@@ -11,6 +11,9 @@ import { useSceneStore } from '../../store/sceneStore'
 import { solveIK } from '../../engine/robot/ikSolver'
 import { ShieldAlert, HelpCircle } from 'lucide-react'
 import { WorkflowStep } from '../../types/robot.types'
+import { registerMoveLRunner } from '../../services/robotMotionRuntime'
+import { JointAngles } from '../../types/robot.types'
+
 
 const SELF_COLLISION_PAIRS = [
   { a: 'shoulder_link', b: 'forearm_link' },
@@ -36,10 +39,10 @@ export default function Viewport3D() {
   const hitboxHelpersRef = useRef<THREE.LineSegments[]>([])
   const keysPressedRef = useRef<Set<string>>(new Set())
   const [isRobotLoaded, setIsRobotLoaded] = useState(false)
-  
+
   // Track loaded 3D models: map objectId -> THREE.Object3D
   const loadedObjectsRef = useRef<Map<string, THREE.Object3D>>(new Map())
-  
+
   // Cache the last user config JSON to block infinite store update loop
   const lastUserConfigRef = useRef<string>('')
 
@@ -60,28 +63,28 @@ export default function Viewport3D() {
   const computeFK = (angles: number[], robot: any) => {
     const jointNames = ['j1', 'j2', 'j3', 'j4', 'j5', 'j6']
     const originalAngles = jointNames.map(name => robot.joints[name].rotation.z)
-    
+
     jointNames.forEach((name, idx) => {
       robot.joints[name].setJointValue(angles[idx] * Math.PI / 180)
     })
     robot.updateMatrixWorld(true)
-    
+
     const baseLink = robot.links['base_link']
     const wristLink = robot.links['wrist3_link']
     const pos = new THREE.Vector3()
     const q = new THREE.Quaternion()
-    
+
     if (baseLink && wristLink) {
       const baseMatInv = new THREE.Matrix4().copy(baseLink.matrixWorld).invert()
       const relativeMat = new THREE.Matrix4().multiplyMatrices(baseMatInv, wristLink.matrixWorld)
       relativeMat.decompose(pos, q, new THREE.Vector3())
     }
-    
+
     jointNames.forEach((name, idx) => {
       robot.joints[name].setJointValue(originalAngles[idx])
     })
     robot.updateMatrixWorld(true)
-    
+
     const euler = new THREE.Euler().setFromQuaternion(q, 'XYZ')
     return {
       x: Math.round(pos.x * 1000 * 10) / 10,
@@ -106,7 +109,86 @@ export default function Viewport3D() {
     return solveIK(targetPos, targetQuat, currentAngles as any, robot)
   }
 
+  const angularDifference = (first: number, second: number): number => {
+    const difference = ((first - second + 180) % 360 + 360) % 360 - 180
+    return Math.abs(difference)
+  }
 
+  useEffect(() => {
+    return registerMoveLRunner(async (targetPose, speed): Promise<void> => {
+      const robot = robotRef.current
+
+      if (!robot) {
+        throw new Error('Robot model has not finished loading')
+      }
+
+      const targetPosition = new THREE.Vector3(
+        targetPose.x / 1000,
+        targetPose.y / 1000,
+        targetPose.z / 1000
+      )
+
+      const targetEuler = new THREE.Euler(
+        THREE.MathUtils.degToRad(targetPose.rx),
+        THREE.MathUtils.degToRad(targetPose.ry),
+        THREE.MathUtils.degToRad(targetPose.rz),
+        'XYZ'
+      )
+
+      const targetQuaternion = new THREE.Quaternion().setFromEuler(targetEuler)
+      const frameDelayMs = Math.max(16, 100 - speed)
+
+      useRobotStore.getState().setPlaying(true)
+
+      try {
+        for (let attempt = 0; attempt < 100; attempt++) {
+          const currentAngles = useRobotStore.getState().jointAngles
+
+          const nextAngles = solveIK(targetPosition, targetQuaternion, currentAngles, robot)
+
+          if (!nextAngles) {
+            throw new Error('IK could not find a solution for MoveL target')
+          }
+
+          const largestJointChange = Math.max(
+            ...nextAngles.map((angle, index) => Math.abs(angle - currentAngles[index]))
+          )
+
+          useRobotStore.getState().setJointAngles(nextAngles as JointAngles)
+
+          await new Promise<void>((resolve) => {
+            window.setTimeout(resolve, frameDelayMs)
+          })
+
+          const actualPose = computeFK(nextAngles, robot)
+
+          const positionError = Math.hypot(
+            actualPose.x - targetPose.x,
+            actualPose.y - targetPose.y,
+            actualPose.z - targetPose.z
+          )
+
+          const rotationError = Math.max(
+            angularDifference(actualPose.rx, targetPose.rx),
+            angularDifference(actualPose.ry, targetPose.ry),
+            angularDifference(actualPose.rz, targetPose.rz)
+          )
+
+          if (positionError < 1 && rotationError < 1) {
+            return
+          }
+
+          if (largestJointChange < 0.01) {
+            throw new Error('MoveL target is unreachable or IK is stuck')
+          }
+        }
+
+        throw new Error('MoveL did not converge after 100 IK iterations')
+      } finally {
+        useRobotStore.getState().setPlaying(false)
+      }
+    })
+  }, [isRobotLoaded])
 
   // Compute a tight OBB for a single URDF link.
   // IMPORTANT: In URDFLoader's scene graph, shoulder_link CONTAINS upperarm_link as a descendant.
@@ -187,9 +269,9 @@ export default function Viewport3D() {
     }
     // Canonical edge list for a box (12 edges)
     const edgePairs = [
-      [0,1],[2,3],[4,5],[6,7],
-      [0,2],[1,3],[4,6],[5,7],
-      [0,4],[1,5],[2,6],[3,7]
+      [0, 1], [2, 3], [4, 5], [6, 7],
+      [0, 2], [1, 3], [4, 6], [5, 7],
+      [0, 4], [1, 5], [2, 6], [3, 7]
     ]
     const positions: number[] = []
     for (const [a, b] of edgePairs) {
@@ -269,7 +351,7 @@ export default function Viewport3D() {
         } else {
           nextJoints[jIdx] = tempJoints[jIdx] + angleVal
         }
-        
+
         if (!step.jointAngles || step.jointAngles.some((val, i) => Math.abs(val - nextJoints[i]) > 0.1)) {
           updatedFields.jointAngles = nextJoints as any
           stepChanged = true
@@ -284,7 +366,7 @@ export default function Viewport3D() {
         const curTCP = computeFK(tempJoints, robot)
         const axis = step.tcpAxis || 'Z'
         const dist = step.distance || 0
-        
+
         nextTCP = { ...curTCP }
         const key = axis.toLowerCase() as 'x' | 'y' | 'z'
         if (step.moveMode === 'absolute') {
@@ -481,11 +563,11 @@ export default function Viewport3D() {
           const x = Math.round(threeObj.position.x * 1000)
           const y = Math.round(threeObj.position.y * 1000)
           const z = Math.round(threeObj.position.z * 1000)
-          
+
           const rx = Math.round((threeObj.rotation.x * 180) / Math.PI)
           const ry = Math.round((threeObj.rotation.y * 180) / Math.PI)
           const rz = Math.round((threeObj.rotation.z * 180) / Math.PI)
-          
+
           const sx = Math.round(threeObj.scale.x * 10) / 10
           const sy = Math.round(threeObj.scale.y * 10) / 10
           const sz = Math.round(threeObj.scale.z * 10) / 10
@@ -514,7 +596,7 @@ export default function Viewport3D() {
           const wristWorldPos = new THREE.Vector3()
           wristLink.getWorldPosition(wristWorldPos)
           const wristLocalPos = wristWorldPos.applyMatrix4(baseMatInv)
-          
+
           const dist = targetPos.distanceTo(wristLocalPos)
           const maxDistance = 0.08 // 8cm
           const clampedTargetPos = targetPos.clone()
@@ -525,7 +607,7 @@ export default function Viewport3D() {
 
           const currentAngles = useRobotStore.getState().jointAngles
           const newAngles = solveIK(clampedTargetPos, targetQuat, currentAngles as any, robot)
-          
+
           if (newAngles) {
             setJointAngles(newAngles)
           }
@@ -556,7 +638,7 @@ export default function Viewport3D() {
             if (deg < -180) deg += 360
 
             const clampedDeg = Math.max(limit.min, Math.min(limit.max, deg))
-            
+
             const currentAngles = [...useRobotStore.getState().jointAngles]
             currentAngles[jointIdx] = Math.round(clampedDeg * 10) / 10
             setJointAngles(currentAngles as any)
@@ -611,7 +693,7 @@ export default function Viewport3D() {
       (robot) => {
         robot.rotation.x = -Math.PI / 2
         robot.position.y = 0
-        
+
         robot.traverse((child: any) => {
           if (child.isMesh) {
             child.castShadow = true
@@ -658,11 +740,11 @@ export default function Viewport3D() {
       // 1. Raycast imported auxiliary objects first
       const loadedMeshes = Array.from(loadedObjectsRef.current.values())
       const objectIntersects = raycaster.intersectObjects(loadedMeshes, true)
-      
+
       if (objectIntersects.length > 0) {
         let hitObject: THREE.Object3D | null = objectIntersects[0].object
         let matchedId: string | null = null
-        
+
         while (hitObject && hitObject !== scene) {
           for (const [id, threeObj] of loadedObjectsRef.current.entries()) {
             if (threeObj === hitObject) {
@@ -688,7 +770,7 @@ export default function Viewport3D() {
         if (intersects.length > 0) {
           let obj: THREE.Object3D | null = intersects[0].object
           let jointName: string | null = null
-          
+
           while (obj && obj !== robot) {
             if (obj.name) {
               const nameLower = obj.name.toLowerCase()
@@ -709,7 +791,7 @@ export default function Viewport3D() {
           }
         }
       }
-      
+
       // Click empty space clears selection
       useRobotStore.getState().setSelectedJointName(null)
       useSceneStore.getState().setSelectedObjectId(null)
@@ -760,7 +842,7 @@ export default function Viewport3D() {
       hitboxHelpersRef.current.forEach(h => {
         scene.remove(h)
         h.geometry.dispose()
-        ;(h.material as THREE.Material).dispose()
+          ; (h.material as THREE.Material).dispose()
       })
       hitboxHelpersRef.current = []
 
@@ -1013,7 +1095,7 @@ export default function Viewport3D() {
     const animate = () => {
       animationFrameId = requestAnimationFrame(animate)
       controls.update()
-      
+
       // Update outline helper for selected objects
       if (boxHelperRef.current && boxHelperRef.current.visible) {
         boxHelperRef.current.update()
@@ -1147,13 +1229,13 @@ export default function Viewport3D() {
             const mesh = new THREE.Mesh(geometry, material)
             mesh.castShadow = true
             mesh.receiveShadow = true
-            
+
             updateThreeObjTransform(mesh, obj.transform)
             mesh.visible = obj.visible
 
             scene.add(mesh)
             loadedMap.set(obj.id, mesh)
-            
+
             updateSelection()
           })
         } else {
@@ -1172,7 +1254,7 @@ export default function Viewport3D() {
 
             scene.add(model)
             loadedMap.set(obj.id, model)
-            
+
             updateSelection()
           })
         }
@@ -1182,7 +1264,7 @@ export default function Viewport3D() {
         if (threeObj) {
           const transformControls = transformControlsRef.current
           const isDraggingThis = transformControls && transformControls.dragging && transformControls.object === threeObj
-          
+
           if (!isDraggingThis) {
             updateThreeObjTransform(threeObj, obj.transform)
           }
@@ -1312,7 +1394,7 @@ export default function Viewport3D() {
 
     if (isIKMode) {
       highlightJointLink(null)
-      
+
       // Only copy the wristLink position to the dummyTarget if we are not actively dragging it
       if (!transformControls.dragging) {
         const wristLink = robot.links['wrist3_link']
@@ -1327,12 +1409,12 @@ export default function Viewport3D() {
           dummyTarget.updateMatrixWorld(true)
         }
       }
-      
+
       transformControls.setMode('translate')
       transformControls.showX = true
       transformControls.showY = true
       transformControls.showZ = true
-      
+
       // Only attach if it's not already attached to prevent resetting the dragging state offset
       if (transformControls.object !== dummyTarget) {
         transformControls.attach(dummyTarget)
@@ -1342,14 +1424,14 @@ export default function Viewport3D() {
     } else if (selectedJointName) {
       dummyTarget.visible = false
       highlightJointLink(selectedJointName)
-      
+
       const jointObj = robot.joints[selectedJointName]
       if (jointObj) {
         transformControls.setMode('rotate')
         transformControls.showX = false
         transformControls.showY = false
         transformControls.showZ = true
-        
+
         // Only attach if it's not already attached to prevent resetting the dragging state offset
         if (transformControls.object !== jointObj) {
           transformControls.attach(jointObj)
@@ -1368,7 +1450,7 @@ export default function Viewport3D() {
         transformControls.showX = true
         transformControls.showY = true
         transformControls.showZ = true
-        
+
         // Only attach if it's not already attached to prevent resetting the dragging state offset
         if (transformControls.object !== threeObj) {
           transformControls.attach(threeObj)

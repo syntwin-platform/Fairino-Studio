@@ -5,6 +5,7 @@ import Viewport3D from './components/viewport/Viewport3D'
 import WorkflowPanel from './components/workflow/WorkflowPanel'
 import CodePanel from './components/code/CodePanel'
 import { Code, ChevronDown, ChevronUp } from 'lucide-react'
+import BackendSimulatorPanel from './components/BackendSimulatorPanel'
 
 function App(): React.JSX.Element {
   const [showCode, setShowCode] = useState(true)
@@ -24,6 +25,7 @@ function App(): React.JSX.Element {
           {/* 3D Viewport */}
           <div className="flex-1 min-h-0 relative">
             <Viewport3D />
+            <BackendSimulatorPanel />
 
             {/* Floating Toggle Button for LUA Code Preview */}
             <button
