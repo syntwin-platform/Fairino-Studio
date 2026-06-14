@@ -6,6 +6,7 @@ import {
   defaultBackendSimulatorConfig
 } from '../types/backendDevice'
 import { backendDeviceSimulator } from '../services/backendDeviceSimulator'
+import { useRobotStore } from '../store/robotStore'
 
 const STORAGE_KEY = 'syntwin.backendSimulator.config'
 
@@ -41,6 +42,18 @@ export default function BackendSimulatorPanel(): React.JSX.Element {
     isConnected: false
   })
   const [isOpen, setIsOpen] = useState(false)
+
+  const cabinetDigitalOutputs = useRobotStore(
+    (state) => state.cabinetDigitalOutputs
+  )
+
+  const toolDigitalOutputs = useRobotStore(
+    (state) => state.toolDigitalOutputs
+  )
+
+  const gripperState = useRobotStore(
+    (state) => state.gripperState
+  )
 
   useEffect(() => {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(config))
@@ -116,13 +129,12 @@ export default function BackendSimulatorPanel(): React.JSX.Element {
         title="Open Backend Simulator"
       >
         <span
-          className={`h-2.5 w-2.5 rounded-full ${
-            status.isConnected
+          className={`h-2.5 w-2.5 rounded-full ${status.isConnected
               ? 'bg-emerald-400'
               : status.isRunning
                 ? 'bg-amber-400'
                 : 'bg-slate-500'
-          }`}
+            }`}
         />
         <Server size={14} className="text-blue-400" />
         <span>Backend</span>
@@ -135,21 +147,20 @@ export default function BackendSimulatorPanel(): React.JSX.Element {
   }
 
   return (
-    <div className="absolute bottom-4 left-4 z-20 w-72 rounded border border-[#2d2d34] bg-[#141417]/95 text-slate-200 shadow-xl backdrop-blur">
+    <div className="absolute bottom-4 left-4 z-20 flex max-h-[calc(100%_-_2rem)] w-72 flex-col overflow-hidden rounded border border-[#2d2d34] bg-[#141417]/95 text-slate-200 shadow-xl backdrop-blur">
       <button
         onClick={() => setIsOpen(false)}
-        className="flex w-full items-center justify-between border-b border-[#2d2d34] px-3 py-2 text-left transition hover:bg-[#1e1e24]"
+        className="flex w-full shrink-0 items-center justify-between border-b border-[#2d2d34] px-3 py-2 text-left transition hover:bg-[#1e1e24]"
         title="Collapse Backend Simulator"
       >
         <div className="flex items-center gap-2">
           <span
-            className={`h-2.5 w-2.5 rounded-full ${
-              status.isConnected
+            className={`h-2.5 w-2.5 rounded-full ${status.isConnected
                 ? 'bg-emerald-400'
                 : status.isRunning
                   ? 'bg-amber-400'
                   : 'bg-slate-500'
-            }`}
+              }`}
           />
           <Server size={14} className="text-blue-400" />
           <div>
@@ -160,7 +171,7 @@ export default function BackendSimulatorPanel(): React.JSX.Element {
         <ChevronDown size={15} className="text-slate-500" />
       </button>
 
-      <div className="max-h-[calc(100vh-220px)] overflow-y-auto p-3">
+      <div className="min-h-0 flex-1 overflow-y-auto p-3">
         <div className="space-y-2">
           <label className="block">
             <span className="text-[10px] font-semibold uppercase text-slate-400">Backend URL</span>
@@ -295,6 +306,29 @@ export default function BackendSimulatorPanel(): React.JSX.Element {
           <div className="flex justify-between">
             <span className="text-slate-400">Last result</span>
             <span>{formatTime(status.lastResultAt)}</span>
+          </div>
+
+          <div className="flex justify-between">
+            <span className="text-slate-400">Gripper</span>
+            <span>{gripperState === 'open' ? 'Open' : 'Closed'}</span>
+          </div>
+
+          <div className="flex justify-between gap-2">
+            <span className="text-slate-400">Cabinet DO</span>
+            <span className="text-right">
+              {Object.entries(cabinetDigitalOutputs)
+                .map(([index, value]) => `${index}:${value}`)
+                .join(', ') || '-'}
+            </span>
+          </div>
+
+          <div className="flex justify-between gap-2">
+            <span className="text-slate-400">Tool DO</span>
+            <span className="text-right">
+              {Object.entries(toolDigitalOutputs)
+                .map(([index, value]) => `${index}:${value}`)
+                .join(', ') || '-'}
+            </span>
           </div>
 
           {status.lastError && (

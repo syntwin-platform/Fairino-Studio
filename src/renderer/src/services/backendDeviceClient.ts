@@ -51,12 +51,20 @@ export async function postTelemetry(
 }
 
 export async function getPendingCommand(
-  config: BackendSimulatorConfig
+  config: BackendSimulatorConfig,
+  isBusy: boolean
 ): Promise<PendingDeviceCommand | null> {
-  const response = await fetch(apiUrl(config, '/api/device/commands/pending'), {
-    method: 'GET',
-    headers: deviceHeaders(config)
+  const query = new URLSearchParams({
+    isBusy: String(isBusy)
   })
+
+  const response = await fetch(
+    apiUrl(config, `/api/device/commands/pending?${query.toString()}`),
+    {
+      method: 'GET',
+      headers: deviceHeaders(config)
+    }
+  )
 
   if (response.status === 204) {
     return null

@@ -12,8 +12,35 @@ import { solveIK } from '../../engine/robot/ikSolver'
 import { ShieldAlert, HelpCircle } from 'lucide-react'
 import { WorkflowStep } from '../../types/robot.types'
 import { registerMoveLRunner } from '../../services/robotMotionRuntime'
+import { throwIfCommandCancelled } from '../../services/commandExecutionRuntime'
 import { JointAngles } from '../../types/robot.types'
 
+function waitForMoveLFrame(
+  milliseconds: number,
+  signal: AbortSignal
+): Promise<void> {
+  throwIfCommandCancelled(signal)
+
+  return new Promise((resolve, reject) => {
+    const handleAbort = (): void => {
+      window.clearTimeout(timeoutId)
+      signal.removeEventListener('abort', handleAbort)
+
+      try {
+        throwIfCommandCancelled(signal)
+      } catch (error) {
+        reject(error)
+      }
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      signal.removeEventListener('abort', handleAbort)
+      resolve()
+    }, milliseconds)
+
+    signal.addEventListener('abort', handleAbort, { once: true })
+  })
+}
 
 const SELF_COLLISION_PAIRS = [
   { a: 'shoulder_link', b: 'forearm_link' },
@@ -114,13 +141,25 @@ export default function Viewport3D() {
     return Math.abs(difference)
   }
 
-  useEffect(() => {
-    return registerMoveLRunner(async (targetPose, speed): Promise<void> => {
+useEffect(() => {
+  return registerMoveLRunner(
+    async (targetPose, speed, signal): Promise<void> => {
+      throwIfCommandCancelled(signal)
+
       const robot = robotRef.current
 
       if (!robot) {
         throw new Error('Robot model has not finished loading')
       }
+
+      const startAngles = useRobotStore.getState().jointAngles
+      const startPose = computeFK(startAngles, robot)
+
+      const startPosition = new THREE.Vector3(
+        startPose.x / 1000,
+        startPose.y / 1000,
+        startPose.z / 1000
+      )
 
       const targetPosition = new THREE.Vector3(
         targetPose.x / 1000,
@@ -128,67 +167,196 @@ export default function Viewport3D() {
         targetPose.z / 1000
       )
 
-      const targetEuler = new THREE.Euler(
-        THREE.MathUtils.degToRad(targetPose.rx),
-        THREE.MathUtils.degToRad(targetPose.ry),
-        THREE.MathUtils.degToRad(targetPose.rz),
-        'XYZ'
+      const startQuaternion = new THREE.Quaternion().setFromEuler(
+        new THREE.Euler(
+          THREE.MathUtils.degToRad(startPose.rx),
+          THREE.MathUtils.degToRad(startPose.ry),
+          THREE.MathUtils.degToRad(startPose.rz),
+          'XYZ'
+        )
       )
 
-      const targetQuaternion = new THREE.Quaternion().setFromEuler(targetEuler)
-      const frameDelayMs = Math.max(16, 100 - speed)
+      const targetQuaternion = new THREE.Quaternion().setFromEuler(
+        new THREE.Euler(
+          THREE.MathUtils.degToRad(targetPose.rx),
+          THREE.MathUtils.degToRad(targetPose.ry),
+          THREE.MathUtils.degToRad(targetPose.rz),
+          'XYZ'
+        )
+      )
+
+      const distanceMillimeters =
+        startPosition.distanceTo(targetPosition) * 1000
+
+      const rotationDegrees = THREE.MathUtils.radToDeg(
+        startQuaternion.angleTo(targetQuaternion)
+      )
+
+      const maxMoveLDistanceMillimeters = 50
+      const maxMoveLRotationDegrees = 15
+      const maxMoveLDurationMilliseconds = 20_000
+      const moveLStartedAt = performance.now()
+
+      if (distanceMillimeters > maxMoveLDistanceMillimeters) {
+        throw new Error(
+          `MoveL distance ${distanceMillimeters.toFixed(1)} mm exceeds simulator limit ` +
+            `${maxMoveLDistanceMillimeters} mm`
+        )
+      }
+
+      if (rotationDegrees > maxMoveLRotationDegrees) {
+        throw new Error(
+          `MoveL rotation ${rotationDegrees.toFixed(1)} degrees exceeds simulator limit ` +
+            `${maxMoveLRotationDegrees} degrees`
+        )
+      }
+
+      const waypointCount = Math.max(
+        1,
+        Math.ceil(distanceMillimeters / 2),
+        Math.ceil(rotationDegrees)
+      )
+
+      const frameDelayMs = Math.max(16, 110 - speed)
 
       useRobotStore.getState().setPlaying(true)
 
       try {
-        for (let attempt = 0; attempt < 100; attempt++) {
-          const currentAngles = useRobotStore.getState().jointAngles
+        for (
+          let waypointIndex = 1;
+          waypointIndex <= waypointCount;
+          waypointIndex++
+        ) {
+          throwIfCommandCancelled(signal)
 
-          const nextAngles = solveIK(targetPosition, targetQuaternion, currentAngles, robot)
-
-          if (!nextAngles) {
-            throw new Error('IK could not find a solution for MoveL target')
+          if (
+            performance.now() - moveLStartedAt >
+            maxMoveLDurationMilliseconds
+          ) {
+            throw new Error(
+              'MoveL exceeded the 20 second simulator execution limit'
+            )
           }
 
-          const largestJointChange = Math.max(
-            ...nextAngles.map((angle, index) => Math.abs(angle - currentAngles[index]))
+          const progress = waypointIndex / waypointCount
+
+          const waypointPosition = startPosition
+            .clone()
+            .lerp(targetPosition, progress)
+
+          const waypointQuaternion = startQuaternion
+            .clone()
+            .slerp(targetQuaternion, progress)
+
+          const waypointEuler = new THREE.Euler().setFromQuaternion(
+            waypointQuaternion,
+            'XYZ'
           )
 
-          useRobotStore.getState().setJointAngles(nextAngles as JointAngles)
-
-          await new Promise<void>((resolve) => {
-            window.setTimeout(resolve, frameDelayMs)
-          })
-
-          const actualPose = computeFK(nextAngles, robot)
-
-          const positionError = Math.hypot(
-            actualPose.x - targetPose.x,
-            actualPose.y - targetPose.y,
-            actualPose.z - targetPose.z
-          )
-
-          const rotationError = Math.max(
-            angularDifference(actualPose.rx, targetPose.rx),
-            angularDifference(actualPose.ry, targetPose.ry),
-            angularDifference(actualPose.rz, targetPose.rz)
-          )
-
-          if (positionError < 1 && rotationError < 1) {
-            return
+          const waypointPose = {
+            x: waypointPosition.x * 1000,
+            y: waypointPosition.y * 1000,
+            z: waypointPosition.z * 1000,
+            rx: THREE.MathUtils.radToDeg(waypointEuler.x),
+            ry: THREE.MathUtils.radToDeg(waypointEuler.y),
+            rz: THREE.MathUtils.radToDeg(waypointEuler.z)
           }
 
-          if (largestJointChange < 0.01) {
-            throw new Error('MoveL target is unreachable or IK is stuck')
+          let waypointReached = false
+
+          for (let attempt = 0; attempt < 25; attempt++) {
+            throwIfCommandCancelled(signal)
+
+            const currentAngles = useRobotStore.getState().jointAngles
+
+            const nextAngles = solveIK(
+              waypointPosition,
+              waypointQuaternion,
+              currentAngles,
+              robot
+            )
+
+            if (!nextAngles) {
+              throw new Error(
+                `MoveL IK failed at waypoint ${waypointIndex}/${waypointCount}`
+              )
+            }
+
+            const largestJointChange = Math.max(
+              ...nextAngles.map((angle, index) =>
+                Math.abs(angle - currentAngles[index])
+              )
+            )
+
+            useRobotStore
+              .getState()
+              .setJointAngles(nextAngles as JointAngles)
+
+            await waitForMoveLFrame(frameDelayMs, signal)
+            throwIfCommandCancelled(signal)
+
+            const actualPose = computeFK(nextAngles, robot)
+
+            const positionError = Math.hypot(
+              actualPose.x - waypointPose.x,
+              actualPose.y - waypointPose.y,
+              actualPose.z - waypointPose.z
+            )
+
+            const rotationError = Math.max(
+              angularDifference(actualPose.rx, waypointPose.rx),
+              angularDifference(actualPose.ry, waypointPose.ry),
+              angularDifference(actualPose.rz, waypointPose.rz)
+            )
+
+            if (positionError <= 0.75 && rotationError <= 0.5) {
+              waypointReached = true
+              break
+            }
+
+            if (largestJointChange < 0.005) {
+              break
+            }
+          }
+
+          if (!waypointReached) {
+            throw new Error(
+              `MoveL could not reach Cartesian waypoint ${waypointIndex}/${waypointCount}`
+            )
           }
         }
 
-        throw new Error('MoveL did not converge after 100 IK iterations')
+        throwIfCommandCancelled(signal)
+
+        const finalPose = computeFK(
+          useRobotStore.getState().jointAngles,
+          robot
+        )
+
+        const finalPositionError = Math.hypot(
+          finalPose.x - targetPose.x,
+          finalPose.y - targetPose.y,
+          finalPose.z - targetPose.z
+        )
+
+        const finalRotationError = Math.max(
+          angularDifference(finalPose.rx, targetPose.rx),
+          angularDifference(finalPose.ry, targetPose.ry),
+          angularDifference(finalPose.rz, targetPose.rz)
+        )
+
+        if (finalPositionError > 1 || finalRotationError > 1) {
+          throw new Error(
+            `MoveL final pose error: ${finalPositionError.toFixed(2)} mm, ` +
+              `${finalRotationError.toFixed(2)} deg`
+          )
+        }
       } finally {
         useRobotStore.getState().setPlaying(false)
       }
-    })
-  }, [isRobotLoaded])
+    }
+  )
+}, [isRobotLoaded])
 
   // Compute a tight OBB for a single URDF link.
   // IMPORTANT: In URDFLoader's scene graph, shoulder_link CONTAINS upperarm_link as a descendant.

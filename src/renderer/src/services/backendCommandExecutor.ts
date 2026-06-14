@@ -2,6 +2,12 @@ import { useRobotStore } from '../store/robotStore'
 import { JointAngles, TCPPose } from '../types/robot.types'
 import { PendingDeviceCommand } from '../types/backendDevice'
 import { runMoveL } from './robotMotionRuntime'
+import {
+  beginCommandExecution,
+  cancelActiveCommand,
+  finishCommandExecution,
+  throwIfCommandCancelled
+} from './commandExecutionRuntime'
 
 interface MoveJPayload {
   jointAngles: number[]
@@ -13,6 +19,26 @@ interface MoveLPayload {
   tcpPose: TCPPose
   speed?: number
   acc?: number
+}
+
+interface RotateJointPayload {
+  jointIndex: number
+  angle: number
+  speed?: number
+  acc?: number
+}
+
+interface SetDOPayload {
+  doType: 'cabinet' | 'tool'
+  doIndex: number
+  doValue: 0 | 1
+}
+
+interface RunProgramStep {
+  orderIndex: number
+  stepType: string
+  label?: string
+  payload?: unknown
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -33,9 +59,27 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max)
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    window.setTimeout(resolve, ms)
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  throwIfCommandCancelled(signal)
+
+  return new Promise((resolve, reject) => {
+    const handleAbort = (): void => {
+      window.clearTimeout(timeoutId)
+      signal.removeEventListener('abort', handleAbort)
+
+      try {
+        throwIfCommandCancelled(signal)
+      } catch (error) {
+        reject(error)
+      }
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      signal.removeEventListener('abort', handleAbort)
+      resolve()
+    }, ms)
+
+    signal.addEventListener('abort', handleAbort, { once: true })
   })
 }
 
@@ -107,7 +151,204 @@ function parseMoveLPayload(payload: unknown): MoveLPayload {
   }
 }
 
-async function executeMoveJ(payload: unknown): Promise<void> {
+function parseRotateJointPayload(payload: unknown): RotateJointPayload {
+  if (!isRecord(payload)) {
+    throw new Error('RotateJoint payload must be an object')
+  }
+
+  if (
+    !Number.isInteger(payload.jointIndex) ||
+    (payload.jointIndex as number) < 0 ||
+    (payload.jointIndex as number) > 5
+  ) {
+    throw new Error('RotateJoint jointIndex must be between 0 and 5')
+  }
+
+  if (!isFiniteNumber(payload.angle)) {
+    throw new Error('RotateJoint angle must be a finite number')
+  }
+
+  validateMotionValue(payload.speed, 'speed')
+  validateMotionValue(payload.acc, 'acc')
+
+  return {
+    jointIndex: payload.jointIndex as number,
+    angle: payload.angle,
+    speed: payload.speed as number | undefined,
+    acc: payload.acc as number | undefined
+  }
+}
+
+function parseSetDOPayload(payload: unknown): SetDOPayload {
+  if (!isRecord(payload)) {
+    throw new Error('SetDO payload must be an object')
+  }
+
+  if (payload.doType !== 'cabinet' && payload.doType !== 'tool') {
+    throw new Error('SetDO doType must be cabinet or tool')
+  }
+
+  if (!Number.isInteger(payload.doIndex)) {
+    throw new Error('SetDO doIndex must be an integer')
+  }
+
+  const doIndex = payload.doIndex as number
+
+  if (payload.doType === 'cabinet' && (doIndex < 1 || doIndex > 8)) {
+    throw new Error('Cabinet DO index must be between 1 and 8')
+  }
+
+  if (payload.doType === 'tool' && (doIndex < 0 || doIndex > 1)) {
+    throw new Error('Tool DO index must be between 0 and 1')
+  }
+
+  if (payload.doValue !== 0 && payload.doValue !== 1) {
+    throw new Error('SetDO doValue must be 0 or 1')
+  }
+
+  return {
+    doType: payload.doType,
+    doIndex,
+    doValue: payload.doValue
+  }
+}
+
+function parseRunProgramSteps(payload: unknown): RunProgramStep[] {
+  if (!isRecord(payload)) {
+    throw new Error('RunProgram payload must be an object')
+  }
+
+  if (!Array.isArray(payload.steps) || payload.steps.length === 0) {
+    throw new Error('RunProgram steps must be a non-empty array')
+  }
+
+  const orderIndexes = new Set<number>()
+
+  const steps = payload.steps.map((value, index): RunProgramStep => {
+    if (!isRecord(value)) {
+      throw new Error(`RunProgram step ${index + 1} must be an object`)
+    }
+
+    if (
+      !Number.isInteger(value.orderIndex) ||
+      (value.orderIndex as number) < 1
+    ) {
+      throw new Error(`RunProgram step ${index + 1} has invalid orderIndex`)
+    }
+
+    const orderIndex = value.orderIndex as number
+
+    if (orderIndexes.has(orderIndex)) {
+      throw new Error(`Duplicate RunProgram orderIndex: ${orderIndex}`)
+    }
+
+    orderIndexes.add(orderIndex)
+
+    if (
+      typeof value.stepType !== 'string' ||
+      !value.stepType.trim()
+    ) {
+      throw new Error(`RunProgram step ${orderIndex} requires stepType`)
+    }
+
+    return {
+      orderIndex,
+      stepType: value.stepType,
+      label: typeof value.label === 'string' ? value.label : undefined,
+      payload: value.payload
+    }
+  })
+
+  return steps.sort((first, second) => first.orderIndex - second.orderIndex)
+}
+
+async function executeWaitMs(
+  payload: unknown,
+  signal: AbortSignal
+): Promise<void> {
+  throwIfCommandCancelled(signal)
+
+  if (!isRecord(payload)) {
+    throw new Error('WaitMs payload must be an object')
+  }
+
+  const delayMs = payload.delayMs
+
+  if (
+    !Number.isInteger(delayMs) ||
+    (delayMs as number) < 0
+  ) {
+    throw new Error('WaitMs delayMs must be a non-negative integer')
+  }
+
+  await delay(delayMs as number, signal)
+}
+
+async function executeRunProgram(
+  payload: unknown,
+  signal: AbortSignal
+): Promise<void> {
+  const steps = parseRunProgramSteps(payload)
+
+  for (let index = 0; index < steps.length; index++) {
+    throwIfCommandCancelled(signal)
+
+    const step = steps[index]
+
+    useRobotStore.getState().setCurrentStepIndex(index)
+
+    switch (step.stepType) {
+      case 'MoveJ':
+        await executeMoveJ(step.payload, signal)
+        break
+
+      case 'MoveL':
+        await executeMoveL(step.payload, signal)
+        break
+
+      case 'RotateJoint':
+        await executeRotateJoint(step.payload, signal)
+        break
+
+      case 'MoveTCP':
+        await executeMoveTCP(step.payload, signal)
+        break
+
+      case 'WaitMs':
+        await executeWaitMs(step.payload, signal)
+        break
+
+            case 'SetDO':
+        await executeSetDO(step.payload, signal)
+        break
+
+      case 'GripperOpen':
+        await executeGripper('open', signal)
+        break
+
+      case 'GripperClose':
+        await executeGripper('closed', signal)
+        break
+
+      case 'Comment':
+        break
+
+      default:
+        throw new Error(
+          `Unsupported RunProgram step type: ${step.stepType}`
+        )
+    }
+  }
+
+  throwIfCommandCancelled(signal)
+}
+
+async function executeMoveJ(
+  payload: unknown,
+  signal: AbortSignal
+): Promise<void> {
+  throwIfCommandCancelled(signal)
+
   const moveJ = parseMoveJPayload(payload)
   const robotStore = useRobotStore.getState()
   const startAngles = [...robotStore.jointAngles]
@@ -124,6 +365,8 @@ async function executeMoveJ(payload: unknown): Promise<void> {
 
   try {
     for (let frame = 1; frame <= frameCount; frame++) {
+      throwIfCommandCancelled(signal)
+
       const progress = easeInOutCubic(frame / frameCount)
       const interpolated = startAngles.map((start, index) => {
         const target = targetAngles[index]
@@ -131,32 +374,139 @@ async function executeMoveJ(payload: unknown): Promise<void> {
       }) as JointAngles
 
       useRobotStore.getState().setJointAngles(interpolated)
-      await delay(frameMs)
+      await delay(frameMs, signal)
     }
 
+    throwIfCommandCancelled(signal)
     useRobotStore.getState().setJointAngles(targetAngles as JointAngles)
   } finally {
     useRobotStore.getState().setPlaying(false)
   }
 }
 
-async function executeMoveL(payload: unknown): Promise<void> {
-  const moveL = parseMoveLPayload(payload)
+async function executeRotateJoint(
+  payload: unknown,
+  signal: AbortSignal
+): Promise<void> {
+  throwIfCommandCancelled(signal)
 
-  await runMoveL(moveL.tcpPose, moveL.speed ?? 30)
+  const rotateJoint = parseRotateJointPayload(payload)
+  const targetAngles = [
+    ...useRobotStore.getState().jointAngles
+  ] as JointAngles
+
+  targetAngles[rotateJoint.jointIndex] = rotateJoint.angle
+
+  await executeMoveJ(
+    {
+      jointAngles: targetAngles,
+      speed: rotateJoint.speed,
+      acc: rotateJoint.acc
+    },
+    signal
+  )
 }
 
-export async function executeBackendCommand(command: PendingDeviceCommand): Promise<void> {
-  switch (command.commandType) {
-    case 'MoveJ':
-      await executeMoveJ(command.payload)
-      return
+async function executeMoveL(
+  payload: unknown,
+  signal: AbortSignal
+): Promise<void> {
+  throwIfCommandCancelled(signal)
 
-    case 'MoveL':
-      await executeMoveL(command.payload)
-      return
+  const moveL = parseMoveLPayload(payload)
 
-    default:
-      throw new Error(`Unsupported command type: ${command.commandType}`)
+  await runMoveL(
+    moveL.tcpPose,
+    moveL.speed ?? 30,
+    signal
+  )
+
+  throwIfCommandCancelled(signal)
+}
+
+async function executeMoveTCP(
+  payload: unknown,
+  signal: AbortSignal
+): Promise<void> {
+  throwIfCommandCancelled(signal)
+
+  // Backend snapshot đã chuyển MoveTCP thành TCP pose tuyệt đối.
+  await executeMoveL(payload, signal)
+}
+
+async function executeSetDO(
+  payload: unknown,
+  signal: AbortSignal
+): Promise<void> {
+  throwIfCommandCancelled(signal)
+
+  const setDO = parseSetDOPayload(payload)
+
+  useRobotStore.getState().setDigitalOutput(
+    setDO.doType,
+    setDO.doIndex,
+    setDO.doValue
+  )
+
+  await delay(100, signal)
+}
+
+async function executeGripper(
+  state: 'open' | 'closed',
+  signal: AbortSignal
+): Promise<void> {
+  throwIfCommandCancelled(signal)
+
+  const robotStore = useRobotStore.getState()
+  const doValue: 0 | 1 = state === 'closed' ? 1 : 0
+
+  robotStore.setDigitalOutput('cabinet', 1, doValue)
+  robotStore.setGripperState(state)
+
+  await delay(500, signal)
+}
+
+function executeEmergencyStop(commandId: string): void {
+  cancelActiveCommand(
+    `Emergency stop requested by command ${commandId}`
+  )
+
+  // EStop giữ robot tại vị trí hiện tại và dừng trạng thái playback.
+  useRobotStore.getState().setPlaying(false)
+}
+
+export async function executeBackendCommand(
+  command: PendingDeviceCommand
+): Promise<void> {
+  if (command.commandType === 'EStop') {
+    executeEmergencyStop(command.commandId)
+    return
+  }
+
+  const signal = beginCommandExecution(command.commandId)
+
+  try {
+    switch (command.commandType) {
+      case 'SetDO':
+        await executeSetDO(command.payload, signal)
+        return
+
+      case 'MoveJ':
+        await executeMoveJ(command.payload, signal)
+        return
+
+      case 'MoveL':
+        await executeMoveL(command.payload, signal)
+        return
+
+      case 'RunProgram':
+        await executeRunProgram(command.payload, signal)
+        return
+
+      default:
+        throw new Error(`Unsupported command type: ${command.commandType}`)
+    }
+  } finally {
+    finishCommandExecution(command.commandId)
   }
 }

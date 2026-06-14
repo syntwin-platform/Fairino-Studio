@@ -2,8 +2,13 @@ import {
   BackendSimulatorConfig,
   BackendSimulatorStatus,
   DeviceTelemetryPayload,
+  PendingDeviceCommand,
   TcpPose
 } from '../types/backendDevice'
+import {
+  cancelActiveCommand,
+  getActiveCommandId
+} from './commandExecutionRuntime'
 import { useRobotStore } from '../store/robotStore'
 import { useSceneStore } from '../store/sceneStore'
 import {
@@ -25,7 +30,13 @@ let commandPollTimer: ReturnType<typeof setInterval> | null = null
 
 let heartbeatInFlight = false
 let telemetryInFlight = false
+
+// Chỉ khóa request GET pending đang diễn ra.
 let commandPollInFlight = false
+
+// Command thường vẫn có thể chạy trong khi request polling tiếp tục.
+let commandExecutionInFlight = false
+
 let running = false
 let runId = 0
 
@@ -158,40 +169,28 @@ async function sendTelemetry(
   }
 }
 
-async function pollCommand(
+async function executeAndReportCommand(
   config: BackendSimulatorConfig,
+  command: PendingDeviceCommand,
   callbacks: BackendDeviceSimulatorCallbacks,
   currentRunId: number
 ): Promise<void> {
-  if (commandPollInFlight) return
-
-  commandPollInFlight = true
+  let commandSucceeded = true
+  let commandMessage = 'Simulated command executed in Fairino-Studio'
 
   try {
-    const command = await getPendingCommand(config)
+    await executeBackendCommand(command)
+  } catch (error) {
+    commandSucceeded = false
+    commandMessage =
+      error instanceof Error
+        ? error.message
+        : 'Command execution failed'
+  }
 
-    if (runId !== currentRunId || command === null) return
+  commandMessage = commandMessage.slice(0, 500)
 
-    callbacks.onStatusChange({
-      isConnected: true,
-      lastCommandAt: new Date().toISOString(),
-      lastError: undefined
-    })
-
-    callbacks.onLog?.(`Received command ${command.commandType} (${command.commandId})`)
-
-    let commandSucceeded = true
-    let commandMessage = 'Simulated command executed in Fairino-Studio'
-
-    try {
-      await executeBackendCommand(command)
-    } catch (error) {
-      commandSucceeded = false
-      commandMessage = error instanceof Error ? error.message : 'Command execution failed'
-    }
-
-    commandMessage = commandMessage.slice(0, 500)
-
+  try {
     await postCommandResult(config, {
       commandId: command.commandId,
       robotId: config.robotId,
@@ -210,16 +209,97 @@ async function pollCommand(
     callbacks.onStatusChange({
       isConnected: true,
       lastResultAt: new Date().toISOString(),
-      lastError: commandSucceeded ? undefined : `Command failed: ${commandMessage}`
+      lastError: commandSucceeded
+        ? undefined
+        : `Command failed: ${commandMessage}`
     })
   } catch (error) {
     if (runId !== currentRunId) return
 
     callbacks.onStatusChange({
       isConnected: false,
-      lastError: error instanceof Error ? error.message : 'Command polling failed'
+      lastError:
+        error instanceof Error
+          ? error.message
+          : 'Command result submission failed'
+    })
+  }
+}
+
+async function pollCommand(
+  config: BackendSimulatorConfig,
+  callbacks: BackendDeviceSimulatorCallbacks,
+  currentRunId: number
+): Promise<void> {
+  if (commandPollInFlight) return
+
+  commandPollInFlight = true
+
+  try {
+    const isBusy =
+      commandExecutionInFlight ||
+      getActiveCommandId() !== null
+
+    const command = await getPendingCommand(config, isBusy)
+
+    if (runId !== currentRunId || command === null) {
+      return
+    }
+
+    callbacks.onStatusChange({
+      isConnected: true,
+      lastCommandAt: new Date().toISOString(),
+      lastError: undefined
+    })
+
+    callbacks.onLog?.(
+      `Received command ${command.commandType} (${command.commandId})`
+    )
+
+    if (command.commandType === 'EStop') {
+      // Không await. EStop chạy song song và cancel command hiện tại ngay lập tức.
+      void executeAndReportCommand(
+        config,
+        command,
+        callbacks,
+        currentRunId
+      )
+
+      return
+    }
+
+    if (commandExecutionInFlight || getActiveCommandId() !== null) {
+      callbacks.onStatusChange({
+        lastError:
+          `Backend returned ${command.commandType} while robot is busy`
+      })
+
+      return
+    }
+
+    commandExecutionInFlight = true
+
+    // Không await tại đây. Polling phải tiếp tục để nhận EStop.
+    void executeAndReportCommand(
+      config,
+      command,
+      callbacks,
+      currentRunId
+    ).finally(() => {
+      commandExecutionInFlight = false
+    })
+  } catch (error) {
+    if (runId !== currentRunId) return
+
+    callbacks.onStatusChange({
+      isConnected: false,
+      lastError:
+        error instanceof Error
+          ? error.message
+          : 'Command polling failed'
     })
   } finally {
+    // Chỉ khóa trong thời gian gọi GET pending.
     commandPollInFlight = false
   }
 }
@@ -266,7 +346,8 @@ export const backendDeviceSimulator = {
     }, normalizedConfig.commandPollIntervalMs)
   },
 
-  stop(): void {
+    stop(): void {
+    cancelActiveCommand('Backend simulator disconnected')
     runId += 1
 
     if (heartbeatTimer) {
@@ -287,6 +368,7 @@ export const backendDeviceSimulator = {
     heartbeatInFlight = false
     telemetryInFlight = false
     commandPollInFlight = false
+    commandExecutionInFlight = false
     running = false
   },
 
