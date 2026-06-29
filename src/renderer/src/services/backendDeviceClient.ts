@@ -2,18 +2,36 @@ import {
   BackendSimulatorConfig,
   DeviceCommandResultPayload,
   DeviceTelemetryPayload,
-  PendingDeviceCommand
+  PendingDeviceCommand,
+  DeviceSessionResponse
 } from '../types/backendDevice'
+
+export class BackendDeviceRequestError extends Error {
+  constructor(
+    readonly status: number,
+    message: string
+  ) {
+    super(message)
+    this.name = 'BackendDeviceRequestError'
+  }
+}
 
 function apiUrl(config: BackendSimulatorConfig, path: string): string {
   return `${config.backendUrl.replace(/\/+$/, '')}${path}`
 }
 
-function deviceHeaders(config: BackendSimulatorConfig): HeadersInit {
+function deviceSessionHeaders(config: BackendSimulatorConfig): HeadersInit {
   return {
     'Content-Type': 'application/json',
     'X-Robot-Id': config.robotId,
     'X-Device-Secret': config.deviceSecret
+  }
+}
+
+function deviceBearerHeaders(accessToken: string): HeadersInit {
+  return {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${accessToken}`
   }
 }
 
@@ -24,54 +42,78 @@ async function readErrorMessage(response: Response): Promise<string> {
     : `HTTP ${response.status}: ${response.statusText}`
 }
 
-export async function postHeartbeat(config: BackendSimulatorConfig): Promise<void> {
-  const response = await fetch(apiUrl(config, '/api/device/heartbeat'), {
+export async function createDeviceSession(
+  config: BackendSimulatorConfig
+): Promise<DeviceSessionResponse> {
+  const response = await fetch(apiUrl(config, '/api/device/session'), {
     method: 'POST',
-    headers: deviceHeaders(config)
+    headers: deviceSessionHeaders(config)
   })
 
   if (!response.ok) {
-    throw new Error(await readErrorMessage(response))
+    throw new BackendDeviceRequestError(response.status, await readErrorMessage(response))
+  }
+
+  return (await response.json()) as DeviceSessionResponse
+}
+
+export async function postHeartbeat(
+  config: BackendSimulatorConfig,
+  accessToken: string,
+  signal?: AbortSignal
+): Promise<void> {
+  const response = await fetch(apiUrl(config, '/api/device/heartbeat'), {
+    method: 'POST',
+    headers: deviceBearerHeaders(accessToken),
+    signal
+  })
+
+  if (!response.ok) {
+    throw new BackendDeviceRequestError(response.status, await readErrorMessage(response))
   }
 }
 
 export async function postTelemetry(
   config: BackendSimulatorConfig,
-  telemetry: DeviceTelemetryPayload
+  telemetry: DeviceTelemetryPayload,
+  accessToken: string,
+  signal?: AbortSignal
 ): Promise<void> {
   const response = await fetch(apiUrl(config, '/api/device/telemetry'), {
     method: 'POST',
-    headers: deviceHeaders(config),
-    body: JSON.stringify(telemetry)
+    headers: deviceBearerHeaders(accessToken),
+    body: JSON.stringify(telemetry),
+    signal
   })
 
   if (!response.ok) {
-    throw new Error(await readErrorMessage(response))
+    throw new BackendDeviceRequestError(response.status, await readErrorMessage(response))
   }
 }
 
 export async function getPendingCommand(
   config: BackendSimulatorConfig,
-  isBusy: boolean
+  accessToken: string,
+  isBusy: boolean,
+  signal?: AbortSignal
 ): Promise<PendingDeviceCommand | null> {
   const query = new URLSearchParams({
-    isBusy: String(isBusy)
+    isBusy: String(isBusy),
+    waitSeconds: '25'
   })
 
-  const response = await fetch(
-    apiUrl(config, `/api/device/commands/pending?${query.toString()}`),
-    {
-      method: 'GET',
-      headers: deviceHeaders(config)
-    }
-  )
+  const response = await fetch(apiUrl(config, `/api/device/commands/pending?${query.toString()}`), {
+    method: 'GET',
+    headers: deviceBearerHeaders(accessToken),
+    signal
+  })
 
   if (response.status === 204) {
     return null
   }
 
   if (!response.ok) {
-    throw new Error(await readErrorMessage(response))
+    throw new BackendDeviceRequestError(response.status, await readErrorMessage(response))
   }
 
   return (await response.json()) as PendingDeviceCommand
@@ -79,15 +121,18 @@ export async function getPendingCommand(
 
 export async function postCommandResult(
   config: BackendSimulatorConfig,
-  result: DeviceCommandResultPayload
+  result: DeviceCommandResultPayload,
+  accessToken: string,
+  signal?: AbortSignal
 ): Promise<void> {
   const response = await fetch(apiUrl(config, '/api/device/commands/result'), {
     method: 'POST',
-    headers: deviceHeaders(config),
-    body: JSON.stringify(result)
+    headers: deviceBearerHeaders(accessToken),
+    body: JSON.stringify(result),
+    signal
   })
 
   if (!response.ok) {
-    throw new Error(await readErrorMessage(response))
+    throw new BackendDeviceRequestError(response.status, await readErrorMessage(response))
   }
 }

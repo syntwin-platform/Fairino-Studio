@@ -1,5 +1,20 @@
 import { create } from 'zustand'
-import { JointAngles, TCPPose, WorkflowStep } from '../types/robot.types'
+import {
+  DEFAULT_JOINT_ANGLES,
+  JointAngles,
+  ProgrammingMode,
+  TCPPose,
+  RobotProgramSource,
+  WorkflowStep
+} from '../types/robot.types'
+
+function createStepId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `step_${crypto.randomUUID()}`
+  }
+
+  return `step_${Date.now()}_${Math.random().toString(36).slice(2)}`
+}
 
 interface RobotState {
   // Robot Hardware Config & Current values
@@ -11,6 +26,7 @@ interface RobotState {
   // Project properties
   projectName: string
   currentFilePath: string | null
+  programSource: RobotProgramSource
 
   // Workflow Steps
   steps: WorkflowStep[]
@@ -21,7 +37,7 @@ interface RobotState {
   selectedJointName: string | null
   playbackSpeed: number // multiplier (1 = 1x, 2 = 2x, etc.)
   currentStepIndex: number
-  mode: 'normal' | 'advanced'
+  mode: ProgrammingMode
   language: 'vi' | 'en'
   lengthUnit: 'mm' | 'm'
   angleUnit: 'deg' | 'rad'
@@ -30,22 +46,18 @@ interface RobotState {
   toolDigitalOutputs: Record<number, 0 | 1>
   gripperState: 'open' | 'closed'
 
-
   // Actions
   setJointAngles: (angles: JointAngles) => void
   setTCPPose: (pose: TCPPose) => void
   setIKMode: (enabled: boolean) => void
   setProjectName: (name: string) => void
   setCurrentFilePath: (path: string | null) => void
-  setMode: (mode: 'normal' | 'advanced') => void
+  setMode: (mode: ProgrammingMode) => void
   setLanguage: (lang: 'vi' | 'en') => void
   setLengthUnit: (unit: 'mm' | 'm') => void
   setAngleUnit: (unit: 'deg' | 'rad') => void
-  setDigitalOutput: (
-    doType: 'cabinet' | 'tool',
-    doIndex: number,
-    doValue: 0 | 1
-  ) => void
+  setDigitalOutput: (doType: 'cabinet' | 'tool', doIndex: number, doValue: 0 | 1) => void
+  setProgramSource: (source: RobotProgramSource) => void
 
   setGripperState: (state: 'open' | 'closed') => void
   // Workflow actions
@@ -65,12 +77,13 @@ interface RobotState {
 
 export const useRobotStore = create<RobotState>((set) => ({
   robotModel: 'FR5',
-  jointAngles: [0, -30, 90, 0, 60, 0],
+  jointAngles: [...DEFAULT_JOINT_ANGLES],
   tcpPose: { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0 },
   isIKMode: false,
 
   projectName: 'coffee_machine_workflow',
   currentFilePath: null,
+  programSource: 'Studio',
 
   steps: [],
   selectedStepId: null,
@@ -100,25 +113,25 @@ export const useRobotStore = create<RobotState>((set) => ({
     set((state) =>
       doType === 'cabinet'
         ? {
-          cabinetDigitalOutputs: {
-            ...state.cabinetDigitalOutputs,
-            [doIndex]: doValue
+            cabinetDigitalOutputs: {
+              ...state.cabinetDigitalOutputs,
+              [doIndex]: doValue
+            }
           }
-        }
         : {
-          toolDigitalOutputs: {
-            ...state.toolDigitalOutputs,
-            [doIndex]: doValue
+            toolDigitalOutputs: {
+              ...state.toolDigitalOutputs,
+              [doIndex]: doValue
+            }
           }
-        }
     ),
-
+  setProgramSource: (programSource) => set({ programSource }),
   setGripperState: (gripperState) => set({ gripperState }),
   addStep: (step) =>
     set((state) => {
       const newStep: WorkflowStep = {
         ...step,
-        id: `step_${Date.now()}`
+        id: createStepId()
       }
       return {
         steps: [...state.steps, newStep],

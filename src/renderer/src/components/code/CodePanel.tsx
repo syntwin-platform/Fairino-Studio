@@ -1,42 +1,37 @@
-import { useEffect, useState } from 'react'
 import Editor from '@monaco-editor/react'
-import { useRobotStore } from '../../store/robotStore'
-import { generateLua } from '../../engine/codegen/luaCodegen'
-import { Code, Copy, Check } from 'lucide-react'
+import { Check, Code, Copy } from 'lucide-react'
+import { useMemo, useState } from 'react'
+import type { ReactElement } from 'react'
 
-export default function CodePanel() {
+import { generateLua } from '../../engine/codegen/luaCodegen'
+import { useRobotStore } from '../../store/robotStore'
+
+export default function CodePanel(): ReactElement {
   const steps = useRobotStore((state) => state.steps)
   const projectName = useRobotStore((state) => state.projectName)
-  const [luaCode, setLuaCode] = useState('')
   const [copied, setCopied] = useState(false)
 
-  useEffect(() => {
-    const code = generateLua(steps, projectName)
-    setCodeText(code)
-  }, [steps, projectName])
+  const luaCode = useMemo(() => generateLua(steps, projectName), [steps, projectName])
 
-  const setCodeText = (code: string) => {
-    setLuaCode(code)
-  }
-
-  const handleCopy = () => {
-    navigator.clipboard.writeText(luaCode)
+  const handleCopy = (): void => {
+    void navigator.clipboard.writeText(luaCode)
     setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+    window.setTimeout(() => setCopied(false), 2000)
   }
 
   return (
-    <div className="h-full w-full bg-[#1e1e24] border-t border-[#2d2d34] flex flex-col text-slate-200">
-      {/* Code Header Bar */}
-      <div className="h-9 px-4 bg-[#141417] border-b border-[#2d2d34] flex items-center justify-between shrink-0">
+    <div className="flex h-full w-full flex-col border-t border-[#2d2d34] bg-[#1e1e24] text-slate-200">
+      <div className="flex h-9 shrink-0 items-center justify-between border-b border-[#2d2d34] bg-[#141417] px-4">
         <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-300">
           <Code size={14} className="text-blue-500" />
           <span>Fairino LUA Script Preview</span>
-          <span className="text-[10px] text-slate-500 font-normal">(Cập nhật thời gian thực)</span>
+          <span className="text-[10px] font-normal text-slate-500">(Cập nhật thời gian thực)</span>
         </div>
+
         <button
+          type="button"
           onClick={handleCopy}
-          className="flex items-center gap-1 px-2 py-0.5 rounded bg-[#25252b] hover:bg-[#2e2e36] text-[10px] border border-[#393942] transition"
+          className="flex items-center gap-1 rounded border border-[#393942] bg-[#25252b] px-2 py-0.5 text-[10px] transition hover:bg-[#2e2e36]"
         >
           {copied ? (
             <>
@@ -52,8 +47,7 @@ export default function CodePanel() {
         </button>
       </div>
 
-      {/* Editor Container */}
-      <div className="flex-1 min-h-0 w-full relative">
+      <div className="relative min-h-0 w-full flex-1">
         <Editor
           height="100%"
           language="lua"
@@ -63,14 +57,14 @@ export default function CodePanel() {
             readOnly: true,
             minimap: { enabled: false },
             fontSize: 12,
-            fontFamily: "Fira Code, Monaco, Menlo, Consolas, monospace",
+            fontFamily: 'Fira Code, Monaco, Menlo, Consolas, monospace',
             lineNumbers: 'on',
             scrollBeyondLastLine: false,
             automaticLayout: true,
             padding: { top: 8 }
           }}
           loading={
-            <div className="absolute inset-0 flex items-center justify-center text-slate-500 text-xs bg-[#1e1e24]">
+            <div className="absolute inset-0 flex items-center justify-center bg-[#1e1e24] text-xs text-slate-500">
               Đang tải Monaco Editor...
             </div>
           }

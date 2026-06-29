@@ -1,12 +1,18 @@
 import { TCPPose } from '../types/robot.types'
+import { defaultRobotRuntimeConfig, RobotRuntimeConfig } from '../types/backendDevice'
 
-type MoveLRunner = (
-  tcpPose: TCPPose,
-  speed: number,
-  signal: AbortSignal
-) => Promise<void>
+type MoveLRunner = (tcpPose: TCPPose, speed: number, signal: AbortSignal) => Promise<void>
 
 let moveLRunner: MoveLRunner | null = null
+let robotRuntimeConfig: RobotRuntimeConfig = defaultRobotRuntimeConfig
+
+export function setRobotRuntimeConfig(config: RobotRuntimeConfig): void {
+  robotRuntimeConfig = config
+}
+
+export function getRobotRuntimeConfig(): RobotRuntimeConfig {
+  return robotRuntimeConfig
+}
 
 export function registerMoveLRunner(runner: MoveLRunner): () => void {
   moveLRunner = runner

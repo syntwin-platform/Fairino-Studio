@@ -5,6 +5,10 @@ import icon from '../../resources/icon.png?asset'
 import fs from 'fs/promises'
 import { setupMenu } from './menu'
 
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 function createWindow(): void {
   // Create the browser window.
   const mainWindow = new BrowserWindow({
@@ -70,8 +74,8 @@ app.whenReady().then(() => {
     try {
       await fs.writeFile(filePath, content, 'utf-8')
       return { success: true }
-    } catch (error: any) {
-      return { success: false, error: error.message }
+    } catch (error: unknown) {
+      return { success: false, error: getErrorMessage(error) }
     }
   })
 
@@ -79,8 +83,8 @@ app.whenReady().then(() => {
     try {
       const content = await fs.readFile(filePath, 'utf-8')
       return { success: true, content }
-    } catch (error: any) {
-      return { success: false, error: error.message }
+    } catch (error: unknown) {
+      return { success: false, error: getErrorMessage(error) }
     }
   })
 

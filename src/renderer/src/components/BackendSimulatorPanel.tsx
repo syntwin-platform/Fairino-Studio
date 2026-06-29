@@ -3,13 +3,16 @@ import { ChevronDown, ChevronUp, Link, Link2Off, Server } from 'lucide-react'
 import {
   BackendSimulatorConfig,
   BackendSimulatorStatus,
-  defaultBackendSimulatorConfig
+  defaultBackendSimulatorConfig,
+  defaultRobotRuntimeConfig
 } from '../types/backendDevice'
 import { backendDeviceSimulator } from '../services/backendDeviceSimulator'
 import { useRobotStore } from '../store/robotStore'
+import { getRobotRuntimeConfig as fetchRobotRuntimeConfig } from '../services/backendRuntimeConfigClient'
+import { setRobotRuntimeConfig } from '../services/robotMotionRuntime'
 
 const STORAGE_KEY = 'syntwin.backendSimulator.config'
-
+const TOKEN_KEY = 'syntwin.backendProgram.accessToken'
 function loadConfig(): BackendSimulatorConfig {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY)
@@ -29,13 +32,42 @@ function formatTime(value?: string): string {
   return new Date(value).toLocaleTimeString()
 }
 
+async function loadRuntimeConfigForSimulator(
+  config: BackendSimulatorConfig
+): Promise<string | null> {
+  const token = window.sessionStorage.getItem(TOKEN_KEY)
+
+  if (!token) {
+    setRobotRuntimeConfig({
+      ...defaultRobotRuntimeConfig,
+      robotId: config.robotId
+    })
+
+    return null
+  }
+
+  try {
+    const runtimeConfig = await fetchRobotRuntimeConfig(config.backendUrl, config.robotId, token)
+
+    setRobotRuntimeConfig(runtimeConfig)
+    return null
+  } catch (error) {
+    setRobotRuntimeConfig({
+      ...defaultRobotRuntimeConfig,
+      robotId: config.robotId
+    })
+
+    return error instanceof Error ? error.message : 'Failed to load runtime config.'
+  }
+}
+
 function statusLabel(status: BackendSimulatorStatus): string {
   if (status.isConnected) return 'Online'
   if (status.isRunning) return 'Connecting'
   return 'Offline'
 }
 
-export default function BackendSimulatorPanel(): React.JSX.Element {
+export default function BackendSimulatorPanel(): React.ReactElement {
   const [config, setConfig] = useState<BackendSimulatorConfig>(() => loadConfig())
   const [status, setStatus] = useState<BackendSimulatorStatus>({
     isRunning: false,
@@ -43,17 +75,11 @@ export default function BackendSimulatorPanel(): React.JSX.Element {
   })
   const [isOpen, setIsOpen] = useState(false)
 
-  const cabinetDigitalOutputs = useRobotStore(
-    (state) => state.cabinetDigitalOutputs
-  )
+  const cabinetDigitalOutputs = useRobotStore((state) => state.cabinetDigitalOutputs)
 
-  const toolDigitalOutputs = useRobotStore(
-    (state) => state.toolDigitalOutputs
-  )
+  const toolDigitalOutputs = useRobotStore((state) => state.toolDigitalOutputs)
 
-  const gripperState = useRobotStore(
-    (state) => state.gripperState
-  )
+  const gripperState = useRobotStore((state) => state.gripperState)
 
   useEffect(() => {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(config))
@@ -75,8 +101,13 @@ export default function BackendSimulatorPanel(): React.JSX.Element {
     }))
   }
 
-  const handleConnect = (): void => {
+  const handleConnect = async (): Promise<void> => {
     try {
+      const runtimeConfigWarning = await loadRuntimeConfigForSimulator(config)
+
+      if (runtimeConfigWarning) {
+        console.warn(`Runtime config fallback: ${runtimeConfigWarning}`)
+      }
       backendDeviceSimulator.start(
         {
           ...config,
@@ -129,12 +160,13 @@ export default function BackendSimulatorPanel(): React.JSX.Element {
         title="Open Backend Simulator"
       >
         <span
-          className={`h-2.5 w-2.5 rounded-full ${status.isConnected
+          className={`h-2.5 w-2.5 rounded-full ${
+            status.isConnected
               ? 'bg-emerald-400'
               : status.isRunning
                 ? 'bg-amber-400'
                 : 'bg-slate-500'
-            }`}
+          }`}
         />
         <Server size={14} className="text-blue-400" />
         <span>Backend</span>
@@ -155,12 +187,13 @@ export default function BackendSimulatorPanel(): React.JSX.Element {
       >
         <div className="flex items-center gap-2">
           <span
-            className={`h-2.5 w-2.5 rounded-full ${status.isConnected
+            className={`h-2.5 w-2.5 rounded-full ${
+              status.isConnected
                 ? 'bg-emerald-400'
                 : status.isRunning
                   ? 'bg-amber-400'
                   : 'bg-slate-500'
-              }`}
+            }`}
           />
           <Server size={14} className="text-blue-400" />
           <div>
@@ -241,17 +274,21 @@ export default function BackendSimulatorPanel(): React.JSX.Element {
             </label>
 
             <label className="block">
-              <span className="text-[10px] font-semibold uppercase text-slate-400">Poll</span>
+              <span
+                className="text-[10px] font-semibold uppercase text-slate-500"
+                title="Long-polling (waitSeconds=25) is now used. This input is kept for legacy compatibility only."
+              >
+                Legacy Poll
+              </span>
               <input
                 value={config.commandPollIntervalMs}
                 onChange={(event) =>
                   updateConfig('commandPollIntervalMs', Number(event.target.value))
                 }
-                disabled={status.isRunning}
+                disabled={true}
                 type="number"
-                min={300}
-                step={100}
-                className="mt-1 w-full rounded border border-[#2d2d34] bg-[#0f0f12] px-2 py-1.5 text-xs text-white outline-none focus:border-blue-500 disabled:opacity-60"
+                className="mt-1 w-full rounded border border-[#2d2d34] bg-[#0f0f12] px-2 py-1.5 text-xs text-slate-500 outline-none opacity-40 cursor-not-allowed"
+                title="Long-polling (waitSeconds=25) is now used. This input is kept for legacy compatibility only."
               />
             </label>
           </div>
@@ -259,7 +296,7 @@ export default function BackendSimulatorPanel(): React.JSX.Element {
 
         <div className="mt-3 grid grid-cols-2 gap-2">
           <button
-            onClick={handleConnect}
+            onClick={() => void handleConnect()}
             disabled={status.isRunning}
             className="flex items-center justify-center gap-1.5 rounded bg-blue-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
           >

@@ -11,7 +11,10 @@ import { WorkflowStep } from '../../types/robot.types'
  * always receives IEEE-754 double-precision floats, avoiding type-mismatch
  * errors in MoveJ/MoveL pose parameters.
  */
-export function generateLua(steps: WorkflowStep[], projectName: string = 'Unnamed Project'): string {
+export function generateLua(
+  steps: WorkflowStep[],
+  projectName: string = 'Unnamed Project'
+): string {
   const dateStr = new Date().toISOString().split('T')[0]
 
   let lua = `-- ============================================

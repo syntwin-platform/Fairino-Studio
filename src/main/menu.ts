@@ -1,5 +1,4 @@
-import { Menu, MenuItemConstructorOptions, BrowserWindow, dialog, app } from 'electron'
-
+import { app, BrowserWindow, dialog, Menu, MenuItemConstructorOptions, shell } from 'electron'
 /**
  * Creates and sets the native application menu bar.
  * Dispatches file events to the Renderer process via WebContents.
@@ -87,8 +86,7 @@ export function setupMenu(mainWindow: BrowserWindow): void {
       submenu: [
         {
           label: 'Tìm hiểu thêm',
-          click: async () => {
-            const { shell } = require('electron')
+          click: async (): Promise<void> => {
             await shell.openExternal('https://electronjs.org')
           }
         },

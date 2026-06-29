@@ -1,24 +1,44 @@
-import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
+import { contextBridge, ipcRenderer } from 'electron'
+import type { IpcRendererEvent } from 'electron'
 
-// Custom APIs for renderer
-const api = {
-  showSaveDialog: (options: any) => ipcRenderer.invoke('show-save-dialog', options),
-  showOpenDialog: (options: any) => ipcRenderer.invoke('show-open-dialog', options),
-  writeFile: (filePath: string, content: string) => ipcRenderer.invoke('write-file', filePath, content),
-  readFile: (filePath: string) => ipcRenderer.invoke('read-file', filePath),
-  onMenuAction: (callback: (action: string) => void) => {
-    const listener = (_event: any, action: string) => callback(action)
+import type {
+  AppApi,
+  OpenDialogOptions,
+  OpenDialogResult,
+  SaveDialogOptions,
+  SaveDialogResult
+} from './api.types'
+
+type WindowWithApi = Window &
+  typeof globalThis & {
+    electron: typeof electronAPI
+    api: AppApi
+  }
+
+const api: AppApi = {
+  showSaveDialog: (options: SaveDialogOptions): Promise<SaveDialogResult> =>
+    ipcRenderer.invoke('show-save-dialog', options) as Promise<SaveDialogResult>,
+
+  showOpenDialog: (options: OpenDialogOptions): Promise<OpenDialogResult> =>
+    ipcRenderer.invoke('show-open-dialog', options) as Promise<OpenDialogResult>,
+
+  writeFile: (filePath, content) =>
+    ipcRenderer.invoke('write-file', filePath, content) as ReturnType<AppApi['writeFile']>,
+
+  readFile: (filePath) =>
+    ipcRenderer.invoke('read-file', filePath) as ReturnType<AppApi['readFile']>,
+
+  onMenuAction: (callback) => {
+    const listener = (_event: IpcRendererEvent, action: string): void => callback(action)
     ipcRenderer.on('menu-action', listener)
-    return () => {
+
+    return (): void => {
       ipcRenderer.removeListener('menu-action', listener)
     }
   }
 }
 
-// Use `contextBridge` APIs to expose Electron APIs to
-// renderer only if context isolation is enabled, otherwise
-// just add to the DOM global.
 if (process.contextIsolated) {
   try {
     contextBridge.exposeInMainWorld('electron', electronAPI)
@@ -27,8 +47,7 @@ if (process.contextIsolated) {
     console.error(error)
   }
 } else {
-  // @ts-ignore (define in dts)
-  window.electron = electronAPI
-  // @ts-ignore (define in dts)
-  window.api = api
+  const targetWindow = window as WindowWithApi
+  targetWindow.electron = electronAPI
+  targetWindow.api = api
 }

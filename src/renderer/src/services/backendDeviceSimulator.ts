@@ -5,10 +5,7 @@ import {
   PendingDeviceCommand,
   TcpPose
 } from '../types/backendDevice'
-import {
-  cancelActiveCommand,
-  getActiveCommandId
-} from './commandExecutionRuntime'
+import { cancelActiveCommand, getActiveCommandId } from './commandExecutionRuntime'
 import { useRobotStore } from '../store/robotStore'
 import { useSceneStore } from '../store/sceneStore'
 import {
@@ -17,7 +14,8 @@ import {
   postHeartbeat,
   postTelemetry
 } from './backendDeviceClient'
-import { executeBackendCommand } from './backendCommandExecutor'
+import { executeBackendCommand, getCommandExecutionFailureMetadata } from './backendCommandExecutor'
+import { withDeviceToken } from './backendDeviceSession'
 
 interface BackendDeviceSimulatorCallbacks {
   onStatusChange: (status: Partial<BackendSimulatorStatus>) => void
@@ -26,16 +24,14 @@ interface BackendDeviceSimulatorCallbacks {
 
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null
 let telemetryTimer: ReturnType<typeof setInterval> | null = null
-let commandPollTimer: ReturnType<typeof setInterval> | null = null
 
 let heartbeatInFlight = false
 let telemetryInFlight = false
 
-// Chỉ khóa request GET pending đang diễn ra.
-let commandPollInFlight = false
-
 // Command thường vẫn có thể chạy trong khi request polling tiếp tục.
 let commandExecutionInFlight = false
+
+let commandPollAbortController: AbortController | null = null
 
 let running = false
 let runId = 0
@@ -82,10 +78,10 @@ function validateConfig(config: BackendSimulatorConfig): void {
   if (!Number.isFinite(config.telemetryIntervalMs) || config.telemetryIntervalMs < 100) {
     throw new Error('Telemetry interval must be at least 100ms')
   }
+}
 
-  if (!Number.isFinite(config.commandPollIntervalMs) || config.commandPollIntervalMs < 300) {
-    throw new Error('Command poll interval must be at least 300ms')
-  }
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
 export function buildTelemetryFromStores(config: BackendSimulatorConfig): DeviceTelemetryPayload {
@@ -118,7 +114,7 @@ async function sendHeartbeat(
   heartbeatInFlight = true
 
   try {
-    await postHeartbeat(config)
+    await withDeviceToken(config, (token) => postHeartbeat(config, token))
     if (runId !== currentRunId) return
 
     callbacks.onStatusChange({
@@ -148,7 +144,7 @@ async function sendTelemetry(
 
   try {
     const telemetry = buildTelemetryFromStores(config)
-    await postTelemetry(config, telemetry)
+    await withDeviceToken(config, (token) => postTelemetry(config, telemetry, token))
 
     if (runId !== currentRunId) return
 
@@ -177,130 +173,137 @@ async function executeAndReportCommand(
 ): Promise<void> {
   let commandSucceeded = true
   let commandMessage = 'Simulated command executed in Fairino-Studio'
-
+  let failureMetadata: ReturnType<typeof getCommandExecutionFailureMetadata> = null
   try {
     await executeBackendCommand(command)
   } catch (error) {
     commandSucceeded = false
-    commandMessage =
-      error instanceof Error
-        ? error.message
-        : 'Command execution failed'
+    commandMessage = error instanceof Error ? error.message : 'Command execution failed'
+
+    failureMetadata = getCommandExecutionFailureMetadata(error)
   }
 
   commandMessage = commandMessage.slice(0, 500)
 
   try {
-    await postCommandResult(config, {
-      commandId: command.commandId,
-      robotId: config.robotId,
-      success: commandSucceeded,
-      status: commandSucceeded ? 'Completed' : 'Failed',
-      message: commandMessage,
-      rawPayload: {
-        source: 'Fairino-Studio Electron Simulator',
-        commandType: command.commandType
-      },
-      completedAt: new Date().toISOString()
-    })
+    await withDeviceToken(config, (token) =>
+      postCommandResult(
+        config,
+        {
+          commandId: command.commandId,
+          robotId: config.robotId,
+          success: commandSucceeded,
+          status: commandSucceeded ? 'Completed' : 'Failed',
+          message: commandMessage,
+          rawPayload: {
+            source: 'Fairino-Studio Electron Simulator',
+            commandType: command.commandType,
+            failure: failureMetadata
+          },
+          completedAt: new Date().toISOString()
+        },
+        token
+      )
+    )
 
     if (runId !== currentRunId) return
 
     callbacks.onStatusChange({
       isConnected: true,
       lastResultAt: new Date().toISOString(),
-      lastError: commandSucceeded
-        ? undefined
-        : `Command failed: ${commandMessage}`
+      lastError: commandSucceeded ? undefined : `Command failed: ${commandMessage}`
     })
   } catch (error) {
     if (runId !== currentRunId) return
 
     callbacks.onStatusChange({
       isConnected: false,
-      lastError:
-        error instanceof Error
-          ? error.message
-          : 'Command result submission failed'
+      lastError: error instanceof Error ? error.message : 'Command result submission failed'
     })
   }
 }
 
-async function pollCommand(
+async function handlePendingCommand(
+  config: BackendSimulatorConfig,
+  command: PendingDeviceCommand,
+  callbacks: BackendDeviceSimulatorCallbacks,
+  currentRunId: number
+): Promise<void> {
+  callbacks.onStatusChange({
+    isConnected: true,
+    lastCommandAt: new Date().toISOString(),
+    lastError: undefined
+  })
+
+  callbacks.onLog?.(`Received command ${command.commandType} (${command.commandId})`)
+
+  if (command.commandType === 'EStop') {
+    // Không await. EStop chạy song song và cancel command hiện tại ngay lập tức.
+    void executeAndReportCommand(config, command, callbacks, currentRunId)
+
+    return
+  }
+
+  if (commandExecutionInFlight || getActiveCommandId() !== null) {
+    callbacks.onStatusChange({
+      lastError: `Backend returned ${command.commandType} while robot is busy`
+    })
+
+    return
+  }
+
+  commandExecutionInFlight = true
+
+  // Không await tại đây. Polling phải tiếp tục để nhận EStop.
+  void executeAndReportCommand(config, command, callbacks, currentRunId).finally(() => {
+    commandExecutionInFlight = false
+  })
+}
+
+async function runCommandLongPollLoop(
   config: BackendSimulatorConfig,
   callbacks: BackendDeviceSimulatorCallbacks,
   currentRunId: number
 ): Promise<void> {
-  if (commandPollInFlight) return
+  while (running && runId === currentRunId) {
+    try {
+      const isBusy = commandExecutionInFlight || getActiveCommandId() !== null
 
-  commandPollInFlight = true
+      commandPollAbortController = new AbortController()
 
-  try {
-    const isBusy =
-      commandExecutionInFlight ||
-      getActiveCommandId() !== null
-
-    const command = await getPendingCommand(config, isBusy)
-
-    if (runId !== currentRunId || command === null) {
-      return
-    }
-
-    callbacks.onStatusChange({
-      isConnected: true,
-      lastCommandAt: new Date().toISOString(),
-      lastError: undefined
-    })
-
-    callbacks.onLog?.(
-      `Received command ${command.commandType} (${command.commandId})`
-    )
-
-    if (command.commandType === 'EStop') {
-      // Không await. EStop chạy song song và cancel command hiện tại ngay lập tức.
-      void executeAndReportCommand(
-        config,
-        command,
-        callbacks,
-        currentRunId
+      const command = await withDeviceToken(config, (token) =>
+        getPendingCommand(config, token, isBusy, commandPollAbortController?.signal)
       )
 
-      return
-    }
+      commandPollAbortController = null
 
-    if (commandExecutionInFlight || getActiveCommandId() !== null) {
+      if (runId !== currentRunId) {
+        return
+      }
+
+      if (command === null) {
+        continue
+      }
+
+      await handlePendingCommand(config, command, callbacks, currentRunId)
+    } catch (error) {
+      commandPollAbortController = null
+
+      if (runId !== currentRunId) {
+        return
+      }
+
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        return
+      }
+
       callbacks.onStatusChange({
-        lastError:
-          `Backend returned ${command.commandType} while robot is busy`
+        isConnected: false,
+        lastError: error instanceof Error ? error.message : 'Command polling failed'
       })
 
-      return
+      await delay(1000)
     }
-
-    commandExecutionInFlight = true
-
-    // Không await tại đây. Polling phải tiếp tục để nhận EStop.
-    void executeAndReportCommand(
-      config,
-      command,
-      callbacks,
-      currentRunId
-    ).finally(() => {
-      commandExecutionInFlight = false
-    })
-  } catch (error) {
-    if (runId !== currentRunId) return
-
-    callbacks.onStatusChange({
-      isConnected: false,
-      lastError:
-        error instanceof Error
-          ? error.message
-          : 'Command polling failed'
-    })
-  } finally {
-    // Chỉ khóa trong thời gian gọi GET pending.
-    commandPollInFlight = false
   }
 }
 
@@ -331,7 +334,7 @@ export const backendDeviceSimulator = {
 
     void sendHeartbeat(normalizedConfig, callbacks, currentRunId)
     void sendTelemetry(normalizedConfig, callbacks, currentRunId)
-    void pollCommand(normalizedConfig, callbacks, currentRunId)
+    void runCommandLongPollLoop(normalizedConfig, callbacks, currentRunId)
 
     heartbeatTimer = setInterval(() => {
       void sendHeartbeat(normalizedConfig, callbacks, currentRunId)
@@ -340,13 +343,9 @@ export const backendDeviceSimulator = {
     telemetryTimer = setInterval(() => {
       void sendTelemetry(normalizedConfig, callbacks, currentRunId)
     }, normalizedConfig.telemetryIntervalMs)
-
-    commandPollTimer = setInterval(() => {
-      void pollCommand(normalizedConfig, callbacks, currentRunId)
-    }, normalizedConfig.commandPollIntervalMs)
   },
 
-    stop(): void {
+  stop(): void {
     cancelActiveCommand('Backend simulator disconnected')
     runId += 1
 
@@ -360,14 +359,11 @@ export const backendDeviceSimulator = {
       telemetryTimer = null
     }
 
-    if (commandPollTimer) {
-      clearInterval(commandPollTimer)
-      commandPollTimer = null
-    }
+    commandPollAbortController?.abort()
+    commandPollAbortController = null
 
     heartbeatInFlight = false
     telemetryInFlight = false
-    commandPollInFlight = false
     commandExecutionInFlight = false
     running = false
   },

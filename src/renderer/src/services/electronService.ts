@@ -1,16 +1,25 @@
-/**
- * Service representing Electron API calls via IPC.
- * Provides fallback mock methods for web/browser environment testing.
- */
+import type {
+  FileReadResult,
+  FileWriteResult,
+  OpenDialogOptions,
+  OpenDialogResult,
+  SaveDialogOptions,
+  SaveDialogResult
+} from '../../../preload/api.types'
+
 export interface ElectronService {
   isElectron: boolean
-  showSaveDialog: (options: any) => Promise<{ canceled: boolean; filePath?: string }>
-  showOpenDialog: (options: any) => Promise<{ canceled: boolean; filePaths: string[] }>
-  writeFile: (filePath: string, content: string) => Promise<{ success: boolean; error?: string }>
-  readFile: (filePath: string) => Promise<{ success: boolean; content?: string; error?: string }>
+  showSaveDialog: (options: SaveDialogOptions) => Promise<SaveDialogResult>
+  showOpenDialog: (options: OpenDialogOptions) => Promise<OpenDialogResult>
+  writeFile: (filePath: string, content: string) => Promise<FileWriteResult>
+  readFile: (filePath: string) => Promise<FileReadResult>
 }
 
 const isElectronEnv = typeof window !== 'undefined' && 'api' in window
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
 
 export const electronService: ElectronService = {
   isElectron: isElectronEnv,
@@ -19,11 +28,18 @@ export const electronService: ElectronService = {
     if (isElectronEnv) {
       return window.api.showSaveDialog(options)
     }
+
     console.warn('showSaveDialog called outside Electron env.')
-    const fileName = prompt('Nhập tên file để lưu (giả lập):', options.defaultPath || 'project.fairobot')
+
+    const fileName = prompt(
+      'Nhập tên file để lưu (giả lập):',
+      options.defaultPath || 'project.fairobot'
+    )
+
     if (fileName) {
       return { canceled: false, filePath: fileName }
     }
+
     return { canceled: true }
   },
 
@@ -31,8 +47,10 @@ export const electronService: ElectronService = {
     if (isElectronEnv) {
       return window.api.showOpenDialog(options)
     }
+
     console.warn('showOpenDialog called outside Electron env.')
     alert('Vui lòng sử dụng tính năng import trên giao diện web.')
+
     return { canceled: true, filePaths: [] }
   },
 
@@ -40,21 +58,25 @@ export const electronService: ElectronService = {
     if (isElectronEnv) {
       return window.api.writeFile(filePath, content)
     }
+
     console.warn('writeFile called outside Electron env.')
-    // In Web, we simulate saving by triggering a file download
+
     try {
       const blob = new Blob([content], { type: 'application/json' })
       const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = filePath.split(/[\\/]/).pop() || 'project.fairobot'
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
+      const anchor = document.createElement('a')
+
+      anchor.href = url
+      anchor.download = filePath.split(/[\\/]/).pop() || 'project.fairobot'
+
+      document.body.appendChild(anchor)
+      anchor.click()
+      document.body.removeChild(anchor)
       URL.revokeObjectURL(url)
+
       return { success: true }
-    } catch (e: any) {
-      return { success: false, error: e.message }
+    } catch (error: unknown) {
+      return { success: false, error: getErrorMessage(error) }
     }
   },
 
@@ -62,7 +84,12 @@ export const electronService: ElectronService = {
     if (isElectronEnv) {
       return window.api.readFile(filePath)
     }
+
     console.warn('readFile called outside Electron env.')
-    return { success: false, error: 'Không hỗ trợ đọc file trực tiếp ngoài Electron.' }
+
+    return {
+      success: false,
+      error: 'Không hỗ trợ đọc file trực tiếp ngoài Electron.'
+    }
   }
 }

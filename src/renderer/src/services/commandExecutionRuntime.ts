@@ -14,9 +14,7 @@ export class CommandExecutionCancelledError extends Error {
 
 export function beginCommandExecution(commandId: string): AbortSignal {
   if (activeExecution && !activeExecution.controller.signal.aborted) {
-    throw new Error(
-      `Command ${activeExecution.commandId} is already executing`
-    )
+    throw new Error(`Command ${activeExecution.commandId} is already executing`)
   }
 
   const controller = new AbortController()
@@ -47,10 +45,7 @@ export function finishCommandExecution(commandId: string): void {
 export function throwIfCommandCancelled(signal: AbortSignal): void {
   if (!signal.aborted) return
 
-  const reason =
-    typeof signal.reason === 'string'
-      ? signal.reason
-      : 'Cancellation requested'
+  const reason = typeof signal.reason === 'string' ? signal.reason : 'Cancellation requested'
 
   throw new CommandExecutionCancelledError(reason)
 }

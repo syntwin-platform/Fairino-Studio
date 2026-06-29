@@ -1,13 +1,47 @@
-import { useEffect } from 'react'
+import { useCallback, useEffect } from 'react'
+import { AlertTriangle, FilePlus, FolderOpen, Globe, Play, Save, Upload } from 'lucide-react'
+
+import { generateLua } from '../../engine/codegen/luaCodegen'
+import { translations } from '../../i18n/translations'
+import { electronService } from '../../services/electronService'
+import { previewLuaProgram } from '../../services/backendLuaImportClient'
+import { toWorkflowStep } from '../../services/backendLuaWorkflowMapper'
 import { useRobotStore } from '../../store/robotStore'
 import { useSceneStore } from '../../store/sceneStore'
-import { generateLua } from '../../engine/codegen/luaCodegen'
-import { parseLua } from '../../engine/codegen/luaParser'
-import { FolderOpen, Save, FilePlus, Play, AlertTriangle, Globe, Upload } from 'lucide-react'
-import { electronService } from '../../services/electronService'
-import { translations } from '../../i18n/translations'
+import { DEFAULT_JOINT_ANGLES } from '../../types/robot.types'
+import type { JointAngles, RobotProgramSource, WorkflowStep } from '../../types/robot.types'
+import type { Transform3D } from '../../types/scene.types'
 
-export default function Header() {
+type AppLanguage = keyof typeof translations
+
+interface SavedSceneObject {
+  name: string
+  fileType: 'gltf' | 'glb' | 'stl'
+  filePath?: string
+  url?: string
+  transform: Transform3D
+  visible: boolean
+}
+
+interface SavedProjectData {
+  version?: string
+  projectName?: string
+  robotModel?: string
+  jointAngles?: JointAngles
+  steps?: WorkflowStep[]
+  programSource?: RobotProgramSource
+  sceneObjects?: SavedSceneObject[]
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function parseSavedProject(jsonStr: string): SavedProjectData {
+  return JSON.parse(jsonStr) as SavedProjectData
+}
+
+export default function Header(): React.JSX.Element {
   const steps = useRobotStore((state) => state.steps)
   const projectName = useRobotStore((state) => state.projectName)
   const currentFilePath = useRobotStore((state) => state.currentFilePath)
@@ -17,91 +51,105 @@ export default function Header() {
   const setCurrentFilePath = useRobotStore((state) => state.setCurrentFilePath)
   const setJointAngles = useRobotStore((state) => state.setJointAngles)
   const reorderSteps = useRobotStore((state) => state.reorderSteps)
+  const setProgramSource = useRobotStore((state) => state.setProgramSource)
 
-  // Language translation helper
   const language = useRobotStore((state) => state.language)
   const setLanguage = useRobotStore((state) => state.setLanguage)
-  const t = (key: keyof typeof translations.vi) => translations[language][key]
 
-  const handleNewProject = () => {
+  const t = useCallback(
+    (key: keyof typeof translations.vi): string => translations[language][key],
+    [language]
+  )
+
+  const handleNewProject = useCallback((): void => {
     if (confirm(t('newProjectConfirm'))) {
       reorderSteps([])
-      setJointAngles([0, 0, 0, 0, 0, 0])
+      setJointAngles([...DEFAULT_JOINT_ANGLES])
       setProjectName('coffee_machine_workflow')
       setCurrentFilePath(null)
+      setProgramSource('Studio')
       useSceneStore.getState().clearScene()
     }
-  }
+  }, [reorderSteps, setCurrentFilePath, setJointAngles, setProgramSource, setProjectName, t])
 
-  // Serialize current workspace state to JSON string
-  const serializeProject = () => {
+  const serializeProject = useCallback((): string => {
     const robotState = useRobotStore.getState()
     const sceneState = useSceneStore.getState()
 
-    const projectData = {
+    const projectData: SavedProjectData = {
       version: '1.0',
       projectName: robotState.projectName,
       robotModel: robotState.robotModel,
       jointAngles: robotState.jointAngles,
       steps: robotState.steps,
-      sceneObjects: sceneState.objects.map(obj => ({
-        name: obj.name,
-        fileType: obj.fileType,
-        filePath: obj.filePath,
-        transform: obj.transform,
-        visible: obj.visible
+      programSource: robotState.programSource,
+      sceneObjects: sceneState.objects.map((object) => ({
+        name: object.name,
+        fileType: object.fileType,
+        filePath: object.filePath,
+        url: object.url,
+        transform: object.transform,
+        visible: object.visible
       }))
     }
 
     return JSON.stringify(projectData, null, 2)
-  }
+  }, [])
 
-  // Deserialize and load workspace state from JSON string
-  const deserializeProject = (jsonStr: string, filePath: string) => {
-    try {
-      const data = JSON.parse(jsonStr)
-      if (data.version !== '1.0') {
-        alert(t('projectCompatError'))
-        return
-      }
+  const deserializeProject = useCallback(
+    (jsonStr: string, filePath: string): void => {
+      try {
+        const data = parseSavedProject(jsonStr)
 
-      // 1. Populate Robot Store
-      setProjectName(data.projectName || 'loaded_project')
-      setCurrentFilePath(filePath)
-      setJointAngles(data.jointAngles || [0, 0, 0, 0, 0, 0])
-      reorderSteps(data.steps || [])
+        if (data.version !== '1.0') {
+          alert(t('projectCompatError'))
+          return
+        }
 
-      // 2. Populate Scene Store
-      useSceneStore.getState().clearScene()
-      if (data.sceneObjects && Array.isArray(data.sceneObjects)) {
-        data.sceneObjects.forEach((obj: any) => {
-          let url = ''
-          if (obj.filePath) {
-            url = `file:///${obj.filePath.replace(/\\/g, '/')}`
-          }
-          
-          useSceneStore.getState().addObject({
-            name: obj.name,
-            fileType: obj.fileType,
-            filePath: obj.filePath,
-            url: url || obj.url || ''
+        setProjectName(data.projectName || 'loaded_project')
+        setProgramSource(
+          data.programSource === 'ImportedLua' || data.programSource === 'BackendGenerated'
+            ? data.programSource
+            : 'Studio'
+        )
+        setCurrentFilePath(filePath)
+        setJointAngles(data.jointAngles || [...DEFAULT_JOINT_ANGLES])
+        reorderSteps(data.steps || [])
+
+        const sceneStore = useSceneStore.getState()
+        sceneStore.clearScene()
+
+        if (Array.isArray(data.sceneObjects)) {
+          data.sceneObjects.forEach((object) => {
+            const url = object.filePath
+              ? `file:///${object.filePath.replace(/\\/g, '/')}`
+              : object.url || ''
+
+            sceneStore.addObject({
+              name: object.name,
+              fileType: object.fileType,
+              filePath: object.filePath,
+              url
+            })
+
+            const lastAdded = useSceneStore.getState().objects.slice(-1)[0]
+
+            if (lastAdded) {
+              sceneStore.updateObjectTransform(lastAdded.id, object.transform)
+              sceneStore.updateObjectVisibility(lastAdded.id, object.visible)
+            }
           })
-          
-          const lastAdded = useSceneStore.getState().objects.slice(-1)[0]
-          if (lastAdded) {
-            useSceneStore.getState().updateObjectTransform(lastAdded.id, obj.transform)
-            useSceneStore.getState().updateObjectVisibility(lastAdded.id, obj.visible)
-          }
-        })
+        }
+
+        alert(t('projectOpenSuccess'))
+      } catch (error: unknown) {
+        alert(`${t('projectReadError')} ${getErrorMessage(error)}`)
       }
+    },
+    [reorderSteps, setCurrentFilePath, setJointAngles, setProgramSource, setProjectName, t]
+  )
 
-      alert(t('projectOpenSuccess'))
-    } catch (e: any) {
-      alert(`${t('projectReadError')} ${e.message}`)
-    }
-  }
-
-  const handleOpenProject = async () => {
+  const handleOpenProject = useCallback(async (): Promise<void> => {
     const result = await electronService.showOpenDialog({
       title: t('openProject'),
       filters: [{ name: 'FaiRobot Projects', extensions: ['fairobot'] }],
@@ -110,71 +158,80 @@ export default function Header() {
 
     if (!result.canceled && result.filePaths.length > 0) {
       const filePath = result.filePaths[0]
-      const readRes = await electronService.readFile(filePath)
-      if (readRes.success && readRes.content) {
-        deserializeProject(readRes.content, filePath)
+      const readResult = await electronService.readFile(filePath)
+
+      if (readResult.success && readResult.content) {
+        deserializeProject(readResult.content, filePath)
       } else {
-        alert(`${t('projectReadError')} ${readRes.error}`)
+        alert(`${t('projectReadError')} ${readResult.error}`)
       }
     }
-  }
+  }, [deserializeProject, t])
 
-  const handleSaveProject = async () => {
-    const currentPath = useRobotStore.getState().currentFilePath
-    if (currentPath) {
-      const content = serializeProject()
-      const writeRes = await electronService.writeFile(currentPath, content)
-      if (writeRes.success) {
-        alert(t('projectSaveSuccess'))
-      } else {
-        alert(`${t('projectSaveError')} ${writeRes.error}`)
-      }
-    } else {
-      handleSaveAsProject()
-    }
-  }
-
-  const handleSaveAsProject = async () => {
-    const projName = useRobotStore.getState().projectName
+  const handleSaveAsProject = useCallback(async (): Promise<void> => {
+    const currentProjectName = useRobotStore.getState().projectName
     const content = serializeProject()
+
     const result = await electronService.showSaveDialog({
       title: t('saveProject'),
-      defaultPath: `${projName}.fairobot`,
+      defaultPath: `${currentProjectName}.fairobot`,
       filters: [{ name: 'FaiRobot Projects', extensions: ['fairobot'] }]
     })
 
     if (!result.canceled && result.filePath) {
-      const writeRes = await electronService.writeFile(result.filePath, content)
-      if (writeRes.success) {
+      const writeResult = await electronService.writeFile(result.filePath, content)
+
+      if (writeResult.success) {
         setCurrentFilePath(result.filePath)
         alert(t('projectSaveSuccess'))
       } else {
-        alert(`${t('projectSaveError')} ${writeRes.error}`)
+        alert(`${t('projectSaveError')} ${writeResult.error}`)
       }
     }
-  }
+  }, [serializeProject, setCurrentFilePath, t])
 
-  const handleExportLua = async () => {
+  const handleSaveProject = useCallback(async (): Promise<void> => {
+    const currentPath = useRobotStore.getState().currentFilePath
+
+    if (currentPath) {
+      const content = serializeProject()
+      const writeResult = await electronService.writeFile(currentPath, content)
+
+      if (writeResult.success) {
+        alert(t('projectSaveSuccess'))
+      } else {
+        alert(`${t('projectSaveError')} ${writeResult.error}`)
+      }
+
+      return
+    }
+
+    await handleSaveAsProject()
+  }, [handleSaveAsProject, serializeProject, t])
+
+  const handleExportLua = useCallback(async (): Promise<void> => {
     const currentSteps = useRobotStore.getState().steps
-    const projName = useRobotStore.getState().projectName
-    const luaCode = generateLua(currentSteps, projName)
+    const currentProjectName = useRobotStore.getState().projectName
+    const luaCode = generateLua(currentSteps, currentProjectName)
+
     const result = await electronService.showSaveDialog({
       title: t('exportLua'),
-      defaultPath: `${projName}.lua`,
+      defaultPath: `${currentProjectName}.lua`,
       filters: [{ name: 'Lua Script Files', extensions: ['lua'] }]
     })
 
     if (!result.canceled && result.filePath) {
-      const writeRes = await electronService.writeFile(result.filePath, luaCode)
-      if (writeRes.success) {
+      const writeResult = await electronService.writeFile(result.filePath, luaCode)
+
+      if (writeResult.success) {
         alert(t('luaExportSuccess'))
       } else {
-        alert(`${t('luaExportError')} ${writeRes.error}`)
+        alert(`${t('luaExportError')} ${writeResult.error}`)
       }
     }
-  }
+  }, [t])
 
-  const handleImportLua = async () => {
+  const handleImportLua = useCallback(async (): Promise<void> => {
     const result = await electronService.showOpenDialog({
       title: t('importLua'),
       filters: [{ name: 'Lua Script Files', extensions: ['lua'] }],
@@ -183,30 +240,60 @@ export default function Header() {
 
     if (!result.canceled && result.filePaths.length > 0) {
       const filePath = result.filePaths[0]
-      const readRes = await electronService.readFile(filePath)
-      if (readRes.success && readRes.content) {
+      const readResult = await electronService.readFile(filePath)
+
+      if (readResult.success && readResult.content) {
         try {
-          const { steps: parsedSteps, projectName: parsedProjName } = parseLua(readRes.content)
-          if (parsedSteps.length === 0) {
-            alert(`${t('luaImportError')} ${language === 'vi' ? 'Không tìm thấy bước lệnh hợp lệ nào trong file LUA.' : 'No valid command steps found in the LUA file.'}`)
+          const selectedFileName = filePath.split(/[\\/]/).pop() || filePath
+          const preview = await previewLuaProgram(selectedFileName, readResult.content)
+          const parseErrors = preview.diagnostics.filter(
+            (diagnostic) => diagnostic.severity === 'error'
+          )
+
+          if (parseErrors.length > 0) {
+            const details = parseErrors
+              .slice(0, 5)
+              .map(
+                (diagnostic) =>
+                  `Line ${diagnostic.line}: ${diagnostic.message}\n${diagnostic.source}`
+              )
+              .join('\n\n')
+
+            const remainingCount = parseErrors.length - 5
+            const remainingMessage =
+              remainingCount > 0 ? `\n\n...and ${remainingCount} more error(s).` : ''
+
+            alert(`${t('luaImportError')}\n\n${details}${remainingMessage}`)
             return
           }
-          
-          reorderSteps(parsedSteps)
-          if (parsedProjName) {
-            setProjectName(parsedProjName)
+
+          const parsedSteps = preview.parsedSteps
+            .map(toWorkflowStep)
+            .filter((step): step is WorkflowStep => step !== null)
+
+          if (parsedSteps.length === 0) {
+            const message =
+              language === 'vi'
+                ? 'Không tìm thấy bước lệnh hợp lệ nào trong file LUA.'
+                : 'No valid command steps were found in the LUA file.'
+
+            alert(`${t('luaImportError')} ${message}`)
+            return
           }
+
+          reorderSteps(parsedSteps)
+          setProjectName(preview.metadata.projectName || 'Imported Project')
+          setProgramSource('ImportedLua')
           alert(t('luaImportSuccess'))
-        } catch (e: any) {
-          alert(`${t('luaImportError')} ${e.message}`)
+        } catch (error: unknown) {
+          alert(`${t('luaImportError')} ${getErrorMessage(error)}`)
         }
       } else {
-        alert(`${t('luaImportError')} ${readRes.error}`)
+        alert(`${t('luaImportError')} ${readResult.error}`)
       }
     }
-  }
+  }, [language, reorderSteps, setProgramSource, setProjectName, t])
 
-  // Subscribe to native menu actions on mount
   useEffect(() => {
     if (typeof window !== 'undefined' && 'api' in window && window.api.onMenuAction) {
       const unsubscribe = window.api.onMenuAction((action) => {
@@ -215,121 +302,136 @@ export default function Header() {
             handleNewProject()
             break
           case 'open-project':
-            handleOpenProject()
+            void handleOpenProject()
             break
           case 'save-project':
-            handleSaveProject()
+            void handleSaveProject()
             break
           case 'save-as-project':
-            handleSaveAsProject()
+            void handleSaveAsProject()
             break
           case 'export-lua':
-            handleExportLua()
+            void handleExportLua()
             break
           case 'import-lua':
-            handleImportLua()
+            void handleImportLua()
             break
         }
       })
+
       return unsubscribe
     }
+
     return undefined
-  }, [language]) // Refresh subscription if language changes so local confirm prompts get proper translations
+  }, [
+    handleExportLua,
+    handleImportLua,
+    handleNewProject,
+    handleOpenProject,
+    handleSaveAsProject,
+    handleSaveProject
+  ])
 
   return (
-    <header className="h-14 bg-[#141417] border-b border-[#2d2d34] flex items-center justify-between px-6 text-slate-200 select-none shrink-0">
-      {/* Brand / Logo */}
+    <header className="flex h-14 shrink-0 select-none items-center justify-between border-b border-[#2d2d34] bg-[#141417] px-6 text-slate-200">
       <div className="flex items-center gap-3">
-        <div className="bg-gradient-to-tr from-blue-600 to-indigo-600 text-white font-black px-2.5 py-1 rounded-md text-sm shadow-md">
+        <div className="rounded-md bg-gradient-to-tr from-blue-600 to-indigo-600 px-2.5 py-1 text-sm font-black text-white shadow-md">
           FAI
         </div>
         <div>
-          <h1 className="text-sm font-bold text-white leading-tight">FaiRobot Studio</h1>
+          <h1 className="text-sm font-bold leading-tight text-white">FaiRobot Studio</h1>
           <span className="text-[10px] text-slate-500">v1.0.0 (Beta)</span>
         </div>
       </div>
 
-      {/* Project Name Editor */}
       <div className="flex items-center gap-2">
         <input
           type="text"
           value={projectName}
-          onChange={(e) => setProjectName(e.target.value.replace(/[^a-zA-Z0-9_-]/g, ''))}
+          onChange={(event) => setProjectName(event.target.value.replace(/[^a-zA-Z0-9_-]/g, ''))}
           placeholder={t('projectNamePlaceholder')}
           title="Tên dự án (chỉ cho phép chữ cái, số, gạch dưới và gạch ngang)"
-          className="bg-[#1e1e24] hover:bg-[#25252d] focus:bg-[#2d2d38] border border-[#2d2d34] focus:border-blue-500 rounded px-2.5 py-1 text-xs font-semibold text-white outline-none w-48 text-center transition"
+          className="w-48 rounded border border-[#2d2d34] bg-[#1e1e24] px-2.5 py-1 text-center text-xs font-semibold text-white outline-none transition hover:bg-[#25252d] focus:border-blue-500 focus:bg-[#2d2d38]"
         />
+
         {currentFilePath && (
-          <span className="text-[9px] text-slate-500 truncate max-w-[150px]" title={currentFilePath}>
+          <span
+            className="max-w-[150px] truncate text-[9px] text-slate-500"
+            title={currentFilePath}
+          >
             ({currentFilePath.split('\\').pop()})
           </span>
         )}
       </div>
 
-      {/* Collision Global Alert */}
       {collisionWarning && (
-        <div className="flex items-center gap-1.5 px-3 py-1 bg-rose-950/40 border border-rose-500/35 rounded-full text-rose-400 text-xs font-bold animate-pulse">
+        <div className="flex animate-pulse items-center gap-1.5 rounded-full border border-rose-500/35 bg-rose-950/40 px-3 py-1 text-xs font-bold text-rose-400">
           <AlertTriangle size={14} /> {t('collisionWarning')}
         </div>
       )}
 
-      {/* Action Buttons & Language Switcher */}
       <div className="flex items-center gap-4">
-        {/* Language selector */}
-        <div className="flex items-center gap-1.5 border border-[#2d2d34] rounded-lg px-2.5 py-1.5 bg-[#1e1e24] hover:bg-[#25252d] hover:border-slate-500 transition">
+        <div className="flex items-center gap-1.5 rounded-lg border border-[#2d2d34] bg-[#1e1e24] px-2.5 py-1.5 transition hover:border-slate-500 hover:bg-[#25252d]">
           <Globe size={13} className="text-slate-400" />
           <select
             value={language}
-            onChange={(e) => setLanguage(e.target.value as any)}
-            className="bg-transparent text-xs font-bold text-slate-300 outline-none cursor-pointer border-none p-0 pr-1"
+            onChange={(event) => setLanguage(event.target.value as AppLanguage)}
+            className="cursor-pointer border-none bg-transparent p-0 pr-1 text-xs font-bold text-slate-300 outline-none"
           >
             <option value="vi">Tiếng Việt</option>
             <option value="en">English</option>
           </select>
         </div>
 
-        <div className="w-px h-5 bg-[#2d2d34]"></div>
+        <div className="h-5 w-px bg-[#2d2d34]" />
 
         <div className="flex items-center gap-2">
           <button
+            type="button"
             onClick={handleNewProject}
             title={t('newProject')}
-            className="p-1.5 rounded bg-[#1e1e24] hover:bg-[#282830] border border-[#2d2d34] text-slate-300 hover:text-white transition flex items-center gap-1"
+            className="flex items-center gap-1 rounded border border-[#2d2d34] bg-[#1e1e24] p-1.5 text-slate-300 transition hover:bg-[#282830] hover:text-white"
           >
             <FilePlus size={14} />
-            <span className="text-[11px] font-semibold hidden md:inline">{t('newProject')}</span>
+            <span className="hidden text-[11px] font-semibold md:inline">{t('newProject')}</span>
           </button>
-          <button
-            onClick={handleOpenProject}
-            title={t('openProject')}
-            className="p-1.5 rounded bg-[#1e1e24] hover:bg-[#282830] border border-[#2d2d34] text-slate-300 hover:text-white transition flex items-center gap-1"
-          >
-            <FolderOpen size={14} />
-            <span className="text-[11px] font-semibold hidden md:inline">{t('openProject')}</span>
-          </button>
-          <button
-            onClick={handleSaveProject}
-            title={t('saveProject')}
-            className="p-1.5 rounded bg-[#1e1e24] hover:bg-[#282830] border border-[#2d2d34] text-slate-300 hover:text-white transition flex items-center gap-1"
-          >
-            <Save size={14} />
-            <span className="text-[11px] font-semibold hidden md:inline">{t('saveProject')}</span>
-          </button>
-          
-          <div className="w-px h-5 bg-[#2d2d34] mx-1"></div>
 
           <button
-            onClick={handleImportLua}
+            type="button"
+            onClick={() => void handleOpenProject()}
+            title={t('openProject')}
+            className="flex items-center gap-1 rounded border border-[#2d2d34] bg-[#1e1e24] p-1.5 text-slate-300 transition hover:bg-[#282830] hover:text-white"
+          >
+            <FolderOpen size={14} />
+            <span className="hidden text-[11px] font-semibold md:inline">{t('openProject')}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => void handleSaveProject()}
+            title={t('saveProject')}
+            className="flex items-center gap-1 rounded border border-[#2d2d34] bg-[#1e1e24] p-1.5 text-slate-300 transition hover:bg-[#282830] hover:text-white"
+          >
+            <Save size={14} />
+            <span className="hidden text-[11px] font-semibold md:inline">{t('saveProject')}</span>
+          </button>
+
+          <div className="mx-1 h-5 w-px bg-[#2d2d34]" />
+
+          <button
+            type="button"
+            onClick={() => void handleImportLua()}
             title={t('importLua')}
-            className="p-1.5 rounded bg-[#1e1e24] hover:bg-[#282830] border border-[#2d2d34] text-slate-300 hover:text-white transition flex items-center gap-1"
+            className="flex items-center gap-1 rounded border border-[#2d2d34] bg-[#1e1e24] p-1.5 text-slate-300 transition hover:bg-[#282830] hover:text-white"
           >
             <Upload size={14} />
-            <span className="text-[11px] font-semibold hidden md:inline">{t('importLua')}</span>
+            <span className="hidden text-[11px] font-semibold md:inline">{t('importLua')}</span>
           </button>
-          
+
           <button
-            onClick={handleExportLua}
-            className="px-3.5 py-1.5 rounded bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-md transition flex items-center gap-1.5"
+            type="button"
+            onClick={() => void handleExportLua()}
+            className="flex items-center gap-1.5 rounded bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-md transition hover:bg-blue-500"
           >
             <Play size={12} className="fill-white" />
             {t('exportLua')} ({steps.length})

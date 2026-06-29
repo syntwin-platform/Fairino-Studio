@@ -8,6 +8,50 @@ export interface BackendSimulatorConfig {
   commandPollIntervalMs: number
 }
 
+export interface DeviceSessionResponse {
+  robotId: string
+  accessToken: string
+  expiresInSeconds: number
+}
+
+export interface BackendRuntimeScaleConfig {
+  allowLegacyDeviceSecretAuth?: boolean
+  pendingCommandPollIntervalMilliseconds?: number
+  pendingCommandMaxWaitSeconds?: number
+  pendingCommandMaxSkippedQueueItems?: number
+}
+
+export interface MoveLMotionPolicy {
+  maxDistanceMm: number
+  maxRotationDeg: number
+  waypointSpacingMm: number
+  timeoutMs: number
+}
+
+export interface MoveJMotionPolicy {
+  timeoutMs: number
+  maxJointDeltaDeg: number
+}
+
+export interface RobotMotionPolicy {
+  moveL: MoveLMotionPolicy
+  moveJ: MoveJMotionPolicy
+}
+
+export interface JointLimit {
+  joint: number
+  minDeg: number
+  maxDeg: number
+}
+
+export interface RobotRuntimeConfig {
+  robotId: string
+  robotModel: string
+  profile: string
+  motionPolicy: RobotMotionPolicy
+  jointLimits: JointLimit[]
+}
+
 export interface TcpPose {
   x: number
   y: number
@@ -55,6 +99,32 @@ export interface BackendSimulatorStatus {
   lastError?: string
 }
 
+export const defaultRobotRuntimeConfig: RobotRuntimeConfig = {
+  robotId: '',
+  robotModel: 'Fairino FR5',
+  profile: 'Simulator',
+  motionPolicy: {
+    moveL: {
+      maxDistanceMm: 300,
+      maxRotationDeg: 45,
+      waypointSpacingMm: 5,
+      timeoutMs: 20_000
+    },
+    moveJ: {
+      timeoutMs: 20_000,
+      maxJointDeltaDeg: 180
+    }
+  },
+  jointLimits: [
+    { joint: 1, minDeg: -175, maxDeg: 175 },
+    { joint: 2, minDeg: -265, maxDeg: 85 },
+    { joint: 3, minDeg: -160, maxDeg: 160 },
+    { joint: 4, minDeg: -265, maxDeg: 265 },
+    { joint: 5, minDeg: -175, maxDeg: 175 },
+    { joint: 6, minDeg: -175, maxDeg: 175 }
+  ]
+}
+
 export const defaultBackendSimulatorConfig: BackendSimulatorConfig = {
   enabled: false,
   backendUrl: 'http://localhost:5200',
@@ -63,4 +133,68 @@ export const defaultBackendSimulatorConfig: BackendSimulatorConfig = {
   heartbeatIntervalMs: 3000,
   telemetryIntervalMs: 250,
   commandPollIntervalMs: 1000
+}
+
+// ─── Safety Policy ────────────────────────────────────────────────────────────
+
+export type SafetyPolicySource = 'Robot' | 'Company' | 'Default'
+
+export type SafetySeverity = 'Info' | 'Warning' | 'Blocker'
+
+export interface RobotJointLimit {
+  joint: number
+  minDeg: number
+  maxDeg: number
+}
+
+export interface RobotTcpWorkspaceLimit {
+  minX: number
+  maxX: number
+  minY: number
+  maxY: number
+  minZ: number
+  maxZ: number
+  minRotationDeg: number
+  maxRotationDeg: number
+}
+
+export interface RobotSafetyPolicyDefinition {
+  name: string
+  robotModel: string
+  jointLimits: RobotJointLimit[]
+  tcpWorkspace: RobotTcpWorkspaceLimit
+  minSpeedPercent: number
+  maxSpeedPercent: number
+  minAccelerationPercent: number
+  maxAccelerationPercent: number
+  maxJointDeltaDegPerStep: number
+  maxFirstStepJointDeltaDeg: number
+}
+
+export interface SafetyPolicyResponse {
+  source: SafetyPolicySource
+  policyId: string | null
+  companyId: string
+  robotId: string | null
+  canManage: boolean
+  policy: RobotSafetyPolicyDefinition
+  updatedAt: string | null
+}
+
+export interface UpsertSafetyPolicyRequest {
+  policy: RobotSafetyPolicyDefinition
+}
+
+export interface SafetyDiagnostic {
+  severity: SafetySeverity
+  code: string
+  stepOrderIndex: number | null
+  stepLabel: string | null
+  field: string | null
+  message: string
+}
+
+export interface SafetyValidationErrorResponse {
+  message: string
+  diagnostics: SafetyDiagnostic[]
 }

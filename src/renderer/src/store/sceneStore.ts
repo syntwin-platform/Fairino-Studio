@@ -6,7 +6,7 @@ interface SceneState {
   selectedObjectId: string | null
   collisionWarning: boolean
   isDebugHitbox: boolean
-  
+
   // Actions
   addObject: (obj: Omit<SceneObject, 'id' | 'transform' | 'visible'>) => void
   removeObject: (id: string) => void
@@ -69,10 +69,11 @@ export const useSceneStore = create<SceneState>((set) => ({
     })),
 
   setSelectedObjectId: (id) => set({ selectedObjectId: id }),
-  
+
   setCollisionWarning: (warning) => set({ collisionWarning: warning }),
-  
+
   setDebugHitbox: (debug) => set({ isDebugHitbox: debug }),
 
-  clearScene: () => set({ objects: [], selectedObjectId: null, collisionWarning: false, isDebugHitbox: false })
+  clearScene: () =>
+    set({ objects: [], selectedObjectId: null, collisionWarning: false, isDebugHitbox: false })
 }))

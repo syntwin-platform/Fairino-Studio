@@ -1,5 +1,16 @@
 import * as THREE from 'three'
-import { JointAngles } from '../../types/robot.types'
+import type { JointAngles } from '../../types/robot.types'
+
+interface RobotJoint {
+  angle?: number
+  jointValue?: number
+  setJointValue: (value: number) => void
+}
+
+interface FairinoRobotObject extends THREE.Object3D {
+  joints: Record<string, RobotJoint>
+  links: Record<string, THREE.Object3D>
+}
 
 const JOINT_LIMITS = [
   { minRad: (-175 * Math.PI) / 180, maxRad: (175 * Math.PI) / 180 }, // j1
@@ -68,7 +79,7 @@ export function solveIK(
   targetPos: THREE.Vector3, // Target position in meters (robot coordinate frame)
   targetQuat: THREE.Quaternion, // Target orientation (robot coordinate frame)
   currentAngles: JointAngles, // Current joint angles in degrees
-  robotObj: any // Three.js robot object loaded by urdf-loader
+  robotObj: FairinoRobotObject | null | undefined // Three.js robot object loaded by urdf-loader
 ): JointAngles | null {
   if (!robotObj) return null
 

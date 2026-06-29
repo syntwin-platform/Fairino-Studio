@@ -1,4 +1,5 @@
 import { useRobotStore } from '../store/robotStore'
+import { useSceneStore } from '../store/sceneStore'
 import { JointAngles, TCPPose } from '../types/robot.types'
 import { PendingDeviceCommand } from '../types/backendDevice'
 import { runMoveL } from './robotMotionRuntime'
@@ -41,6 +42,31 @@ interface RunProgramStep {
   payload?: unknown
 }
 
+export interface CommandExecutionFailureMetadata {
+  source: string
+  stepIndex?: number
+  stepOrderIndex?: number
+  stepType?: string
+  stepLabel?: string
+  technicalMessage: string
+}
+
+export class CommandExecutionError extends Error {
+  metadata: CommandExecutionFailureMetadata
+
+  constructor(message: string, metadata: CommandExecutionFailureMetadata) {
+    super(message)
+    this.name = 'CommandExecutionError'
+    this.metadata = metadata
+  }
+}
+
+export function getCommandExecutionFailureMetadata(
+  error: unknown
+): CommandExecutionFailureMetadata | null {
+  return error instanceof CommandExecutionError ? error.metadata : null
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -81,6 +107,19 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 
     signal.addEventListener('abort', handleAbort, { once: true })
   })
+}
+
+function throwIfCollisionDetected(): void {
+  if (!useSceneStore.getState().collisionWarning) {
+    return
+  }
+
+  throw new Error('Collision detected. Robot motion stopped by Fairino Studio.')
+}
+
+function assertMotionCanContinue(signal: AbortSignal): void {
+  throwIfCommandCancelled(signal)
+  throwIfCollisionDetected()
 }
 
 function easeInOutCubic(value: number): number {
@@ -229,10 +268,7 @@ function parseRunProgramSteps(payload: unknown): RunProgramStep[] {
       throw new Error(`RunProgram step ${index + 1} must be an object`)
     }
 
-    if (
-      !Number.isInteger(value.orderIndex) ||
-      (value.orderIndex as number) < 1
-    ) {
+    if (!Number.isInteger(value.orderIndex) || (value.orderIndex as number) < 1) {
       throw new Error(`RunProgram step ${index + 1} has invalid orderIndex`)
     }
 
@@ -244,10 +280,7 @@ function parseRunProgramSteps(payload: unknown): RunProgramStep[] {
 
     orderIndexes.add(orderIndex)
 
-    if (
-      typeof value.stepType !== 'string' ||
-      !value.stepType.trim()
-    ) {
+    if (typeof value.stepType !== 'string' || !value.stepType.trim()) {
       throw new Error(`RunProgram step ${orderIndex} requires stepType`)
     }
 
@@ -262,11 +295,8 @@ function parseRunProgramSteps(payload: unknown): RunProgramStep[] {
   return steps.sort((first, second) => first.orderIndex - second.orderIndex)
 }
 
-async function executeWaitMs(
-  payload: unknown,
-  signal: AbortSignal
-): Promise<void> {
-  throwIfCommandCancelled(signal)
+async function executeWaitMs(payload: unknown, signal: AbortSignal): Promise<void> {
+  assertMotionCanContinue(signal)
 
   if (!isRecord(payload)) {
     throw new Error('WaitMs payload must be an object')
@@ -274,80 +304,88 @@ async function executeWaitMs(
 
   const delayMs = payload.delayMs
 
-  if (
-    !Number.isInteger(delayMs) ||
-    (delayMs as number) < 0
-  ) {
+  if (!Number.isInteger(delayMs) || (delayMs as number) < 0) {
     throw new Error('WaitMs delayMs must be a non-negative integer')
   }
 
   await delay(delayMs as number, signal)
+  assertMotionCanContinue(signal)
 }
 
-async function executeRunProgram(
-  payload: unknown,
-  signal: AbortSignal
-): Promise<void> {
+async function executeRunProgram(payload: unknown, signal: AbortSignal): Promise<void> {
   const steps = parseRunProgramSteps(payload)
 
   for (let index = 0; index < steps.length; index++) {
-    throwIfCommandCancelled(signal)
+    assertMotionCanContinue(signal)
 
     const step = steps[index]
 
     useRobotStore.getState().setCurrentStepIndex(index)
 
-    switch (step.stepType) {
-      case 'MoveJ':
-        await executeMoveJ(step.payload, signal)
-        break
+    try {
+      switch (step.stepType) {
+        case 'MoveJ':
+          await executeMoveJ(step.payload, signal)
+          break
 
-      case 'MoveL':
-        await executeMoveL(step.payload, signal)
-        break
+        case 'MoveL':
+          await executeMoveL(step.payload, signal)
+          break
 
-      case 'RotateJoint':
-        await executeRotateJoint(step.payload, signal)
-        break
+        case 'RotateJoint':
+          await executeRotateJoint(step.payload, signal)
+          break
 
-      case 'MoveTCP':
-        await executeMoveTCP(step.payload, signal)
-        break
+        case 'MoveTCP':
+          await executeMoveTCP(step.payload, signal)
+          break
 
-      case 'WaitMs':
-        await executeWaitMs(step.payload, signal)
-        break
+        case 'WaitMs':
+          await executeWaitMs(step.payload, signal)
+          break
 
-            case 'SetDO':
-        await executeSetDO(step.payload, signal)
-        break
+        case 'SetDO':
+          await executeSetDO(step.payload, signal)
+          break
 
-      case 'GripperOpen':
-        await executeGripper('open', signal)
-        break
+        case 'GripperOpen':
+          await executeGripper('open', signal)
+          break
 
-      case 'GripperClose':
-        await executeGripper('closed', signal)
-        break
+        case 'GripperClose':
+          await executeGripper('closed', signal)
+          break
 
-      case 'Comment':
-        break
+        case 'Comment':
+          break
 
-      default:
-        throw new Error(
-          `Unsupported RunProgram step type: ${step.stepType}`
-        )
+        default:
+          throw new Error(`Unsupported RunProgram step type: ${step.stepType}`)
+      }
+    } catch (error) {
+      if (error instanceof CommandExecutionError) {
+        throw error
+      }
+
+      const technicalMessage =
+        error instanceof Error ? error.message : 'RunProgram step execution failed'
+
+      throw new CommandExecutionError(technicalMessage, {
+        source: 'RunProgram',
+        stepIndex: index + 1,
+        stepOrderIndex: step.orderIndex,
+        stepType: step.stepType,
+        stepLabel: step.label,
+        technicalMessage
+      })
     }
   }
 
-  throwIfCommandCancelled(signal)
+  assertMotionCanContinue(signal)
 }
 
-async function executeMoveJ(
-  payload: unknown,
-  signal: AbortSignal
-): Promise<void> {
-  throwIfCommandCancelled(signal)
+async function executeMoveJ(payload: unknown, signal: AbortSignal): Promise<void> {
+  assertMotionCanContinue(signal)
 
   const moveJ = parseMoveJPayload(payload)
   const robotStore = useRobotStore.getState()
@@ -365,7 +403,7 @@ async function executeMoveJ(
 
   try {
     for (let frame = 1; frame <= frameCount; frame++) {
-      throwIfCommandCancelled(signal)
+      assertMotionCanContinue(signal)
 
       const progress = easeInOutCubic(frame / frameCount)
       const interpolated = startAngles.map((start, index) => {
@@ -375,25 +413,22 @@ async function executeMoveJ(
 
       useRobotStore.getState().setJointAngles(interpolated)
       await delay(frameMs, signal)
+      assertMotionCanContinue(signal)
     }
 
-    throwIfCommandCancelled(signal)
+    assertMotionCanContinue(signal)
     useRobotStore.getState().setJointAngles(targetAngles as JointAngles)
+    assertMotionCanContinue(signal)
   } finally {
     useRobotStore.getState().setPlaying(false)
   }
 }
 
-async function executeRotateJoint(
-  payload: unknown,
-  signal: AbortSignal
-): Promise<void> {
-  throwIfCommandCancelled(signal)
+async function executeRotateJoint(payload: unknown, signal: AbortSignal): Promise<void> {
+  assertMotionCanContinue(signal)
 
   const rotateJoint = parseRotateJointPayload(payload)
-  const targetAngles = [
-    ...useRobotStore.getState().jointAngles
-  ] as JointAngles
+  const targetAngles = [...useRobotStore.getState().jointAngles] as JointAngles
 
   targetAngles[rotateJoint.jointIndex] = rotateJoint.angle
 
@@ -407,55 +442,36 @@ async function executeRotateJoint(
   )
 }
 
-async function executeMoveL(
-  payload: unknown,
-  signal: AbortSignal
-): Promise<void> {
-  throwIfCommandCancelled(signal)
+async function executeMoveL(payload: unknown, signal: AbortSignal): Promise<void> {
+  assertMotionCanContinue(signal)
 
   const moveL = parseMoveLPayload(payload)
 
-  await runMoveL(
-    moveL.tcpPose,
-    moveL.speed ?? 30,
-    signal
-  )
+  await runMoveL(moveL.tcpPose, moveL.speed ?? 30, signal)
 
-  throwIfCommandCancelled(signal)
+  assertMotionCanContinue(signal)
 }
 
-async function executeMoveTCP(
-  payload: unknown,
-  signal: AbortSignal
-): Promise<void> {
-  throwIfCommandCancelled(signal)
+async function executeMoveTCP(payload: unknown, signal: AbortSignal): Promise<void> {
+  assertMotionCanContinue(signal)
 
   // Backend snapshot đã chuyển MoveTCP thành TCP pose tuyệt đối.
   await executeMoveL(payload, signal)
 }
 
-async function executeSetDO(
-  payload: unknown,
-  signal: AbortSignal
-): Promise<void> {
-  throwIfCommandCancelled(signal)
+async function executeSetDO(payload: unknown, signal: AbortSignal): Promise<void> {
+  assertMotionCanContinue(signal)
 
   const setDO = parseSetDOPayload(payload)
 
-  useRobotStore.getState().setDigitalOutput(
-    setDO.doType,
-    setDO.doIndex,
-    setDO.doValue
-  )
+  useRobotStore.getState().setDigitalOutput(setDO.doType, setDO.doIndex, setDO.doValue)
 
   await delay(100, signal)
+  assertMotionCanContinue(signal)
 }
 
-async function executeGripper(
-  state: 'open' | 'closed',
-  signal: AbortSignal
-): Promise<void> {
-  throwIfCommandCancelled(signal)
+async function executeGripper(state: 'open' | 'closed', signal: AbortSignal): Promise<void> {
+  assertMotionCanContinue(signal)
 
   const robotStore = useRobotStore.getState()
   const doValue: 0 | 1 = state === 'closed' ? 1 : 0
@@ -464,20 +480,17 @@ async function executeGripper(
   robotStore.setGripperState(state)
 
   await delay(500, signal)
+  assertMotionCanContinue(signal)
 }
 
 function executeEmergencyStop(commandId: string): void {
-  cancelActiveCommand(
-    `Emergency stop requested by command ${commandId}`
-  )
+  cancelActiveCommand(`Emergency stop requested by command ${commandId}`)
 
   // EStop giữ robot tại vị trí hiện tại và dừng trạng thái playback.
   useRobotStore.getState().setPlaying(false)
 }
 
-export async function executeBackendCommand(
-  command: PendingDeviceCommand
-): Promise<void> {
+export async function executeBackendCommand(command: PendingDeviceCommand): Promise<void> {
   if (command.commandType === 'EStop') {
     executeEmergencyStop(command.commandId)
     return
@@ -486,6 +499,8 @@ export async function executeBackendCommand(
   const signal = beginCommandExecution(command.commandId)
 
   try {
+    assertMotionCanContinue(signal)
+
     switch (command.commandType) {
       case 'SetDO':
         await executeSetDO(command.payload, signal)
