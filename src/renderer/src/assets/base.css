@@ -21,6 +21,21 @@
   --ev-button-alt-hover-border: transparent;
   --ev-button-alt-hover-text: var(--ev-c-text-1);
   --ev-button-alt-hover-bg: var(--ev-c-gray-2);
+
+  /* Fairino Dark Industrial Theme Tokens */
+  --fairino-bg: #11131b;
+  --fairino-surface-lowest: #0c0e16;
+  --fairino-surface-low: #141720;
+  --fairino-surface: #1b1e27;
+  --fairino-surface-high: #242833;
+  --fairino-border: #343849;
+  --fairino-text: #e1e7f5;
+  --fairino-muted: #95a0b8;
+  --fairino-primary: #2563eb;
+  --fairino-primary-soft: rgba(37, 99, 235, 0.14);
+  --fairino-success: #10b981;
+  --fairino-warning: #f59e0b;
+  --fairino-danger: #ef4444;
 }
 
 :root {

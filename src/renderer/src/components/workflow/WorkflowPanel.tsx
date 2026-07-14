@@ -1,3 +1,4 @@
+import { useRef, useState } from 'react'
 import type { ReactElement } from 'react'
 
 import { useRobotStore } from '../../store/robotStore'
@@ -17,16 +18,22 @@ import {
   Sparkles,
   Unlock,
   Square,
-  Trash2
+  Trash2,
+  Settings
 } from 'lucide-react'
 import BlockWorkspace from './BlockWorkspace'
 import { translations } from '../../i18n/translations'
+import {
+  getRobotRuntimeConfig,
+  runMoveL,
+  runMoveLForRobot
+} from '../../services/robotMotionRuntime'
 import ProgramImportPanel from './ProgramImportPanel'
+import WorkflowStepDetailsModal from './WorkflowStepDetailsModal'
 
 const DEFAULT_SPEED = 30
 const DEFAULT_ACC = 30
 const DEFAULT_WAIT_MS = 500
-
 
 interface InfoTooltipProps {
   text: string
@@ -59,26 +66,105 @@ export default function WorkflowPanel(): ReactElement {
   const selectedStepId = useRobotStore((state) => state.selectedStepId)
   const setSelectedStepId = useRobotStore((state) => state.setSelectedStepId)
   const setJointAngles = useRobotStore((state) => state.setJointAngles)
+  const setJointAnglesForRobot = useRobotStore((state) => state.setJointAnglesForRobot)
   const updateStep = useRobotStore((state) => state.updateStep)
-
+  const [editingStepId, setEditingStepId] = useState<string | null>(null)
+  const [workflowError, setWorkflowError] = useState<string | null>(null)
   // Mode state
   const mode = useRobotStore((state) => state.mode)
   const setMode = useRobotStore((state) => state.setMode)
   const angleUnit = useRobotStore((state) => state.angleUnit)
+  const lengthUnit = useRobotStore((state) => state.lengthUnit)
+  const editingStep = editingStepId
+    ? (steps.find((step) => step.id === editingStepId) ?? null)
+    : null
 
   // Language translation helper
   const language = useRobotStore((state) => state.language)
   const t = (key: keyof typeof translations.vi): string => translations[language][key]
 
   // Simulation states
-  const isPlaying = useRobotStore((state) => state.isPlaying)
-  const setPlaying = useRobotStore((state) => state.setPlaying)
-  const currentStepIndex = useRobotStore((state) => state.currentStepIndex)
-  const setCurrentStepIndex = useRobotStore((state) => state.setCurrentStepIndex)
+  const selectedRobotId = useRobotStore((state) => state.selectedRobotId)
+  const robotExecutionById = useRobotStore((state) => state.robotExecutionById)
+  const legacyIsPlaying = useRobotStore((state) => state.isPlaying)
+  const legacyCurrentStepIndex = useRobotStore((state) => state.currentStepIndex)
+
+  const selectedExecution = selectedRobotId ? robotExecutionById[selectedRobotId] : undefined
+
+  const isPlaying = selectedRobotId ? (selectedExecution?.isPlaying ?? false) : legacyIsPlaying
+
+  const currentStepIndex = selectedRobotId
+    ? (selectedExecution?.currentStepIndex ?? 0)
+    : legacyCurrentStepIndex
   const collisionWarning = useSceneStore((state) => state.collisionWarning)
   const isRecordBlocked = isPlaying || collisionWarning
+  const moveLPreviewAbortRef = useRef<AbortController | null>(null)
+  const isRunActive = (): boolean => {
+    const state = useRobotStore.getState()
 
-   const handleRecordWaypoint = (type: 'MoveJ' | 'MoveL'): void => {
+    if (!selectedRobotId) {
+      return state.isPlaying
+    }
+
+    return state.robotExecutionById[selectedRobotId]?.isPlaying ?? false
+  }
+
+  const setRunPlaying = (playing: boolean): void => {
+    const state = useRobotStore.getState()
+
+    if (!selectedRobotId) {
+      state.setPlaying(playing)
+      return
+    }
+
+    state.setRobotExecution(selectedRobotId, {
+      isPlaying: playing,
+      ...(playing ? { startedAt: new Date().toISOString() } : {})
+    })
+
+    const hasRunningRobot = Object.values(useRobotStore.getState().robotExecutionById).some(
+      (execution) => execution.isPlaying
+    )
+
+    useRobotStore.getState().setPlaying(hasRunningRobot)
+  }
+
+  const setRunStepIndex = (index: number): void => {
+    const state = useRobotStore.getState()
+
+    if (!selectedRobotId) {
+      state.setCurrentStepIndex(index)
+      return
+    }
+
+    state.setRobotExecution(selectedRobotId, {
+      currentStepIndex: index
+    })
+
+    if (state.selectedRobotId === selectedRobotId) {
+      state.setCurrentStepIndex(index)
+    }
+  }
+
+  const getRunJointAngles = (): typeof jointAngles => {
+    const state = useRobotStore.getState()
+
+    if (!selectedRobotId) {
+      return state.jointAngles
+    }
+
+    return state.jointAnglesByRobotId[selectedRobotId] ?? state.jointAngles
+  }
+
+  const setRunJointAngles = (angles: typeof jointAngles): void => {
+    if (selectedRobotId) {
+      setJointAnglesForRobot(selectedRobotId, angles)
+      return
+    }
+
+    setJointAngles(angles)
+  }
+  const handleRecordWaypoint = (type: 'MoveJ' | 'MoveL'): void => {
     if (isRecordBlocked) return
 
     const pointNum = steps.filter((s) => s.type === 'MoveJ' || s.type === 'MoveL').length + 1
@@ -139,13 +225,51 @@ export default function WorkflowPanel(): ReactElement {
     })
   }
 
-  const handleStepClick = (step: WorkflowStep): void => {
-    setSelectedStepId(step.id)
-    if (step.jointAngles) {
-      setJointAngles(step.jointAngles)
+  const previewMoveLStep = async (step: WorkflowStep): Promise<void> => {
+    if (!step.tcpPose) {
+      console.warn(`${step.label}: missing tcpPose for MoveL preview`)
+      return
+    }
+
+    moveLPreviewAbortRef.current?.abort()
+
+    const controller = new AbortController()
+    moveLPreviewAbortRef.current = controller
+
+    try {
+      if (selectedRobotId) {
+        await runMoveLForRobot(selectedRobotId, step.tcpPose, step.speed, controller.signal, {
+          managePlayingState: false
+        })
+      } else {
+        await runMoveL(step.tcpPose, step.speed, controller.signal, { managePlayingState: false })
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        console.error('MoveL preview failed:', error)
+      }
+    } finally {
+      if (moveLPreviewAbortRef.current === controller) {
+        moveLPreviewAbortRef.current = null
+      }
     }
   }
 
+  const handleStepClick = (step: WorkflowStep): void => {
+    setSelectedStepId(step.id)
+
+    moveLPreviewAbortRef.current?.abort()
+    moveLPreviewAbortRef.current = null
+
+    if (step.type === 'MoveL') {
+      void previewMoveLStep(step)
+      return
+    }
+
+    if (step.jointAngles) {
+      setRunJointAngles(step.jointAngles)
+    }
+  }
   const clamp = (value: number, min: number, max: number): number =>
     Math.min(max, Math.max(min, value))
 
@@ -162,55 +286,155 @@ export default function WorkflowPanel(): ReactElement {
     return clamp(300 + maxDelta * 10 * (30 / speedPercent), 250, 6000)
   }
 
+  const wait = (milliseconds: number): Promise<void> =>
+    new Promise((resolve) => window.setTimeout(resolve, milliseconds))
+
+  const animateJointMotion = async (
+    targetAngles: NonNullable<WorkflowStep['jointAngles']>,
+    speed: number
+  ): Promise<void> => {
+    const startAngles = [...getRunJointAngles()]
+    const duration =
+      getMotionDurationMs(startAngles, targetAngles, speed) / useRobotStore.getState().playbackSpeed
+    const stepsCount = 30
+    const intervalTime = duration / stepsCount
+
+    for (let i = 1; i <= stepsCount; i++) {
+      if (!isRunActive()) break
+
+      const t = i / stepsCount
+      const interpolated = startAngles.map((start, idx) => {
+        const target = targetAngles[idx]
+        return start + (target - start) * t
+      })
+
+      setRunJointAngles(interpolated as typeof targetAngles)
+      await wait(intervalTime)
+    }
+  }
+
+  const runMoveLStep = async (step: WorkflowStep): Promise<void> => {
+    if (!step.tcpPose) {
+      console.warn(`${step.label}: missing tcpPose for MoveL`)
+      return
+    }
+
+    // Capture robot ID so switching selection cannot redirect this command.
+    const runRobotId = selectedRobotId
+    const controller = new AbortController()
+
+    const unsubscribe = useRobotStore.subscribe((state) => {
+      const runIsActive = runRobotId
+        ? (state.robotExecutionById[runRobotId]?.isPlaying ?? false)
+        : state.isPlaying
+
+      if (!runIsActive) {
+        controller.abort()
+      }
+    })
+
+    try {
+      if (runRobotId) {
+        await runMoveLForRobot(runRobotId, step.tcpPose, step.speed, controller.signal, {
+          managePlayingState: false
+        })
+      } else {
+        await runMoveL(step.tcpPose, step.speed, controller.signal, { managePlayingState: false })
+      }
+    } catch (error) {
+      const state = useRobotStore.getState()
+      const runIsActive = runRobotId
+        ? (state.robotExecutionById[runRobotId]?.isPlaying ?? false)
+        : state.isPlaying
+
+      if (runIsActive) {
+        console.error('MoveL simulation failed:', error)
+        setRunPlaying(false)
+      }
+    } finally {
+      unsubscribe()
+    }
+  }
+
+  const getTcpDistanceMm = (
+    from: NonNullable<WorkflowStep['tcpPose']>,
+    to: NonNullable<WorkflowStep['tcpPose']>
+  ): number => {
+    return Math.hypot(to.x - from.x, to.y - from.y, to.z - from.z)
+  }
+
+  const validateWorkflowBeforeRun = (): string | null => {
+    const moveLPolicy = getRobotRuntimeConfig().motionPolicy.moveL
+    const robotState = useRobotStore.getState()
+    let currentTcp = selectedRobotId
+      ? (robotState.tcpPoseByRobotId[selectedRobotId] ?? robotState.tcpPose)
+      : robotState.tcpPose
+
+    for (const [index, step] of steps.entries()) {
+      if (step.tcpPose) {
+        if (step.type === 'MoveL') {
+          const distance = getTcpDistanceMm(currentTcp, step.tcpPose)
+
+          if (distance > moveLPolicy.maxDistanceMm) {
+            return `Step ${index + 1} (${step.label}) MoveL quá xa: ${distance.toFixed(
+              1
+            )}mm > ${moveLPolicy.maxDistanceMm}mm. Hãy đổi step này thành MoveJ hoặc thêm waypoint trung gian.`
+          }
+        }
+
+        currentTcp = step.tcpPose
+      }
+    }
+
+    return null
+  }
+
   // Simulation execution loop with smooth joint angle interpolation
   const runSimulation = async (): Promise<void> => {
     if (steps.length === 0) return
-    setPlaying(true)
+    const validationError = validateWorkflowBeforeRun()
+    if (validationError) {
+      setWorkflowError(validationError)
+      setRunPlaying(false)
+      return
+    }
+
+    setWorkflowError(null)
+    moveLPreviewAbortRef.current?.abort()
+    moveLPreviewAbortRef.current = null
+
+    setRunPlaying(true)
 
     let currentIndex = currentStepIndex
     if (currentIndex >= steps.length) {
       currentIndex = 0
-      setCurrentStepIndex(0)
+      setRunStepIndex(0)
     }
 
-    while (currentIndex < steps.length && useRobotStore.getState().isPlaying) {
+    while (currentIndex < steps.length && isRunActive()) {
       const step = steps[currentIndex]
       setSelectedStepId(step.id)
-
-      if (['MoveJ', 'MoveL', 'RotateJoint', 'MoveTCP'].includes(step.type) && step.jointAngles) {
-        // Smoothly interpolate from current joints to target joints
-        const startAngles = [...useRobotStore.getState().jointAngles]
-        const targetAngles = step.jointAngles
-        const duration =
-          getMotionDurationMs(startAngles, targetAngles, step.speed) /
-          useRobotStore.getState().playbackSpeed // 1 second duration adjusted by playback speed
-        const stepsCount = 30 // 30 frames of animation
-        const intervalTime = duration / stepsCount
-
-        for (let i = 1; i <= stepsCount; i++) {
-          if (!useRobotStore.getState().isPlaying) break
-          const t = i / stepsCount
-          const interpolated = startAngles.map((start, idx) => {
-            const target = targetAngles[idx]
-            return start + (target - start) * t
-          })
-          setJointAngles(interpolated as typeof targetAngles)
-          await new Promise((resolve) => setTimeout(resolve, intervalTime))
-        }
+      if (
+        (step.type === 'MoveJ' || step.type === 'RotateJoint' || step.type === 'MoveTCP') &&
+        step.jointAngles
+      ) {
+        await animateJointMotion(step.jointAngles, step.speed)
+      } else if (step.type === 'MoveL') {
+        await runMoveLStep(step)
       } else if (step.type === 'WaitMs') {
         // Wait delay duration
         const waitTime = (step.delayMs ?? 0) / useRobotStore.getState().playbackSpeed
-        await new Promise((resolve) => setTimeout(resolve, waitTime))
+        await wait(waitTime)
       } else if (step.type === 'GripperOpen') {
         const state = useRobotStore.getState()
         state.setGripperState('open')
         state.setDigitalOutput('cabinet', 1, 0)
-        await new Promise((resolve) => setTimeout(resolve, 500))
+        await wait(500)
       } else if (step.type === 'GripperClose') {
         const state = useRobotStore.getState()
         state.setGripperState('closed')
         state.setDigitalOutput('cabinet', 1, 1)
-        await new Promise((resolve) => setTimeout(resolve, 500))
+        await wait(500)
       } else if (
         step.type === 'SetDO' &&
         step.doIndex !== undefined &&
@@ -219,34 +443,35 @@ export default function WorkflowPanel(): ReactElement {
         useRobotStore
           .getState()
           .setDigitalOutput(step.doType ?? 'cabinet', step.doIndex, step.doValue)
-        await new Promise((resolve) => setTimeout(resolve, 100))
+        await wait(100)
       } else {
         // Comments and unsupported local-only steps complete immediately.
-        await new Promise((resolve) =>
-          setTimeout(resolve, 200 / useRobotStore.getState().playbackSpeed)
-        )
+        await wait(200 / useRobotStore.getState().playbackSpeed)
       }
 
-      if (!useRobotStore.getState().isPlaying) break
+      if (!isRunActive()) break
 
       currentIndex++
-      setCurrentStepIndex(currentIndex)
+      setRunStepIndex(currentIndex)
     }
 
-    setPlaying(false)
+    setRunPlaying(false)
   }
 
   const handlePlay = (): void => {
-    if (isPlaying) {
-      setPlaying(false)
+    if (isRunActive()) {
+      setRunPlaying(false)
     } else {
       setTimeout(() => runSimulation(), 10)
     }
   }
 
   const handleStop = (): void => {
-    setPlaying(false)
-    setCurrentStepIndex(0)
+    moveLPreviewAbortRef.current?.abort()
+    moveLPreviewAbortRef.current = null
+
+    setRunPlaying(false)
+    setRunStepIndex(0)
     setSelectedStepId(null)
   }
 
@@ -397,6 +622,12 @@ export default function WorkflowPanel(): ReactElement {
               {t('workflowSteps')} ({steps.length})
             </span>
 
+            {workflowError && (
+              <div className="mx-4 mt-3 rounded border border-red-500/40 bg-red-950/30 px-3 py-2 text-xs text-red-200">
+                {workflowError}
+              </div>
+            )}
+
             {steps.length === 0 ? (
               <div className="h-40 border border-dashed border-[#2d2d34] rounded-lg flex flex-col items-center justify-center text-slate-500 p-4 text-center">
                 <span className="text-xs">{t('noSteps')}</span>
@@ -437,7 +668,7 @@ export default function WorkflowPanel(): ReactElement {
                         </span>
                       </div>
 
-                      {step.jointAngles && (
+                      {step.type !== 'MoveL' && step.jointAngles && (
                         <div className="mt-1 text-[10px] text-slate-400 font-mono truncate">
                           Q: [
                           {step.jointAngles
@@ -448,98 +679,54 @@ export default function WorkflowPanel(): ReactElement {
                           ] {angleUnit === 'rad' ? 'rad' : '°'}
                         </div>
                       )}
-                      {step.type === 'WaitMs' && step.delayMs !== undefined && (
-                        <div
-                          className="mt-1.5 flex items-center gap-1.5 text-[10px] text-slate-400"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          <span>{language === 'vi' ? 'Trễ:' : 'Delay:'}</span>
-                          <input
-                            type="number"
-                            value={step.delayMs}
-                            onChange={(e) => {
-                              const val = parseInt(e.target.value) || 0
-                              updateStep(step.id, {
-                                delayMs: val,
-                                label: language === 'vi' ? `Đợi trễ ${val}ms` : `Wait ${val}ms`
-                              })
-                            }}
-                            disabled={isPlaying}
-                            className="bg-black/40 border border-white/10 rounded px-1.5 py-0.5 w-16 text-center text-[10px] font-mono font-bold text-white outline-none"
-                          />
-                          <span>ms</span>
-                        </div>
+                      {step.type === 'WaitMs' && (
+                        <p className="mt-1 text-[10px] text-slate-400 font-mono">
+                          Trễ: {step.delayMs || 1000} ms
+                        </p>
                       )}
-                      {step.type === 'SetDO' && step.doIndex !== undefined && (
-                        <div
-                          className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10px] text-slate-400"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          <select
-                            value={step.doType || 'cabinet'}
-                            onChange={(e) => {
-                              const newType = e.target.value as 'cabinet' | 'tool'
-                              const newIdx = newType === 'tool' ? 0 : 1
-                              updateStep(step.id, {
-                                doType: newType,
-                                doIndex: newIdx,
-                                label:
-                                  language === 'vi'
-                                    ? `Cài đặt ${newType === 'tool' ? 'Tool DO' : 'DO'} ${newIdx}`
-                                    : `Set ${newType === 'tool' ? 'Tool DO' : 'DO'} ${newIdx}`
-                              })
-                            }}
-                            disabled={isPlaying}
-                            className="bg-black/40 border border-white/10 rounded px-1.5 py-0.5 text-[10px] text-white font-semibold outline-none cursor-pointer"
-                          >
-                            <option value="cabinet">{t('cabinetDO')}</option>
-                            <option value="tool">{t('toolDO')}</option>
-                          </select>
-                          <select
-                            value={step.doIndex}
-                            onChange={(e) => {
-                              const val = parseInt(e.target.value)
-                              const type = step.doType || 'cabinet'
-                              updateStep(step.id, {
-                                doIndex: val,
-                                label:
-                                  language === 'vi'
-                                    ? `Cài đặt ${type === 'tool' ? 'Tool DO' : 'DO'} ${val}`
-                                    : `Set ${type === 'tool' ? 'Tool DO' : 'DO'} ${val}`
-                              })
-                            }}
-                            disabled={isPlaying}
-                            className="bg-black/40 border border-white/10 rounded px-1.5 py-0.5 text-[10px] text-white font-semibold outline-none cursor-pointer"
-                          >
-                            {((step.doType || 'cabinet') === 'tool'
-                              ? [0, 1]
-                              : [1, 2, 3, 4, 5, 6, 7, 8]
-                            ).map((num) => (
-                              <option key={num} value={num}>
-                                {(step.doType || 'cabinet') === 'tool'
-                                  ? `End-DO ${num}`
-                                  : `DO ${num}`}
-                              </option>
-                            ))}
-                          </select>
-                          <span>=</span>
-                          <select
-                            value={step.doValue ?? 1}
-                            onChange={(e) => {
-                              const val = parseInt(e.target.value) as 0 | 1
-                              updateStep(step.id, { doValue: val })
-                            }}
-                            disabled={isPlaying}
-                            className="bg-black/40 border border-white/10 rounded px-1.5 py-0.5 text-[10px] text-white font-semibold outline-none cursor-pointer"
-                          >
-                            <option value={1}>{t('turnOn')}</option>
-                            <option value={0}>{t('turnOff')}</option>
-                          </select>
-                        </div>
+                      {step.type === 'SetDO' && (
+                        <p className="mt-1 text-[10px] text-slate-400 font-mono">
+                          DO: {step.doType === 'tool' ? 'Tool' : 'Cabinet'} DO {step.doIndex} ={' '}
+                          {step.doValue}
+                        </p>
+                      )}
+                      {step.type === 'RotateJoint' && (
+                        <p className="mt-1 text-[10px] text-slate-400 font-mono">
+                          Quay J{step.jointIndex}: {step.angle}° ({step.rotateMode})
+                        </p>
+                      )}
+                      {step.type === 'MoveTCP' && (
+                        <p className="mt-1 text-[10px] text-slate-400 font-mono">
+                          TCP Dịch {step.tcpAxis}: {step.distance} mm ({step.moveMode})
+                        </p>
+                      )}
+                      {step.type === 'MoveL' && step.tcpPose && (
+                        <p className="mt-1 text-[10px] text-blue-300 font-mono truncate">
+                          TCP target: [{step.tcpPose.x.toFixed(1)}, {step.tcpPose.y.toFixed(1)},{' '}
+                          {step.tcpPose.z.toFixed(1)}] mm
+                        </p>
+                      )}
+
+                      {step.type === 'MoveL' && step.jointAngles && (
+                        <p className="mt-1 text-[10px] text-slate-500 font-mono truncate">
+                          IK Q: [
+                          {step.jointAngles
+                            .map((v) =>
+                              angleUnit === 'rad' ? ((v * Math.PI) / 180).toFixed(2) : Math.round(v)
+                            )
+                            .join(', ')}
+                          ] {angleUnit === 'rad' ? 'rad' : '°'}
+                        </p>
+                      )}
+
+                      {(step.type === 'GripperOpen' || step.type === 'GripperClose') && (
+                        <p className="mt-1 text-[10px] text-slate-400 font-mono">
+                          Gripper: {step.type === 'GripperOpen' ? 'OPEN' : 'CLOSED'}
+                        </p>
                       )}
                     </div>
 
-                    {/* Move & Delete buttons */}
+                    {/* Move, Edit & Delete buttons */}
                     <div
                       className="flex items-center gap-1 shrink-0"
                       onClick={(e) => e.stopPropagation()}
@@ -548,6 +735,7 @@ export default function WorkflowPanel(): ReactElement {
                         onClick={() => moveStep(idx, 'up')}
                         disabled={idx === 0}
                         className="p-1 hover:bg-[#2d2d34] rounded text-slate-500 hover:text-slate-300 disabled:opacity-30 cursor-pointer"
+                        title="Move Up"
                       >
                         <ArrowUp size={12} />
                       </button>
@@ -555,12 +743,21 @@ export default function WorkflowPanel(): ReactElement {
                         onClick={() => moveStep(idx, 'down')}
                         disabled={idx === steps.length - 1}
                         className="p-1 hover:bg-[#2d2d34] rounded text-slate-500 hover:text-slate-300 disabled:opacity-30 cursor-pointer"
+                        title="Move Down"
                       >
                         <ArrowDown size={12} />
                       </button>
                       <button
+                        onClick={() => setEditingStepId(step.id)}
+                        className="p-1 hover:bg-[#2d2d34] rounded text-slate-500 hover:text-blue-400 cursor-pointer"
+                        title="Settings"
+                      >
+                        <Settings size={12} />
+                      </button>
+                      <button
                         onClick={() => removeStep(step.id)}
                         className="p-1 hover:bg-rose-950/30 rounded text-slate-500 hover:text-rose-400 cursor-pointer"
+                        title="Delete"
                       >
                         <Trash2 size={12} />
                       </button>
@@ -599,6 +796,19 @@ export default function WorkflowPanel(): ReactElement {
           </button>
         </div>
       </div>
+
+      {editingStep && (
+        <WorkflowStepDetailsModal
+          step={editingStep}
+          isOpen={!!editingStep}
+          onClose={() => setEditingStepId(null)}
+          updateStep={updateStep}
+          angleUnit={angleUnit}
+          lengthUnit={lengthUnit}
+          isPlaying={isPlaying}
+          language={language}
+        />
+      )}
     </div>
   )
 }

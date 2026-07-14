@@ -2,16 +2,33 @@ import { useEffect, useRef, useState } from 'react'
 import { AlertTriangle, Braces, CheckCircle2, FileCode2, Info, UploadCloud, X } from 'lucide-react'
 import { toWorkflowStep } from '../../services/backendLuaWorkflowMapper'
 import type { WorkflowStep } from '../../types/robot.types'
+import type { ValidatedLuaProgram } from '../../types/factoryProgram.types'
+
+export type { ValidatedLuaProgram } from '../../types/factoryProgram.types'
 import {
-  BackendLuaDiagnostic,
-  BackendLuaPreviewResponse,
-  previewLuaProgram
+  previewLuaProgram,
+  previewLuaProgramForRobot,
+  type BackendLuaDiagnostic,
+  type BackendLuaPreviewResponse,
+  type BackendLuaRequestContext
 } from '../../services/backendLuaImportClient'
 import { electronService } from '../../services/electronService'
 import { useRobotStore } from '../../store/robotStore'
 import ProgramJsonImport from './ProgramJsonImport'
+import {
+  beginFactoryRunDiagnosticSession,
+  recordFactoryRunDiagnostic
+} from '../../services/factoryRunDiagnostics'
 
 const MAX_LUA_FILE_SIZE = 1024 * 1024
+
+interface ProgramImportPanelProps {
+  requestContext?: BackendLuaRequestContext
+  luaOnly?: boolean
+  actionLabel?: string
+  onProgramAccepted?: (program: ValidatedLuaProgram) => void
+  factoryDiagnostics?: boolean
+}
 
 interface LuaPreviewResult {
   steps: WorkflowStep[]
@@ -254,13 +271,20 @@ function StatusRow({ label, value, danger, success }: StatusRowProps): React.Rea
 
 // ─── Main Component ─────────────────────────────────────────────────────────
 
-export default function ProgramImportPanel(): React.JSX.Element {
+export default function ProgramImportPanel({
+  requestContext,
+  luaOnly = false,
+  actionLabel = 'Load into workflow',
+  onProgramAccepted,
+  factoryDiagnostics = false
+}: ProgramImportPanelProps = {}): React.JSX.Element {
   const reorderSteps = useRobotStore((state) => state.reorderSteps)
   const setProjectName = useRobotStore((state) => state.setProjectName)
   const setProgramSource = useRobotStore((state) => state.setProgramSource)
   const inputRef = useRef<HTMLInputElement>(null)
   const [importMode, setImportMode] = useState<'lua' | 'json'>('lua')
   const [fileName, setFileName] = useState('')
+  const [fileContent, setFileContent] = useState('')
   const [parseResult, setParseResult] = useState<LuaPreviewResult | null>(null)
   const [isParsing, setIsParsing] = useState(false)
   const [fileError, setFileError] = useState('')
@@ -272,42 +296,105 @@ export default function ProgramImportPanel(): React.JSX.Element {
   const importDetailBtnRef = useRef<HTMLButtonElement>(null)
 
   const parseFileContent = async (name: string, content: string): Promise<void> => {
+    const parseStartedAtMonotonicMs = performance.now()
+
+    if (factoryDiagnostics) {
+      beginFactoryRunDiagnosticSession(name)
+
+      recordFactoryRunDiagnostic('lua.parse.started', {
+        details: {
+          fileName: name,
+          contentLength: content.length
+        }
+      })
+    }
+
     setFileError('')
     setIsLoaded(false)
 
+    // Trường hợp user chọn file không phải .lua
     if (!name.toLowerCase().endsWith('.lua')) {
       setFileName(name)
       setParseResult(null)
+      setFileContent('')
       setFileError('Only .lua files are supported.')
+
+      if (factoryDiagnostics) {
+        recordFactoryRunDiagnostic('lua.parse.failed', {
+          durationMs: performance.now() - parseStartedAtMonotonicMs,
+          details: {
+            reasonCode: 'invalid_extension'
+          }
+        })
+      }
+
       return
     }
 
+    // Trường hợp file Lua không có nội dung
     if (!content.trim()) {
       setFileName(name)
       setParseResult(null)
+      setFileContent('')
       setFileError('The LUA file is empty.')
+
+      if (factoryDiagnostics) {
+        recordFactoryRunDiagnostic('lua.parse.failed', {
+          durationMs: performance.now() - parseStartedAtMonotonicMs,
+          details: {
+            reasonCode: 'empty_file'
+          }
+        })
+      }
+
       return
     }
 
     setIsParsing(true)
 
     try {
-      const result = await previewLuaProgram(name, content)
+      const result = requestContext
+        ? await previewLuaProgramForRobot(requestContext, name, content)
+        : await previewLuaProgram(name, content)
+
       const steps = result.parsedSteps
         .map(toWorkflowStep)
         .filter((step): step is WorkflowStep => step !== null)
 
+      setFileContent(content)
       setFileName(name)
+
       setParseResult({
         steps,
         projectName: result.metadata.projectName || 'Imported Project',
         diagnostics: result.diagnostics,
         raw: result
       })
+
+      if (factoryDiagnostics) {
+        recordFactoryRunDiagnostic('lua.parse.completed', {
+          durationMs: performance.now() - parseStartedAtMonotonicMs,
+          details: {
+            stepCount: steps.length,
+            diagnosticCount: result.diagnostics.length
+          }
+        })
+      }
     } catch (error) {
       setFileName(name)
       setParseResult(null)
+      setFileContent('')
+
       setFileError(error instanceof Error ? error.message : 'Failed to parse the LUA file.')
+
+      if (factoryDiagnostics) {
+        recordFactoryRunDiagnostic('lua.parse.failed', {
+          durationMs: performance.now() - parseStartedAtMonotonicMs,
+          details: {
+            reasonCode: 'backend_parse_failed'
+          }
+        })
+      }
     } finally {
       setIsParsing(false)
     }
@@ -397,12 +484,32 @@ export default function ProgramImportPanel(): React.JSX.Element {
       return
     }
 
+    if (onProgramAccepted) {
+      if (factoryDiagnostics) {
+        recordFactoryRunDiagnostic('lua.accepted', {
+          details: {
+            stepCount: parseResult.steps.length
+          }
+        })
+      }
+      onProgramAccepted({
+        fileName,
+        luaContent: fileContent,
+        projectName: parseResult.projectName,
+        steps: parseResult.steps,
+        diagnostics: parseResult.diagnostics,
+        raw: parseResult.raw
+      })
+
+      setIsLoaded(true)
+      return
+    }
+
     reorderSteps(parseResult.steps)
     setProjectName(parseResult.projectName)
     setProgramSource('ImportedLua')
     setIsLoaded(true)
   }
-
   const errorDiagnostics =
     parseResult?.diagnostics.filter((diagnostic) => diagnostic.severity === 'error') || []
 
@@ -452,34 +559,36 @@ export default function ProgramImportPanel(): React.JSX.Element {
         </button>
       </div>
 
-      <div className="mb-4 grid grid-cols-2 gap-2">
-        <button
-          type="button"
-          onClick={() => setImportMode('lua')}
-          className={`flex items-center justify-center gap-1.5 rounded border px-3 py-2 text-xs font-bold ${
-            importMode === 'lua'
-              ? 'border-blue-500 bg-blue-600 text-white'
-              : 'border-[#393942] bg-[#25252b] text-slate-400'
-          }`}
-        >
-          <FileCode2 size={13} />
-          LUA File
-        </button>
+      {!luaOnly && (
+        <div className="mb-4 grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            onClick={() => setImportMode('lua')}
+            className={`flex items-center justify-center gap-1.5 rounded border px-3 py-2 text-xs font-bold ${
+              importMode === 'lua'
+                ? 'border-blue-500 bg-blue-600 text-white'
+                : 'border-[#393942] bg-[#25252b] text-slate-400'
+            }`}
+          >
+            <FileCode2 size={13} />
+            LUA File
+          </button>
 
-        <button
-          type="button"
-          onClick={() => setImportMode('json')}
-          className={`flex items-center justify-center gap-1.5 rounded border px-3 py-2 text-xs font-bold ${
-            importMode === 'json'
-              ? 'border-blue-500 bg-blue-600 text-white'
-              : 'border-[#393942] bg-[#25252b] text-slate-400'
-          }`}
-        >
-          <Braces size={13} />
-          JSON Code
-        </button>
-      </div>
-      {importMode === 'json' && <ProgramJsonImport />}
+          <button
+            type="button"
+            onClick={() => setImportMode('json')}
+            className={`flex items-center justify-center gap-1.5 rounded border px-3 py-2 text-xs font-bold ${
+              importMode === 'json'
+                ? 'border-blue-500 bg-blue-600 text-white'
+                : 'border-[#393942] bg-[#25252b] text-slate-400'
+            }`}
+          >
+            <Braces size={13} />
+            JSON Code
+          </button>
+        </div>
+      )}
+      {!luaOnly && importMode === 'json' && <ProgramJsonImport />}
 
       {importMode === 'lua' && (
         <>
@@ -532,9 +641,7 @@ export default function ProgramImportPanel(): React.JSX.Element {
             <div className="mt-3 flex min-w-0 gap-2 rounded border border-red-500/40 bg-red-950/30 p-3 text-red-200">
               <AlertTriangle size={14} className="shrink-0" />
 
-              <p className="min-w-0 flex-1 break-words text-[10px] leading-relaxed">
-                {fileError}
-              </p>
+              <p className="min-w-0 flex-1 break-words text-[10px] leading-relaxed">{fileError}</p>
             </div>
           )}
 
@@ -585,7 +692,7 @@ export default function ProgramImportPanel(): React.JSX.Element {
                 onClick={handleLoadWorkflow}
                 className="w-full rounded bg-violet-600 px-4 py-2 text-xs font-bold text-white hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-40"
               >
-                Load into workflow
+                {actionLabel}
               </button>
 
               {isLoaded && (

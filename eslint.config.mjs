@@ -25,7 +25,11 @@ export default defineConfig(
     },
     rules: {
       ...eslintPluginReactHooks.configs.recommended.rules,
-      ...eslintPluginReactRefresh.configs.vite.rules
+      ...eslintPluginReactRefresh.configs.vite.rules,
+
+      // Tắt rule quá nghiêm của React Hooks mới.
+      // Project hiện tại có nhiều useEffect dùng để reset/load state UI.
+      'react-hooks/set-state-in-effect': 'off'
     }
   },
   eslintConfigPrettier

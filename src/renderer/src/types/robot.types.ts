@@ -50,6 +50,29 @@ export interface WorkflowStep {
   comment?: string
 }
 
+export interface RobotSceneBinding {
+  id?: string
+  sceneType: string
+  baseX: number
+  baseY: number
+  baseZ: number
+  baseYaw: number
+  urdfPath?: string | null
+  primPath?: string | null
+  rosNamespace?: string | null
+  graphPath?: string | null
+}
+
+export interface RobotInstance {
+  id: string
+  name: string
+  model: string
+  status: string
+  connectionType: string
+  robotModelId?: string | null
+  sceneBinding?: RobotSceneBinding | null
+}
+
 export interface RobotModelConfig {
   name: string
   payload: number // kg

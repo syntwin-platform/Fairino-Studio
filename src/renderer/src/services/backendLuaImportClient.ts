@@ -45,6 +45,12 @@ export interface BackendLuaPreviewResponse {
   } | null
 }
 
+export interface BackendLuaRequestContext {
+  backendUrl: string
+  robotId: string
+  token: string
+}
+
 export function getBackendLuaConfig(): { config: BackendSimulatorConfig; token: string } {
   const rawConfig = localStorage.getItem(CONFIG_KEY)
   const token = sessionStorage.getItem(TOKEN_KEY) || ''
@@ -68,6 +74,30 @@ export function getBackendLuaConfig(): { config: BackendSimulatorConfig; token: 
   }
 
   return { config, token }
+}
+
+function normalizeLuaRequestContext(context: BackendLuaRequestContext): BackendLuaRequestContext {
+  const backendUrl = context.backendUrl.trim().replace(/\/+$/, '')
+  const robotId = context.robotId.trim()
+  const token = context.token.trim()
+
+  if (!backendUrl) {
+    throw new Error('Backend URL is empty.')
+  }
+
+  if (!robotId) {
+    throw new Error('Robot ID is empty.')
+  }
+
+  if (!token) {
+    throw new Error('Please login to Backend Program first.')
+  }
+
+  return {
+    backendUrl,
+    robotId,
+    token
+  }
 }
 
 function createLuaImportErrorMessage(status: number, responseText: string): string {
@@ -94,20 +124,29 @@ function createLuaImportErrorMessage(status: number, responseText: string): stri
   return message || `HTTP ${status}`
 }
 
-export async function previewLuaProgram(
+export interface ImportedLuaProgramResponse {
+  id: string
+  robotId?: string
+  name?: string
+  status?: string
+}
+
+export async function previewLuaProgramForRobot(
+  context: BackendLuaRequestContext,
   fileName: string,
   luaContent: string
 ): Promise<BackendLuaPreviewResponse> {
-  const { config, token } = getBackendLuaConfig()
-  const baseUrl = config.backendUrl.replace(/\/+$/, '')
+  const normalized = normalizeLuaRequestContext(context)
 
   const response = await fetch(
-    `${baseUrl}/api/robots/${config.robotId}/programs/import/lua/preview`,
+    `${normalized.backendUrl}/api/robots/${encodeURIComponent(
+      normalized.robotId
+    )}/programs/import/lua/preview`,
     {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+        Authorization: `Bearer ${normalized.token}`
       },
       body: JSON.stringify({
         fileName,
@@ -122,4 +161,52 @@ export async function previewLuaProgram(
   }
 
   return (await response.json()) as BackendLuaPreviewResponse
+}
+
+export async function previewLuaProgram(
+  fileName: string,
+  luaContent: string
+): Promise<BackendLuaPreviewResponse> {
+  const { config, token } = getBackendLuaConfig()
+
+  return previewLuaProgramForRobot(
+    {
+      backendUrl: config.backendUrl,
+      robotId: config.robotId,
+      token
+    },
+    fileName,
+    luaContent
+  )
+}
+export async function importLuaProgramForRobot(
+  context: BackendLuaRequestContext,
+  fileName: string,
+  luaContent: string
+): Promise<ImportedLuaProgramResponse> {
+  const normalized = normalizeLuaRequestContext(context)
+
+  const response = await fetch(
+    `${normalized.backendUrl}/api/robots/${encodeURIComponent(
+      normalized.robotId
+    )}/programs/import/lua`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${normalized.token}`
+      },
+      body: JSON.stringify({
+        fileName,
+        luaContent
+      })
+    }
+  )
+
+  if (!response.ok) {
+    const text = await response.text()
+    throw new Error(createLuaImportErrorMessage(response.status, text))
+  }
+
+  return (await response.json()) as ImportedLuaProgramResponse
 }

@@ -10,6 +10,7 @@ export interface BackendSimulatorConfig {
 
 export interface DeviceSessionResponse {
   robotId: string
+  runtimeSessionId?: string | null
   accessToken: string
   expiresInSeconds: number
 }
@@ -83,7 +84,7 @@ export interface DeviceCommandResultPayload {
   commandId: string
   robotId: string
   success: boolean
-  status: 'Completed' | 'Failed'
+  status: 'Completed' | 'Failed' | 'Cancelled'
   message: string
   rawPayload?: unknown
   completedAt: string
@@ -99,14 +100,38 @@ export interface BackendSimulatorStatus {
   lastError?: string
 }
 
+export type BackendSimulatorConfigByRobotId = Record<string, BackendSimulatorConfig>
+
+export type BackendSimulatorStatusByRobotId = Record<string, BackendSimulatorStatus>
+
+export function createBackendSimulatorConfigForRobot(
+  baseConfig: BackendSimulatorConfig,
+  robotId: string,
+  deviceSecret: string
+): BackendSimulatorConfig {
+  return {
+    ...baseConfig,
+    robotId,
+    deviceSecret,
+    enabled: Boolean(robotId.trim() && deviceSecret.trim())
+  }
+}
+
+export function createDisconnectedBackendSimulatorStatus(): BackendSimulatorStatus {
+  return {
+    isRunning: false,
+    isConnected: false
+  }
+}
+
 export const defaultRobotRuntimeConfig: RobotRuntimeConfig = {
   robotId: '',
   robotModel: 'Fairino FR5',
   profile: 'Simulator',
   motionPolicy: {
     moveL: {
-      maxDistanceMm: 300,
-      maxRotationDeg: 45,
+      maxDistanceMm: 800,
+      maxRotationDeg: 180,
       waypointSpacingMm: 5,
       timeoutMs: 20_000
     },
@@ -131,7 +156,7 @@ export const defaultBackendSimulatorConfig: BackendSimulatorConfig = {
   robotId: '',
   deviceSecret: '',
   heartbeatIntervalMs: 3000,
-  telemetryIntervalMs: 250,
+  telemetryIntervalMs: 1000,
   commandPollIntervalMs: 1000
 }
 

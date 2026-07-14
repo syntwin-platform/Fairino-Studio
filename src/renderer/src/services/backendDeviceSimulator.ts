@@ -5,13 +5,15 @@ import {
   PendingDeviceCommand,
   TcpPose
 } from '../types/backendDevice'
-import { cancelActiveCommand, getActiveCommandId } from './commandExecutionRuntime'
+import { cancelActiveCommandForRobot, getActiveCommandIdForRobot } from './commandExecutionRuntime'
 import { useRobotStore } from '../store/robotStore'
 import { useSceneStore } from '../store/sceneStore'
 import {
   getPendingCommand,
   postCommandResult,
+  postFactoryRunArmed,
   postHeartbeat,
+  postFactoryRunStarted,
   postTelemetry
 } from './backendDeviceClient'
 import { executeBackendCommand, getCommandExecutionFailureMetadata } from './backendCommandExecutor'
@@ -22,19 +24,29 @@ interface BackendDeviceSimulatorCallbacks {
   onLog?: (message: string) => void
 }
 
-let heartbeatTimer: ReturnType<typeof setInterval> | null = null
-let telemetryTimer: ReturnType<typeof setInterval> | null = null
+interface BackendDeviceSimulatorSessionState {
+  heartbeatTimer: ReturnType<typeof setInterval> | null
+  telemetryTimer: ReturnType<typeof setInterval> | null
+  heartbeatInFlight: boolean
+  telemetryInFlight: boolean
+  commandExecutionInFlight: boolean
+  commandPollAbortController: AbortController | null
+  running: boolean
+  runId: number
+}
 
-let heartbeatInFlight = false
-let telemetryInFlight = false
-
-// Command thường vẫn có thể chạy trong khi request polling tiếp tục.
-let commandExecutionInFlight = false
-
-let commandPollAbortController: AbortController | null = null
-
-let running = false
-let runId = 0
+function createSessionState(): BackendDeviceSimulatorSessionState {
+  return {
+    heartbeatTimer: null,
+    telemetryTimer: null,
+    heartbeatInFlight: false,
+    telemetryInFlight: false,
+    commandExecutionInFlight: false,
+    commandPollAbortController: null,
+    running: false,
+    runId: 0
+  }
+}
 
 function isGuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
@@ -75,8 +87,8 @@ function validateConfig(config: BackendSimulatorConfig): void {
     throw new Error('Heartbeat interval must be at least 1000ms')
   }
 
-  if (!Number.isFinite(config.telemetryIntervalMs) || config.telemetryIntervalMs < 100) {
-    throw new Error('Telemetry interval must be at least 100ms')
+  if (!Number.isFinite(config.telemetryIntervalMs) || config.telemetryIntervalMs < 250) {
+    throw new Error('Telemetry interval must be at least 250ms')
   }
 }
 
@@ -87,9 +99,12 @@ function delay(ms: number): Promise<void> {
 export function buildTelemetryFromStores(config: BackendSimulatorConfig): DeviceTelemetryPayload {
   const robotState = useRobotStore.getState()
   const sceneState = useSceneStore.getState()
+  const robotId = config.robotId.trim()
 
-  const jointAngles = [...robotState.jointAngles]
-  const tcpPose = { ...robotState.tcpPose }
+  const jointAngles = [...(robotState.jointAnglesByRobotId[robotId] ?? robotState.jointAngles)]
+  const tcpPose = {
+    ...(robotState.tcpPoseByRobotId[robotId] ?? robotState.tcpPose)
+  }
 
   validateJointAngles(jointAngles)
   validateTcpPose(tcpPose)
@@ -99,8 +114,8 @@ export function buildTelemetryFromStores(config: BackendSimulatorConfig): Device
     tcpPose,
     jointAngles,
     temperature: null,
-    statusCode: robotState.isPlaying ? 'RUNNING' : 'IDLE',
-    collisionWarning: sceneState.collisionWarning,
+    statusCode: robotState.robotExecutionById[robotId]?.isPlaying ? 'RUNNING' : 'IDLE',
+    collisionWarning: sceneState.robotContactsById[robotId]?.level === 'collision',
     timestamp: new Date().toISOString()
   }
 }
@@ -108,14 +123,15 @@ export function buildTelemetryFromStores(config: BackendSimulatorConfig): Device
 async function sendHeartbeat(
   config: BackendSimulatorConfig,
   callbacks: BackendDeviceSimulatorCallbacks,
-  currentRunId: number
+  currentRunId: number,
+  session: BackendDeviceSimulatorSessionState
 ): Promise<void> {
-  if (heartbeatInFlight) return
-  heartbeatInFlight = true
+  if (session.heartbeatInFlight) return
+  session.heartbeatInFlight = true
 
   try {
     await withDeviceToken(config, (token) => postHeartbeat(config, token))
-    if (runId !== currentRunId) return
+    if (session.runId !== currentRunId) return
 
     callbacks.onStatusChange({
       isConnected: true,
@@ -123,30 +139,31 @@ async function sendHeartbeat(
       lastError: undefined
     })
   } catch (error) {
-    if (runId !== currentRunId) return
+    if (session.runId !== currentRunId) return
 
     callbacks.onStatusChange({
       isConnected: false,
       lastError: error instanceof Error ? error.message : 'Heartbeat failed'
     })
   } finally {
-    heartbeatInFlight = false
+    session.heartbeatInFlight = false
   }
 }
 
 async function sendTelemetry(
   config: BackendSimulatorConfig,
   callbacks: BackendDeviceSimulatorCallbacks,
-  currentRunId: number
+  currentRunId: number,
+  session: BackendDeviceSimulatorSessionState
 ): Promise<void> {
-  if (telemetryInFlight) return
-  telemetryInFlight = true
+  if (session.telemetryInFlight) return
+  session.telemetryInFlight = true
 
   try {
     const telemetry = buildTelemetryFromStores(config)
     await withDeviceToken(config, (token) => postTelemetry(config, telemetry, token))
 
-    if (runId !== currentRunId) return
+    if (session.runId !== currentRunId) return
 
     callbacks.onStatusChange({
       isConnected: true,
@@ -154,14 +171,14 @@ async function sendTelemetry(
       lastError: undefined
     })
   } catch (error) {
-    if (runId !== currentRunId) return
+    if (session.runId !== currentRunId) return
 
     callbacks.onStatusChange({
       isConnected: false,
       lastError: error instanceof Error ? error.message : 'Telemetry failed'
     })
   } finally {
-    telemetryInFlight = false
+    session.telemetryInFlight = false
   }
 }
 
@@ -169,17 +186,56 @@ async function executeAndReportCommand(
   config: BackendSimulatorConfig,
   command: PendingDeviceCommand,
   callbacks: BackendDeviceSimulatorCallbacks,
-  currentRunId: number
+  currentRunId: number,
+  session: BackendDeviceSimulatorSessionState
 ): Promise<void> {
   let commandSucceeded = true
   let commandMessage = 'Simulated command executed in Fairino-Studio'
   let failureMetadata: ReturnType<typeof getCommandExecutionFailureMetadata> = null
+
+  const receivedAtUtc = new Date().toISOString()
+
   try {
-    await executeBackendCommand(command)
+    await executeBackendCommand(command, {
+      armFactoryRunCommand: async (payload, estimatedStepDurationsMs, signal) => {
+        return await withDeviceToken(config, (token) =>
+          postFactoryRunArmed(
+            config,
+            {
+              factoryRunId: payload.factoryRunId,
+              targetId: payload.targetId,
+              commandId: command.commandId,
+              robotId: command.robotId,
+              receivedAtUtc,
+              armedAtUtc: new Date().toISOString(),
+              estimatedStepDurationsMs
+            },
+            token,
+            signal
+          )
+        )
+      },
+
+      reportFactoryRunStarted: async (payload, actualStartedAtUtc, signal) => {
+        await withDeviceToken(config, (token) =>
+          postFactoryRunStarted(
+            config,
+            {
+              factoryRunId: payload.factoryRunId,
+              targetId: payload.targetId,
+              commandId: command.commandId,
+              robotId: command.robotId,
+              actualStartedAtUtc
+            },
+            token,
+            signal
+          )
+        )
+      }
+    })
   } catch (error) {
     commandSucceeded = false
     commandMessage = error instanceof Error ? error.message : 'Command execution failed'
-
     failureMetadata = getCommandExecutionFailureMetadata(error)
   }
 
@@ -206,7 +262,7 @@ async function executeAndReportCommand(
       )
     )
 
-    if (runId !== currentRunId) return
+    if (session.runId !== currentRunId) return
 
     callbacks.onStatusChange({
       isConnected: true,
@@ -214,7 +270,7 @@ async function executeAndReportCommand(
       lastError: commandSucceeded ? undefined : `Command failed: ${commandMessage}`
     })
   } catch (error) {
-    if (runId !== currentRunId) return
+    if (session.runId !== currentRunId) return
 
     callbacks.onStatusChange({
       isConnected: false,
@@ -227,7 +283,8 @@ async function handlePendingCommand(
   config: BackendSimulatorConfig,
   command: PendingDeviceCommand,
   callbacks: BackendDeviceSimulatorCallbacks,
-  currentRunId: number
+  currentRunId: number,
+  session: BackendDeviceSimulatorSessionState
 ): Promise<void> {
   callbacks.onStatusChange({
     isConnected: true,
@@ -237,14 +294,33 @@ async function handlePendingCommand(
 
   callbacks.onLog?.(`Received command ${command.commandType} (${command.commandId})`)
 
-  if (command.commandType === 'EStop') {
-    // Không await. EStop chạy song song và cancel command hiện tại ngay lập tức.
-    void executeAndReportCommand(config, command, callbacks, currentRunId)
+  if (
+    command.commandType === 'RunProgram' &&
+    command.payload &&
+    typeof command.payload === 'object'
+  ) {
+    const scheduledStartAtUtc = (command.payload as { scheduledStartAtUtc?: unknown })
+      .scheduledStartAtUtc
 
+    if (typeof scheduledStartAtUtc === 'string') {
+      const receivedAtMs = Date.now()
+      const scheduledAtMs = Date.parse(scheduledStartAtUtc)
+      const startDeltaMs = scheduledAtMs - receivedAtMs
+
+      callbacks.onLog?.(
+        `RunProgram scheduledStartAtUtc: ${scheduledStartAtUtc}; ` +
+          `receivedAtUtc: ${new Date(receivedAtMs).toISOString()}; ` +
+          `startDeltaMs: ${Math.round(startDeltaMs)}`
+      )
+    }
+  }
+
+  if (command.commandType === 'EStop') {
+    void executeAndReportCommand(config, command, callbacks, currentRunId, session)
     return
   }
 
-  if (commandExecutionInFlight || getActiveCommandId() !== null) {
+  if (session.commandExecutionInFlight || getActiveCommandIdForRobot(config.robotId) !== null) {
     callbacks.onStatusChange({
       lastError: `Backend returned ${command.commandType} while robot is busy`
     })
@@ -252,32 +328,35 @@ async function handlePendingCommand(
     return
   }
 
-  commandExecutionInFlight = true
+  session.commandExecutionInFlight = true
 
-  // Không await tại đây. Polling phải tiếp tục để nhận EStop.
-  void executeAndReportCommand(config, command, callbacks, currentRunId).finally(() => {
-    commandExecutionInFlight = false
+  void executeAndReportCommand(config, command, callbacks, currentRunId, session).finally(() => {
+    session.commandExecutionInFlight = false
+
+    // Command vừa kết thúc nhưng vòng poll có thể vẫn đang chờ với isBusy=true.
+    // Abort để loop lập tức poll lại normal queue với isBusy=false.
+    session.commandPollAbortController?.abort()
   })
 }
 
 async function runCommandLongPollLoop(
   config: BackendSimulatorConfig,
   callbacks: BackendDeviceSimulatorCallbacks,
-  currentRunId: number
+  currentRunId: number,
+  session: BackendDeviceSimulatorSessionState
 ): Promise<void> {
-  while (running && runId === currentRunId) {
+  while (session.running && session.runId === currentRunId) {
     try {
-      const isBusy = commandExecutionInFlight || getActiveCommandId() !== null
+      const isBusy =
+        session.commandExecutionInFlight || getActiveCommandIdForRobot(config.robotId) !== null
 
-      commandPollAbortController = new AbortController()
+      session.commandPollAbortController = new AbortController()
 
       const command = await withDeviceToken(config, (token) =>
-        getPendingCommand(config, token, isBusy, commandPollAbortController?.signal)
+        getPendingCommand(config, token, isBusy, session.commandPollAbortController?.signal)
       )
 
-      commandPollAbortController = null
-
-      if (runId !== currentRunId) {
+      if (session.runId !== currentRunId) {
         return
       }
 
@@ -285,15 +364,19 @@ async function runCommandLongPollLoop(
         continue
       }
 
-      await handlePendingCommand(config, command, callbacks, currentRunId)
+      await handlePendingCommand(config, command, callbacks, currentRunId, session)
     } catch (error) {
-      commandPollAbortController = null
+      session.commandPollAbortController = null
 
-      if (runId !== currentRunId) {
+      if (session.runId !== currentRunId) {
         return
       }
 
       if (error instanceof DOMException && error.name === 'AbortError') {
+        if (session.running && session.runId === currentRunId) {
+          continue
+        }
+
         return
       }
 
@@ -307,68 +390,122 @@ async function runCommandLongPollLoop(
   }
 }
 
-export const backendDeviceSimulator = {
+export interface BackendDeviceSimulatorSessionApi {
+  start(config: BackendSimulatorConfig, callbacks: BackendDeviceSimulatorCallbacks): void
+  stop(): void
+  isRunning(): boolean
+}
+
+export function createBackendDeviceSimulatorSession(): BackendDeviceSimulatorSessionApi {
+  const session = createSessionState()
+  let activeRobotId = ''
+
+  return {
+    start(config, callbacks): void {
+      if (session.running) this.stop()
+
+      const normalizedConfig: BackendSimulatorConfig = {
+        ...config,
+        backendUrl: config.backendUrl.trim(),
+        robotId: config.robotId.trim(),
+        deviceSecret: config.deviceSecret.trim()
+      }
+
+      validateConfig(normalizedConfig)
+      activeRobotId = normalizedConfig.robotId
+
+      session.running = true
+      session.runId += 1
+      const currentRunId = session.runId
+
+      callbacks.onStatusChange({
+        isRunning: true,
+        isConnected: false,
+        lastError: undefined
+      })
+
+      callbacks.onLog?.('Backend simulator heartbeat and telemetry started.')
+
+      void sendHeartbeat(normalizedConfig, callbacks, currentRunId, session)
+      void sendTelemetry(normalizedConfig, callbacks, currentRunId, session)
+      void runCommandLongPollLoop(normalizedConfig, callbacks, currentRunId, session)
+
+      session.heartbeatTimer = setInterval(() => {
+        void sendHeartbeat(normalizedConfig, callbacks, currentRunId, session)
+      }, normalizedConfig.heartbeatIntervalMs)
+
+      session.telemetryTimer = setInterval(() => {
+        void sendTelemetry(normalizedConfig, callbacks, currentRunId, session)
+      }, normalizedConfig.telemetryIntervalMs)
+    },
+
+    stop(): void {
+      cancelActiveCommandForRobot(activeRobotId, 'Backend simulator disconnected')
+      session.runId += 1
+
+      if (session.heartbeatTimer) {
+        clearInterval(session.heartbeatTimer)
+        session.heartbeatTimer = null
+      }
+
+      if (session.telemetryTimer) {
+        clearInterval(session.telemetryTimer)
+        session.telemetryTimer = null
+      }
+
+      session.commandPollAbortController?.abort()
+      session.commandPollAbortController = null
+
+      session.heartbeatInFlight = false
+      session.telemetryInFlight = false
+      session.commandExecutionInFlight = false
+      session.running = false
+    },
+
+    isRunning(): boolean {
+      return session.running
+    }
+  }
+}
+
+export const backendDeviceSimulator = createBackendDeviceSimulatorSession()
+
+const simulatorSessionsByRobotId = new Map<string, BackendDeviceSimulatorSessionApi>()
+
+export const backendDeviceSimulatorManager = {
   start(config: BackendSimulatorConfig, callbacks: BackendDeviceSimulatorCallbacks): void {
-    if (running) this.stop()
+    const robotId = config.robotId.trim()
+    if (!robotId) throw new Error('Robot ID is required')
 
-    const normalizedConfig: BackendSimulatorConfig = {
-      ...config,
-      backendUrl: config.backendUrl.trim(),
-      robotId: config.robotId.trim(),
-      deviceSecret: config.deviceSecret.trim()
+    let session = simulatorSessionsByRobotId.get(robotId)
+
+    if (!session) {
+      session = createBackendDeviceSimulatorSession()
+      simulatorSessionsByRobotId.set(robotId, session)
     }
 
-    validateConfig(normalizedConfig)
-
-    running = true
-    runId += 1
-    const currentRunId = runId
-
-    callbacks.onStatusChange({
-      isRunning: true,
-      isConnected: false,
-      lastError: undefined
-    })
-
-    callbacks.onLog?.('Backend simulator heartbeat and telemetry started.')
-
-    void sendHeartbeat(normalizedConfig, callbacks, currentRunId)
-    void sendTelemetry(normalizedConfig, callbacks, currentRunId)
-    void runCommandLongPollLoop(normalizedConfig, callbacks, currentRunId)
-
-    heartbeatTimer = setInterval(() => {
-      void sendHeartbeat(normalizedConfig, callbacks, currentRunId)
-    }, normalizedConfig.heartbeatIntervalMs)
-
-    telemetryTimer = setInterval(() => {
-      void sendTelemetry(normalizedConfig, callbacks, currentRunId)
-    }, normalizedConfig.telemetryIntervalMs)
+    session.start(config, callbacks)
   },
 
-  stop(): void {
-    cancelActiveCommand('Backend simulator disconnected')
-    runId += 1
+  stop(robotId: string): void {
+    const normalizedRobotId = robotId.trim()
+    const session = simulatorSessionsByRobotId.get(normalizedRobotId)
 
-    if (heartbeatTimer) {
-      clearInterval(heartbeatTimer)
-      heartbeatTimer = null
-    }
+    if (!session) return
 
-    if (telemetryTimer) {
-      clearInterval(telemetryTimer)
-      telemetryTimer = null
-    }
-
-    commandPollAbortController?.abort()
-    commandPollAbortController = null
-
-    heartbeatInFlight = false
-    telemetryInFlight = false
-    commandExecutionInFlight = false
-    running = false
+    session.stop()
+    simulatorSessionsByRobotId.delete(normalizedRobotId)
   },
 
-  isRunning(): boolean {
-    return running
+  stopAll(): void {
+    for (const session of simulatorSessionsByRobotId.values()) {
+      session.stop()
+    }
+
+    simulatorSessionsByRobotId.clear()
+  },
+
+  isRunning(robotId: string): boolean {
+    return simulatorSessionsByRobotId.get(robotId.trim())?.isRunning() ?? false
   }
 }

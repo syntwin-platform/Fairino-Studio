@@ -10,9 +10,11 @@ import {
   Radio,
   Clock,
   ToggleLeft,
-  HelpCircle
+  HelpCircle,
+  Settings
 } from 'lucide-react'
 import { translations } from '../../i18n/translations'
+import WorkflowStepDetailsModal from './WorkflowStepDetailsModal'
 
 // Helper component for descriptive tooltips on technical terms
 interface InfoTooltipProps {
@@ -34,75 +36,6 @@ function InfoTooltip({ text }: InfoTooltipProps): React.JSX.Element {
   )
 }
 
-interface SignedNumberInputProps {
-  value: number
-  step: string
-  disabled: boolean
-  onValueChange: (value: number) => void
-}
-
-function SignedNumberInput({
-  value,
-  step,
-  disabled,
-  onValueChange
-}: SignedNumberInputProps): React.JSX.Element {
-  const [draft, setDraft] = useState<string | null>(null)
-  const displayValue = draft ?? String(value)
-
-  const handleChange = (event: React.ChangeEvent<HTMLInputElement>): void => {
-    const rawValue = event.target.value.replace(',', '.')
-
-    // Cho phép trạng thái đang nhập: "-", "-0.", "1."
-    if (!/^-?\d*(\.\d*)?$/.test(rawValue)) {
-      return
-    }
-
-    setDraft(rawValue)
-
-    if (rawValue === '' || rawValue === '-' || rawValue === '.' || rawValue === '-.') {
-      return
-    }
-
-    const parsedValue = Number(rawValue)
-
-    if (Number.isFinite(parsedValue)) {
-      onValueChange(parsedValue)
-    }
-  }
-
-  const handleBlur = (): void => {
-    const currentDraft = draft ?? String(value)
-    const parsedValue = Number(currentDraft)
-
-    if (currentDraft === '' || currentDraft === '-' || !Number.isFinite(parsedValue)) {
-      setDraft(null)
-      return
-    }
-
-    onValueChange(parsedValue)
-    setDraft(null)
-  }
-
-  return (
-    <input
-      type="text"
-      inputMode="decimal"
-      value={displayValue}
-      onChange={handleChange}
-      onBlur={handleBlur}
-      onKeyDown={(event) => {
-        if (event.key === 'Enter') {
-          event.currentTarget.blur()
-        }
-      }}
-      step={step}
-      disabled={disabled}
-      className="w-16 rounded border border-white/10 bg-black/40 px-1.5 py-0.5 text-center font-mono text-xs font-bold text-white outline-none"
-    />
-  )
-}
-
 interface BlockTemplate {
   type: StepType
   labelKey: keyof typeof translations.vi
@@ -118,8 +51,19 @@ export default function BlockWorkspace(): React.JSX.Element {
   const reorderSteps = useRobotStore((state) => state.reorderSteps)
   const selectedStepId = useRobotStore((state) => state.selectedStepId)
   const setSelectedStepId = useRobotStore((state) => state.setSelectedStepId)
-  const isPlaying = useRobotStore((state) => state.isPlaying)
-  const currentStepIndex = useRobotStore((state) => state.currentStepIndex)
+  const isPlaying = useRobotStore((state) => {
+    const robotId = state.selectedRobotId
+
+    return robotId ? (state.robotExecutionById[robotId]?.isPlaying ?? false) : state.isPlaying
+  })
+
+  const currentStepIndex = useRobotStore((state) => {
+    const robotId = state.selectedRobotId
+
+    return robotId
+      ? (state.robotExecutionById[robotId]?.currentStepIndex ?? 0)
+      : state.currentStepIndex
+  })
 
   const lengthUnit = useRobotStore((state) => state.lengthUnit)
   const angleUnit = useRobotStore((state) => state.angleUnit)
@@ -131,6 +75,10 @@ export default function BlockWorkspace(): React.JSX.Element {
   // Drag & drop state
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null)
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null)
+  const [editingStepId, setEditingStepId] = useState<string | null>(null)
+  const editingStep = editingStepId
+    ? (steps.find((step) => step.id === editingStepId) ?? null)
+    : null
 
   const blockTemplates: BlockTemplate[] = [
     {
@@ -343,8 +291,9 @@ export default function BlockWorkspace(): React.JSX.Element {
               draggable={!isPlaying}
               onDragStart={(e) => handleTemplateDragStart(e, tpl.type)}
               onClick={() => !isPlaying && handleAddBlock(tpl.type)}
-              className={`flex items-center gap-1.5 px-2 py-1.5 rounded-lg border text-xs font-bold shadow-sm cursor-grab active:cursor-grabbing transition transform hover:scale-[1.03] select-none ${tpl.colorClass} ${isPlaying ? 'opacity-40 pointer-events-none' : ''
-                }`}
+              className={`flex items-center gap-1.5 px-2 py-1.5 rounded-lg border text-xs font-bold shadow-sm cursor-grab active:cursor-grabbing transition transform hover:scale-[1.03] select-none ${tpl.colorClass} ${
+                isPlaying ? 'opacity-40 pointer-events-none' : ''
+              }`}
             >
               {tpl.icon}
               <span>{t(tpl.labelKey)}</span>
@@ -409,9 +358,11 @@ export default function BlockWorkspace(): React.JSX.Element {
                 onDrop={(e) => handleDrop(e, idx)}
                 onDragEnd={handleDragEnd}
                 onClick={() => setSelectedStepId(step.id)}
-                className={`relative flex w-full min-w-0 items-stretch rounded-xl border transition shadow-md select-none transform ${blockBg} ${blockBorder} ${blockText} ${isDragged ? 'opacity-30 scale-95' : ''
-                  } ${isOver && draggedIndex !== idx ? 'border-t-2 border-t-white pt-4' : ''} ${isCurrentSim ? 'ring-2 ring-emerald-400 scale-[1.02] shadow-emerald-500/20' : ''
-                  }`}
+                className={`relative flex w-full min-w-0 items-stretch rounded-xl border transition shadow-md select-none transform ${blockBg} ${blockBorder} ${blockText} ${
+                  isDragged ? 'opacity-30 scale-95' : ''
+                } ${isOver && draggedIndex !== idx ? 'border-t-2 border-t-white pt-4' : ''} ${
+                  isCurrentSim ? 'ring-2 ring-emerald-400 scale-[1.02] shadow-emerald-500/20' : ''
+                }`}
                 style={{
                   clipPath:
                     'polygon(0% 0%, 30% 0%, 35% 6px, 45% 6px, 50% 0%, 100% 0%, 100% 100%, 50% 100%, 45% calc(100% + 6px), 35% calc(100% + 6px), 30% 100%, 0% 100%)',
@@ -457,263 +408,24 @@ export default function BlockWorkspace(): React.JSX.Element {
                     {(step.type === 'GripperClose' || step.type === 'GripperOpen') && <>Gripper</>}
                   </span>
 
-                  {/* Render parameters interface inside the block */}
-                  {step.type === 'RotateJoint' && (
-                    <div className="grid w-full min-w-0 grid-cols-[auto_minmax(0,0.9fr)_minmax(0,1.1fr)_auto] items-center gap-2 text-xs">
-                      <span className="whitespace-nowrap">{t('rotateJointBlock')}</span>
-                      <select
-                        value={step.jointIndex || 1}
-                        onChange={(e) => {
-                          const idxVal = parseInt(e.target.value)
-                          updateStep(step.id, {
-                            jointIndex: idxVal,
-                            label: `${t('rotateJointBlock')} ${idxVal}`
-                          })
-                        }}
-                        disabled={isPlaying}
-                        className="min-w-0 w-full rounded border border-white/10 bg-black/40 px-1.5 py-0.5 text-xs font-semibold text-white outline-none cursor-pointer"
-                      >
-                        {[1, 2, 3, 4, 5, 6].map((num) => (
-                          <option key={num} value={num}>
-                            {t('jointLimitTitle')} {num}
-                          </option>
-                        ))}
-                      </select>
-
-                      <select
-                        value={step.rotateMode || 'absolute'}
-                        onChange={(e) => {
-                          updateStep(step.id, { rotateMode: e.target.value as WorkflowStep['rotateMode'] })
-                        }}
-                        disabled={isPlaying}
-                        className="min-w-0 w-full rounded border border-white/10 bg-black/40 px-1.5 py-0.5 text-xs font-semibold text-white outline-none cursor-pointer"
-                      >
-                        <option value="absolute">{t('toAngle')}</option>
-                        <option value="relative">{t('byDegrees')}</option>
-                      </select>
-
-                      <div className="flex shrink-0 items-center gap-1 whitespace-nowrap">
-                        <SignedNumberInput
-                          value={
-                            angleUnit === 'rad'
-                              ? Math.round((((step.angle ?? 0) * Math.PI) / 180) * 1000) / 1000
-                              : (step.angle ?? 0)
-                          }
-                          step={angleUnit === 'rad' ? '0.001' : '1'}
-                          disabled={isPlaying}
-                          onValueChange={(inputValue) => {
-                            const degreeValue =
-                              angleUnit === 'rad'
-                                ? Math.round(((inputValue * 180) / Math.PI) * 10) / 10
-                                : inputValue
-
-                            updateStep(step.id, {
-                              angle: degreeValue
-                            })
-                          }}
-                        />
-                        <span className="shrink-0">
-                          {angleUnit === 'rad' ? 'rad' : t('degrees')}
-                        </span>
-                      </div>
-                    </div>
-                  )}
-
-                  {step.type === 'MoveTCP' && (
-                    <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5 text-xs">
-                      <span>{t('moveTCPBlock')}</span>
-                      <select
-                        value={step.tcpAxis || 'Z'}
-                        onChange={(e) => {
-                          const axisVal = e.target.value as NonNullable<WorkflowStep['tcpAxis']>
-                          updateStep(step.id, {
-                            tcpAxis: axisVal,
-                            label: `${t('moveTCPBlock')} ${axisVal}`
-                          })
-                        }}
-                        disabled={isPlaying}
-                        className="bg-black/40 border border-white/10 rounded px-1.5 py-0.5 text-xs text-white font-semibold outline-none cursor-pointer"
-                      >
-                        {['X', 'Y', 'Z'].map((axis) => (
-                          <option key={axis} value={axis}>
-                            {axis}
-                          </option>
-                        ))}
-                      </select>
-
-                      <select
-                        value={step.moveMode || 'relative'}
-                        onChange={(e) => {
-                          updateStep(step.id, { moveMode: e.target.value as WorkflowStep['moveMode'] })
-                        }}
-                        disabled={isPlaying}
-                        className="bg-black/40 border border-white/10 rounded px-1.5 py-0.5 text-xs text-white font-semibold outline-none cursor-pointer"
-                      >
-                        <option value="relative">{t('byDegrees')}</option>
-                        <option value="absolute">{t('toCoordinate')}</option>
-                      </select>
-
-                      <SignedNumberInput
-                        value={
-                          lengthUnit === 'm'
-                            ? Math.round(((step.distance ?? 0) / 1000) * 10000) / 10000
-                            : (step.distance ?? 0)
-                        }
-                        step={lengthUnit === 'm' ? '0.0001' : '1'}
-                        disabled={isPlaying}
-                        onValueChange={(inputValue) => {
-                          const millimeterValue =
-                            lengthUnit === 'm'
-                              ? Math.round(inputValue * 1000 * 10) / 10
-                              : inputValue
-
-                          updateStep(step.id, {
-                            distance: millimeterValue
-                          })
-                        }}
-                      />
-                      <span>{lengthUnit}</span>
-                    </div>
-                  )}
-
-                  {step.type === 'SetDO' && (
-                    <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5 text-xs">
-                      <select
-                        value={step.doType || 'cabinet'}
-                        onChange={(e) => {
-                          const newType = e.target.value as 'cabinet' | 'tool'
-                          const newIdx = newType === 'tool' ? 0 : 1
-                          updateStep(step.id, {
-                            doType: newType,
-                            doIndex: newIdx,
-                            label:
-                              language === 'vi'
-                                ? `Cài đặt ${newType === 'tool' ? 'Tool DO' : 'DO'} ${newIdx}`
-                                : `Set ${newType === 'tool' ? 'Tool DO' : 'DO'} ${newIdx}`
-                          })
-                        }}
-                        disabled={isPlaying}
-                        className="bg-black/40 border border-white/10 rounded px-1.5 py-0.5 text-xs text-white font-semibold outline-none cursor-pointer"
-                      >
-                        <option value="cabinet">{t('cabinetDO')}</option>
-                        <option value="tool">{t('toolDO')}</option>
-                      </select>
-                      <select
-                        value={step.doIndex ?? 1}
-                        onChange={(e) => {
-                          const val = parseInt(e.target.value)
-                          const type = step.doType || 'cabinet'
-                          updateStep(step.id, {
-                            doIndex: val,
-                            label:
-                              language === 'vi'
-                                ? `Cài đặt ${type === 'tool' ? 'Tool DO' : 'DO'} ${val}`
-                                : `Set ${type === 'tool' ? 'Tool DO' : 'DO'} ${val}`
-                          })
-                        }}
-                        disabled={isPlaying}
-                        className="bg-black/40 border border-white/10 rounded px-1.5 py-0.5 text-xs text-white font-semibold outline-none cursor-pointer"
-                      >
-                        {((step.doType || 'cabinet') === 'tool'
-                          ? [0, 1]
-                          : [1, 2, 3, 4, 5, 6, 7, 8]
-                        ).map((num) => (
-                          <option key={num} value={num}>
-                            {(step.doType || 'cabinet') === 'tool' ? `End-DO ${num}` : `DO ${num}`}
-                          </option>
-                        ))}
-                      </select>
-                      <span>{language === 'vi' ? 'thành' : 'to'}</span>
-                      <div className="flex items-center gap-1">
-                        <select
-                          value={step.doValue ?? 1}
-                          onChange={(e) => {
-                            const val = parseInt(e.target.value) as 0 | 1
-                            updateStep(step.id, { doValue: val })
-                          }}
-                          disabled={isPlaying}
-                          className="bg-black/40 border border-white/10 rounded px-1.5 py-0.5 text-xs text-white font-semibold outline-none cursor-pointer font-mono"
-                        >
-                          <option value={1}>{t('turnOn')}</option>
-                          <option value={0}>{t('turnOff')}</option>
-                        </select>
-                        <InfoTooltip text={t('tooltipDOVal')} />
-                      </div>
-                    </div>
-                  )}
-
-                  {step.type === 'WaitMs' && (
-                    <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5 text-xs">
-                      <span>{t('waitMsBlock')}</span>
-                      <input
-                        type="number"
-                        value={step.delayMs || 1000}
-                        onChange={(e) => {
-                          const val = parseInt(e.target.value) || 0
-                          updateStep(step.id, {
-                            delayMs: val,
-                            label: `${t('waitMsBlock')} ${val}ms`
-                          })
-                        }}
-                        disabled={isPlaying}
-                        className="bg-black/40 border border-white/10 rounded px-1.5 py-0.5 w-16 text-center text-xs font-mono font-bold text-white outline-none"
-                      />
-                      <span>ms</span>
-                    </div>
-                  )}
-
-                  {step.type === 'GripperClose' && (
-                    <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5 text-xs font-semibold">
-                      <span>
-                        {language === 'vi'
-                          ? 'Thiết lập đóng tay gắp robot'
-                          : 'Set gripper state to CLOSED'}{' '}
-                        (DO 1 = 1)
-                      </span>
-                      <button
-                        onClick={() => {
-                          updateStep(step.id, {
-                            type: 'GripperOpen',
-                            label: t('gripperOpenBlock')
-                          })
-                        }}
-                        disabled={isPlaying}
-                        className="bg-black/20 hover:bg-black/40 px-1.5 py-0.5 rounded text-[10px] border border-white/10 cursor-pointer"
-                      >
-                        {t('changeToOpen')}
-                      </button>
-                    </div>
-                  )}
-
-                  {step.type === 'GripperOpen' && (
-                    <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5 text-xs font-semibold">
-                      <span>
-                        {language === 'vi'
-                          ? 'Thiết lập mở tay gắp robot'
-                          : 'Set gripper state to OPEN'}{' '}
-                        (DO 1 = 0)
-                      </span>
-                      <button
-                        onClick={() => {
-                          updateStep(step.id, {
-                            type: 'GripperClose',
-                            label: t('gripperCloseBlock')
-                          })
-                        }}
-                        disabled={isPlaying}
-                        className="bg-black/20 hover:bg-black/40 px-1.5 py-0.5 rounded text-[10px] border border-white/10 cursor-pointer"
-                      >
-                        {t('changeToClose')}
-                      </button>
-                    </div>
-                  )}
+                  {/* Parameter Summary Label */}
+                  <span className="text-[11px] text-slate-300 font-medium truncate ml-2">
+                    {step.label}
+                  </span>
                 </div>
 
-                {/* 3. Delete action button */}
+                {/* Actions: Edit & Delete buttons */}
                 <div
-                  className="absolute right-2 top-1/2 z-10 -translate-y-1/2"
+                  className="absolute right-2 top-1/2 z-10 -translate-y-1/2 flex items-center gap-1"
                   onClick={(e) => e.stopPropagation()}
                 >
+                  <button
+                    onClick={() => setEditingStepId(step.id)}
+                    className="rounded-lg border border-white/10 bg-black/35 p-1.5 text-white/60 shadow-sm transition hover:border-blue-500/40 hover:bg-blue-950/60 hover:text-blue-300 cursor-pointer"
+                    title={language === 'vi' ? 'Sửa thông số' : 'Edit parameters'}
+                  >
+                    <Settings size={13} />
+                  </button>
                   <button
                     onClick={() => removeStep(step.id)}
                     className="rounded-lg border border-white/10 bg-black/35 p-1.5 text-white/60 shadow-sm transition hover:border-rose-400/40 hover:bg-rose-950/60 hover:text-rose-300 cursor-pointer"
@@ -727,6 +439,19 @@ export default function BlockWorkspace(): React.JSX.Element {
           })
         )}
       </div>
+
+      {editingStep && (
+        <WorkflowStepDetailsModal
+          step={editingStep}
+          isOpen={!!editingStep}
+          onClose={() => setEditingStepId(null)}
+          updateStep={updateStep}
+          angleUnit={angleUnit}
+          lengthUnit={lengthUnit}
+          isPlaying={isPlaying}
+          language={language}
+        />
+      )}
     </div>
   )
 }

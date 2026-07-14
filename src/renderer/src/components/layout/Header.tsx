@@ -1,5 +1,15 @@
 import { useCallback, useEffect } from 'react'
-import { AlertTriangle, FilePlus, FolderOpen, Globe, Play, Save, Upload } from 'lucide-react'
+import {
+  AlertTriangle,
+  Factory,
+  FilePlus,
+  FolderOpen,
+  Globe,
+  Play,
+  Save,
+  Upload,
+  Wrench
+} from 'lucide-react'
 
 import { generateLua } from '../../engine/codegen/luaCodegen'
 import { translations } from '../../i18n/translations'
@@ -45,6 +55,10 @@ export default function Header(): React.JSX.Element {
   const steps = useRobotStore((state) => state.steps)
   const projectName = useRobotStore((state) => state.projectName)
   const currentFilePath = useRobotStore((state) => state.currentFilePath)
+  const robots = useRobotStore((state) => state.robots)
+  const selectedRobotId = useRobotStore((state) => state.selectedRobotId)
+  const workspaceMode = useRobotStore((state) => state.workspaceMode)
+  const setWorkspaceMode = useRobotStore((state) => state.setWorkspaceMode)
   const collisionWarning = useSceneStore((state) => state.collisionWarning)
 
   const setProjectName = useRobotStore((state) => state.setProjectName)
@@ -60,7 +74,7 @@ export default function Header(): React.JSX.Element {
     (key: keyof typeof translations.vi): string => translations[language][key],
     [language]
   )
-
+  const selectedRobot = robots.find((robot) => robot.id === selectedRobotId) ?? null
   const handleNewProject = useCallback((): void => {
     if (confirm(t('newProjectConfirm'))) {
       reorderSteps([])
@@ -345,6 +359,36 @@ export default function Header(): React.JSX.Element {
       </div>
 
       <div className="flex items-center gap-2">
+        <div className="flex rounded border border-[#343849] bg-[#101218] p-0.5">
+          <button
+            type="button"
+            onClick={() => setWorkspaceMode('factory')}
+            title="Monitor and arrange all robots"
+            className={`flex items-center gap-1 rounded px-2 py-1 text-[10px] font-semibold transition ${
+              workspaceMode === 'factory'
+                ? 'bg-blue-600 text-white'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <Factory size={12} />
+            Factory
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setWorkspaceMode('train')}
+            title="Train and program the selected robot"
+            className={`flex items-center gap-1 rounded px-2 py-1 text-[10px] font-semibold transition ${
+              workspaceMode === 'train'
+                ? 'bg-blue-600 text-white'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <Wrench size={12} />
+            Train
+          </button>
+        </div>
+
         <input
           type="text"
           value={projectName}
@@ -353,6 +397,14 @@ export default function Header(): React.JSX.Element {
           title="Tên dự án (chỉ cho phép chữ cái, số, gạch dưới và gạch ngang)"
           className="w-48 rounded border border-[#2d2d34] bg-[#1e1e24] px-2.5 py-1 text-center text-xs font-semibold text-white outline-none transition hover:bg-[#25252d] focus:border-blue-500 focus:bg-[#2d2d38]"
         />
+        {selectedRobot && (
+          <span
+            className="max-w-[180px] truncate rounded border border-blue-500/30 bg-blue-950/30 px-2 py-1 text-[10px] font-semibold text-blue-200"
+            title={`${selectedRobot.name} - ${selectedRobot.id}`}
+          >
+            {selectedRobot.name}
+          </span>
+        )}
 
         {currentFilePath && (
           <span
@@ -390,30 +442,27 @@ export default function Header(): React.JSX.Element {
             type="button"
             onClick={handleNewProject}
             title={t('newProject')}
-            className="flex items-center gap-1 rounded border border-[#2d2d34] bg-[#1e1e24] p-1.5 text-slate-300 transition hover:bg-[#282830] hover:text-white"
+            className="flex items-center gap-1 rounded-md border border-[#343849] bg-[#1e1e24] p-2 text-slate-300 transition hover:bg-[#282830] hover:text-white hover:border-blue-500/50 shadow-sm"
           >
             <FilePlus size={14} />
-            <span className="hidden text-[11px] font-semibold md:inline">{t('newProject')}</span>
           </button>
 
           <button
             type="button"
             onClick={() => void handleOpenProject()}
             title={t('openProject')}
-            className="flex items-center gap-1 rounded border border-[#2d2d34] bg-[#1e1e24] p-1.5 text-slate-300 transition hover:bg-[#282830] hover:text-white"
+            className="flex items-center gap-1 rounded-md border border-[#343849] bg-[#1e1e24] p-2 text-slate-300 transition hover:bg-[#282830] hover:text-white hover:border-blue-500/50 shadow-sm"
           >
             <FolderOpen size={14} />
-            <span className="hidden text-[11px] font-semibold md:inline">{t('openProject')}</span>
           </button>
 
           <button
             type="button"
             onClick={() => void handleSaveProject()}
             title={t('saveProject')}
-            className="flex items-center gap-1 rounded border border-[#2d2d34] bg-[#1e1e24] p-1.5 text-slate-300 transition hover:bg-[#282830] hover:text-white"
+            className="flex items-center gap-1 rounded-md border border-[#343849] bg-[#1e1e24] p-2 text-slate-300 transition hover:bg-[#282830] hover:text-white hover:border-blue-500/50 shadow-sm"
           >
             <Save size={14} />
-            <span className="hidden text-[11px] font-semibold md:inline">{t('saveProject')}</span>
           </button>
 
           <div className="mx-1 h-5 w-px bg-[#2d2d34]" />
@@ -422,16 +471,15 @@ export default function Header(): React.JSX.Element {
             type="button"
             onClick={() => void handleImportLua()}
             title={t('importLua')}
-            className="flex items-center gap-1 rounded border border-[#2d2d34] bg-[#1e1e24] p-1.5 text-slate-300 transition hover:bg-[#282830] hover:text-white"
+            className="flex items-center gap-1 rounded-md border border-[#343849] bg-[#1e1e24] p-2 text-slate-300 transition hover:bg-[#282830] hover:text-white hover:border-blue-500/50 shadow-sm"
           >
             <Upload size={14} />
-            <span className="hidden text-[11px] font-semibold md:inline">{t('importLua')}</span>
           </button>
 
           <button
             type="button"
             onClick={() => void handleExportLua()}
-            className="flex items-center gap-1.5 rounded bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-md transition hover:bg-blue-500"
+            className="flex items-center gap-1.5 rounded-md bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-md transition hover:bg-blue-500"
           >
             <Play size={12} className="fill-white" />
             {t('exportLua')} ({steps.length})

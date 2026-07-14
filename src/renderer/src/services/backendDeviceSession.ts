@@ -3,14 +3,14 @@ import { BackendDeviceRequestError, createDeviceSession } from './backendDeviceC
 
 const refreshSkewMs = 60_000
 
-let cachedSession: {
-  key: string
+interface CachedDeviceSession {
   accessToken: string
+  runtimeSessionId?: string | null
   expiresAt: number
-} | null = null
+}
 
-let activeSessionPromise: Promise<string> | null = null
-let activeSessionKey: string | null = null
+const cachedSessionsByKey = new Map<string, CachedDeviceSession>()
+const activeSessionPromisesByKey = new Map<string, Promise<string>>()
 
 function getSessionKey(config: BackendSimulatorConfig): string {
   return [
@@ -20,41 +20,70 @@ function getSessionKey(config: BackendSimulatorConfig): string {
   ].join('|')
 }
 
-export function invalidateDeviceSession(): void {
-  cachedSession = null
-  activeSessionPromise = null
-  activeSessionKey = null
+function getRuntimeSessionStorageKey(config: BackendSimulatorConfig): string {
+  return `syntwin.backendDevice.runtimeSessionId.${config.robotId.trim()}`
+}
+
+export function getCachedDeviceRuntimeSessionId(config: BackendSimulatorConfig): string | null {
+  const key = getSessionKey(config)
+  const cachedSession = cachedSessionsByKey.get(key)
+
+  if (cachedSession?.runtimeSessionId) {
+    return cachedSession.runtimeSessionId
+  }
+
+  return window.sessionStorage.getItem(getRuntimeSessionStorageKey(config))
+}
+
+export function invalidateDeviceSession(config?: BackendSimulatorConfig): void {
+  if (!config) {
+    cachedSessionsByKey.clear()
+    activeSessionPromisesByKey.clear()
+    return
+  }
+
+  const key = getSessionKey(config)
+  cachedSessionsByKey.delete(key)
+  activeSessionPromisesByKey.delete(key)
 }
 
 export async function getDeviceAccessToken(config: BackendSimulatorConfig): Promise<string> {
   const key = getSessionKey(config)
   const now = Date.now()
+  const cachedSession = cachedSessionsByKey.get(key)
 
-  if (cachedSession && cachedSession.key === key && cachedSession.expiresAt - refreshSkewMs > now) {
+  if (cachedSession && cachedSession.expiresAt - refreshSkewMs > now) {
     return cachedSession.accessToken
   }
 
-  if (activeSessionPromise && activeSessionKey === key) {
-    return activeSessionPromise
+  const activePromise = activeSessionPromisesByKey.get(key)
+
+  if (activePromise) {
+    return activePromise
   }
 
-  activeSessionKey = key
-  activeSessionPromise = (async () => {
+  const sessionPromise = (async () => {
     try {
       const session = await createDeviceSession(config)
-      cachedSession = {
-        key,
+
+      cachedSessionsByKey.set(key, {
         accessToken: session.accessToken,
+        runtimeSessionId: session.runtimeSessionId,
         expiresAt: Date.now() + session.expiresInSeconds * 1000
+      })
+
+      if (session.runtimeSessionId) {
+        window.sessionStorage.setItem(getRuntimeSessionStorageKey(config), session.runtimeSessionId)
       }
+
       return session.accessToken
     } finally {
-      activeSessionPromise = null
-      activeSessionKey = null
+      activeSessionPromisesByKey.delete(key)
     }
   })()
 
-  return activeSessionPromise
+  activeSessionPromisesByKey.set(key, sessionPromise)
+  return sessionPromise
 }
 
 export async function withDeviceToken<T>(
@@ -70,7 +99,7 @@ export async function withDeviceToken<T>(
       throw error
     }
 
-    invalidateDeviceSession()
+    invalidateDeviceSession(config)
     const refreshedAccessToken = await getDeviceAccessToken(config)
     return await fn(refreshedAccessToken)
   }

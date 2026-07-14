@@ -5,9 +5,27 @@ import {
   ProgrammingMode,
   TCPPose,
   RobotProgramSource,
+  RobotInstance,
+  RobotSceneBinding,
   WorkflowStep
 } from '../types/robot.types'
-
+import type { BackendSimulatorStatus } from '../types/backendDevice'
+export type WorkspaceMode = 'factory' | 'train'
+export type RobotPlacementTransformMode = 'translate' | 'rotate'
+export interface RobotExecutionState {
+  isPlaying: boolean
+  currentStepIndex: number
+  startedAt?: string
+  lastError?: string
+}
+const DEFAULT_TCP_POSE: TCPPose = {
+  x: 0,
+  y: 0,
+  z: 0,
+  rx: 0,
+  ry: 0,
+  rz: 0
+}
 function createStepId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return `step_${crypto.randomUUID()}`
@@ -18,11 +36,21 @@ function createStepId(): string {
 
 interface RobotState {
   // Robot Hardware Config & Current values
+  // Backend robot instances. This is a light multi-robot foundation;
+  // current motion/workflow state remains single-active-robot for now.
+  robots: RobotInstance[]
+  selectedRobotId: string | null
+  workspaceMode: WorkspaceMode
+  robotRuntimeById: Record<string, BackendSimulatorStatus>
+  robotExecutionById: Record<string, RobotExecutionState>
   robotModel: string
   jointAngles: JointAngles
+  jointAnglesByRobotId: Record<string, JointAngles>
+  tcpPoseByRobotId: Record<string, TCPPose>
   tcpPose: TCPPose
   isIKMode: boolean
-
+  isRobotPlacementMode: boolean
+  robotPlacementTransformMode: RobotPlacementTransformMode
   // Project properties
   projectName: string
   currentFilePath: string | null
@@ -47,9 +75,27 @@ interface RobotState {
   gripperState: 'open' | 'closed'
 
   // Actions
+  setRobots: (robots: RobotInstance[]) => void
+  upsertRobot: (robot: RobotInstance) => void
+  removeRobot: (robotId: string) => void
+  updateRobotSceneBinding: (robotId: string, sceneBinding: RobotSceneBinding) => void
+  selectRobot: (robotId: string | null) => void
+  setWorkspaceMode: (mode: WorkspaceMode) => void
+  setRobotExecution: (robotId: string, execution: Partial<RobotExecutionState>) => void
+  clearRobotExecution: (robotId: string) => void
+  clearAllRobotExecutions: () => void
+  setRobotRuntime: (robotId: string, status: Partial<BackendSimulatorStatus>) => void
+  clearRobotRuntime: (robotId: string) => void
+  clearAllRobotRuntime: () => void
   setJointAngles: (angles: JointAngles) => void
+  setJointAnglesForRobot: (robotId: string, angles: JointAngles) => void
+  setJointAnglesForRobots: (patch: Record<string, JointAngles>) => void
+
   setTCPPose: (pose: TCPPose) => void
+  setTCPPoseForRobot: (robotId: string, pose: TCPPose) => void
   setIKMode: (enabled: boolean) => void
+  setRobotPlacementMode: (enabled: boolean) => void
+  setRobotPlacementTransformMode: (mode: RobotPlacementTransformMode) => void
   setProjectName: (name: string) => void
   setCurrentFilePath: (path: string | null) => void
   setMode: (mode: ProgrammingMode) => void
@@ -76,10 +122,19 @@ interface RobotState {
 }
 
 export const useRobotStore = create<RobotState>((set) => ({
+  robots: [],
+  selectedRobotId: null,
+  workspaceMode: 'factory',
+  robotRuntimeById: {},
+  robotExecutionById: {},
   robotModel: 'FR5',
   jointAngles: [...DEFAULT_JOINT_ANGLES],
-  tcpPose: { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0 },
+  jointAnglesByRobotId: {},
+  tcpPoseByRobotId: {},
+  tcpPose: { ...DEFAULT_TCP_POSE },
   isIKMode: false,
+  isRobotPlacementMode: false,
+  robotPlacementTransformMode: 'translate',
 
   projectName: 'coffee_machine_workflow',
   currentFilePath: null,
@@ -100,9 +155,308 @@ export const useRobotStore = create<RobotState>((set) => ({
   toolDigitalOutputs: {},
   gripperState: 'open',
 
-  setJointAngles: (angles) => set({ jointAngles: angles }),
-  setTCPPose: (pose) => set({ tcpPose: pose }),
+  setRobots: (robots) =>
+    set((state) => {
+      const nextSelectedRobotId =
+        state.selectedRobotId && robots.some((robot) => robot.id === state.selectedRobotId)
+          ? state.selectedRobotId
+          : (robots[0]?.id ?? null)
+
+      const jointAnglesByRobotId = robots.reduce<Record<string, JointAngles>>((acc, robot) => {
+        acc[robot.id] =
+          state.jointAnglesByRobotId[robot.id] ??
+          (robot.id === state.selectedRobotId ? state.jointAngles : [...DEFAULT_JOINT_ANGLES])
+        return acc
+      }, {})
+
+      const tcpPoseByRobotId = robots.reduce<Record<string, TCPPose>>((acc, robot) => {
+        acc[robot.id] =
+          state.tcpPoseByRobotId[robot.id] ??
+          (robot.id === state.selectedRobotId ? state.tcpPose : { ...DEFAULT_TCP_POSE })
+        return acc
+      }, {})
+
+      return {
+        robots,
+        selectedRobotId: nextSelectedRobotId,
+        jointAnglesByRobotId,
+        tcpPoseByRobotId,
+        jointAngles: nextSelectedRobotId
+          ? jointAnglesByRobotId[nextSelectedRobotId]
+          : [...DEFAULT_JOINT_ANGLES],
+        tcpPose: nextSelectedRobotId
+          ? (tcpPoseByRobotId[nextSelectedRobotId] ?? { ...DEFAULT_TCP_POSE })
+          : { ...DEFAULT_TCP_POSE }
+      }
+    }),
+
+  upsertRobot: (robot) =>
+    set((state) => {
+      const exists = state.robots.some((item) => item.id === robot.id)
+      const robots = exists
+        ? state.robots.map((item) => (item.id === robot.id ? robot : item))
+        : [robot, ...state.robots]
+
+      const nextSelectedRobotId = state.selectedRobotId ?? robot.id
+      const jointAnglesByRobotId = {
+        ...state.jointAnglesByRobotId,
+        [robot.id]:
+          state.jointAnglesByRobotId[robot.id] ??
+          (robot.id === state.selectedRobotId ? state.jointAngles : [...DEFAULT_JOINT_ANGLES])
+      }
+
+      const tcpPoseByRobotId = {
+        ...state.tcpPoseByRobotId,
+        [robot.id]:
+          state.tcpPoseByRobotId[robot.id] ??
+          (robot.id === state.selectedRobotId ? state.tcpPose : { ...DEFAULT_TCP_POSE })
+      }
+
+      return {
+        robots,
+        selectedRobotId: nextSelectedRobotId,
+        jointAnglesByRobotId,
+        tcpPoseByRobotId,
+        jointAngles: nextSelectedRobotId
+          ? jointAnglesByRobotId[nextSelectedRobotId]
+          : [...DEFAULT_JOINT_ANGLES],
+        tcpPose: nextSelectedRobotId
+          ? (tcpPoseByRobotId[nextSelectedRobotId] ?? state.tcpPose)
+          : { ...DEFAULT_TCP_POSE }
+      }
+    }),
+
+  removeRobot: (robotId) =>
+    set((state) => {
+      const robots = state.robots.filter((robot) => robot.id !== robotId)
+      const jointAnglesByRobotId = Object.fromEntries(
+        Object.entries(state.jointAnglesByRobotId).filter(([id]) => id !== robotId)
+      ) as Record<string, JointAngles>
+      const tcpPoseByRobotId = Object.fromEntries(
+        Object.entries(state.tcpPoseByRobotId).filter(([id]) => id !== robotId)
+      ) as Record<string, TCPPose>
+      const robotRuntimeById = Object.fromEntries(
+        Object.entries(state.robotRuntimeById).filter(([id]) => id !== robotId)
+      ) as Record<string, BackendSimulatorStatus>
+      const robotExecutionById = Object.fromEntries(
+        Object.entries(state.robotExecutionById).filter(([id]) => id !== robotId)
+      ) as Record<string, RobotExecutionState>
+      const nextSelectedRobotId =
+        state.selectedRobotId === robotId ? (robots[0]?.id ?? null) : state.selectedRobotId
+
+      return {
+        robots,
+        selectedRobotId: nextSelectedRobotId,
+        robotRuntimeById,
+        robotExecutionById,
+        jointAnglesByRobotId,
+        tcpPoseByRobotId,
+        jointAngles: nextSelectedRobotId
+          ? (jointAnglesByRobotId[nextSelectedRobotId] ?? [...DEFAULT_JOINT_ANGLES])
+          : [...DEFAULT_JOINT_ANGLES],
+        tcpPose: nextSelectedRobotId
+          ? (tcpPoseByRobotId[nextSelectedRobotId] ?? { ...DEFAULT_TCP_POSE })
+          : { ...DEFAULT_TCP_POSE }
+      }
+    }),
+
+  updateRobotSceneBinding: (robotId, sceneBinding) =>
+    set((state) => ({
+      robots: state.robots.map((robot) =>
+        robot.id === robotId
+          ? {
+              ...robot,
+              sceneBinding
+            }
+          : robot
+      )
+    })),
+
+  selectRobot: (robotId) =>
+    set((state) => {
+      const nextRobotId =
+        robotId && state.robots.some((robot) => robot.id === robotId) ? robotId : null
+
+      return {
+        selectedRobotId: nextRobotId,
+        jointAngles: nextRobotId
+          ? (state.jointAnglesByRobotId[nextRobotId] ?? [...DEFAULT_JOINT_ANGLES])
+          : [...DEFAULT_JOINT_ANGLES],
+        tcpPose: nextRobotId
+          ? (state.tcpPoseByRobotId[nextRobotId] ?? { ...DEFAULT_TCP_POSE })
+          : { ...DEFAULT_TCP_POSE }
+      }
+    }),
+
+  setWorkspaceMode: (workspaceMode) =>
+    set((state) => ({
+      workspaceMode,
+      isIKMode: workspaceMode === 'factory' ? false : state.isIKMode,
+      isRobotPlacementMode: workspaceMode === 'train' ? false : state.isRobotPlacementMode,
+      robotPlacementTransformMode:
+        workspaceMode === 'train' ? 'translate' : state.robotPlacementTransformMode,
+      selectedJointName: null
+    })),
+  setRobotExecution: (robotId, execution) =>
+    set((state) => {
+      const normalizedRobotId = robotId.trim()
+
+      if (!normalizedRobotId) {
+        return state
+      }
+
+      const currentExecution = state.robotExecutionById[normalizedRobotId] ?? {
+        isPlaying: false,
+        currentStepIndex: 0
+      }
+
+      return {
+        robotExecutionById: {
+          ...state.robotExecutionById,
+          [normalizedRobotId]: {
+            ...currentExecution,
+            ...execution
+          }
+        }
+      }
+    }),
+
+  clearRobotExecution: (robotId) =>
+    set((state) => {
+      const normalizedRobotId = robotId.trim()
+
+      if (!normalizedRobotId) {
+        return state
+      }
+
+      return {
+        robotExecutionById: Object.fromEntries(
+          Object.entries(state.robotExecutionById).filter(([id]) => id !== normalizedRobotId)
+        ) as Record<string, RobotExecutionState>
+      }
+    }),
+
+  clearAllRobotExecutions: () =>
+    set({
+      robotExecutionById: {}
+    }),
+
+  setRobotRuntime: (robotId, status) =>
+    set((state) => {
+      const normalizedRobotId = robotId.trim()
+
+      if (!normalizedRobotId) {
+        return state
+      }
+
+      return {
+        robotRuntimeById: {
+          ...state.robotRuntimeById,
+          [normalizedRobotId]: {
+            ...(state.robotRuntimeById[normalizedRobotId] ?? {
+              isRunning: false,
+              isConnected: false
+            }),
+            ...status
+          }
+        }
+      }
+    }),
+
+  clearRobotRuntime: (robotId) =>
+    set((state) => {
+      const normalizedRobotId = robotId.trim()
+
+      if (!normalizedRobotId) {
+        return state
+      }
+
+      const robotRuntimeById = Object.fromEntries(
+        Object.entries(state.robotRuntimeById).filter(([id]) => id !== normalizedRobotId)
+      ) as Record<string, BackendSimulatorStatus>
+
+      return {
+        robotRuntimeById
+      }
+    }),
+
+  clearAllRobotRuntime: () =>
+    set({
+      robotRuntimeById: {}
+    }),
+
+  setJointAngles: (angles) =>
+    set((state) => ({
+      jointAngles: angles,
+      jointAnglesByRobotId: state.selectedRobotId
+        ? {
+            ...state.jointAnglesByRobotId,
+            [state.selectedRobotId]: angles
+          }
+        : state.jointAnglesByRobotId
+    })),
+  setJointAnglesForRobot: (robotId, angles) =>
+    set((state) => ({
+      jointAngles: state.selectedRobotId === robotId ? angles : state.jointAngles,
+      jointAnglesByRobotId: {
+        ...state.jointAnglesByRobotId,
+        [robotId]: angles
+      }
+    })),
+
+  setJointAnglesForRobots: (patch) =>
+    set((state) => {
+      const normalizedPatch = Object.fromEntries(
+        Object.entries(patch).filter(([robotId, angles]) => robotId.trim() && angles.length === 6)
+      ) as Record<string, JointAngles>
+
+      if (Object.keys(normalizedPatch).length === 0) {
+        return state
+      }
+
+      const selectedAngles = state.selectedRobotId
+        ? normalizedPatch[state.selectedRobotId]
+        : undefined
+
+      return {
+        jointAngles: selectedAngles ?? state.jointAngles,
+        jointAnglesByRobotId: {
+          ...state.jointAnglesByRobotId,
+          ...normalizedPatch
+        }
+      }
+    }),
+  setTCPPose: (pose) =>
+    set((state) => ({
+      tcpPose: pose,
+      tcpPoseByRobotId: state.selectedRobotId
+        ? {
+            ...state.tcpPoseByRobotId,
+            [state.selectedRobotId]: pose
+          }
+        : state.tcpPoseByRobotId
+    })),
+
+  setTCPPoseForRobot: (robotId, pose) =>
+    set((state) => ({
+      tcpPose: state.selectedRobotId === robotId ? pose : state.tcpPose,
+      tcpPoseByRobotId: {
+        ...state.tcpPoseByRobotId,
+        [robotId]: pose
+      }
+    })),
   setIKMode: (enabled) => set({ isIKMode: enabled }),
+  setRobotPlacementMode: (enabled) =>
+    set((state) => ({
+      isRobotPlacementMode: enabled,
+      robotPlacementTransformMode: enabled ? state.robotPlacementTransformMode : 'translate',
+      isIKMode: enabled ? false : state.isIKMode
+    })),
+
+  setRobotPlacementTransformMode: (mode) =>
+    set({
+      robotPlacementTransformMode: mode
+    }),
   setProjectName: (name) => set({ projectName: name }),
   setCurrentFilePath: (path) => set({ currentFilePath: path }),
   setMode: (mode) => set({ mode }),

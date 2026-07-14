@@ -1,18 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  ChevronDown,
-  ChevronUp,
+  Activity,
   CloudUpload,
   Download,
-  Eye,
   History,
   LoaderCircle,
   LogIn,
   LogOut,
   RefreshCw,
-  X
+  X,
+  Shield
 } from 'lucide-react'
 import { useRobotStore } from '../store/robotStore'
+import CenterModal from './ui/CenterModal'
 import { WorkflowStep } from '../types/robot.types'
 import {
   BackendSimulatorConfig,
@@ -25,7 +25,8 @@ import { exportLuaProgramFromBackend } from '../services/backendLuaExportClient'
 import { SafetyValidationError } from '../services/backendSafetyClient'
 import SafetyDiagnosticsPanel from './SafetyDiagnosticsPanel'
 import RobotSafetyPolicyPanel from './RobotSafetyPolicyPanel'
-
+import TelemetryHistoryPanel from './TelemetryHistoryPanel'
+import { getCachedDeviceRuntimeSessionId } from '../services/backendDeviceSession'
 const CONFIG_KEY = 'syntwin.backendSimulator.config'
 const TOKEN_KEY = 'syntwin.backendProgram.accessToken'
 const EMAIL_KEY = 'syntwin.backendProgram.email'
@@ -76,16 +77,21 @@ function getConfig(): BackendSimulatorConfig {
   }
 
   const config = JSON.parse(raw) as BackendSimulatorConfig
+  const selectedRobotId = useRobotStore.getState().selectedRobotId
+  const activeRobotId = selectedRobotId?.trim() || config.robotId?.trim()
 
   if (!config.backendUrl?.trim()) {
     throw new Error('Backend URL đang trống')
   }
 
-  if (!config.robotId?.trim()) {
+  if (!activeRobotId) {
     throw new Error('Robot ID đang trống')
   }
 
-  return config
+  return {
+    ...config,
+    robotId: activeRobotId
+  }
 }
 
 function percent(value?: number): number {
@@ -526,6 +532,8 @@ export default function BackendProgramControls(): React.ReactElement {
   const projectName = useRobotStore((state) => state.projectName)
   const programSource = useRobotStore((state) => state.programSource)
   const setSelectedStepId = useRobotStore((state) => state.setSelectedStepId)
+  const robots = useRobotStore((state) => state.robots)
+  const selectedRobotId = useRobotStore((state) => state.selectedRobotId)
 
   const [email, setEmail] = useState(() => localStorage.getItem(EMAIL_KEY) || '')
 
@@ -548,13 +556,23 @@ export default function BackendProgramControls(): React.ReactElement {
 
   const [historyLoading, setHistoryLoading] = useState(false)
   const [historyError, setHistoryError] = useState('')
-  const [historyCollapsed, setHistoryCollapsed] = useState(false)
+  const [isHistoryModalOpen, setIsHistoryModalOpen] = useState(false)
+  const [isSafetyModalOpen, setIsSafetyModalOpen] = useState(false)
+  const [isTelemetryModalOpen, setIsTelemetryModalOpen] = useState(false)
 
   // ── Detail Popover state ──────────────────────────────────────────────────
   const [selectedCommandDetailId, setSelectedCommandDetailId] = useState<string | null>(null)
   // Map of command id → button ref
   const buttonRefs = useRef<Map<string, HTMLButtonElement>>(new Map())
   const anchorRef = useRef<HTMLButtonElement | null>(null)
+
+  const activeRobot = robots.find((robot) => robot.id === selectedRobotId) ?? null
+  const activeRobotTitle = activeRobot?.name ?? 'No robot selected'
+  const activeRobotSubtitle = activeRobot
+    ? activeRobot.model
+    : selectedRobotId
+      ? selectedRobotId
+      : 'Select a robot before running backend commands'
 
   const selectedCommand = selectedCommandDetailId
     ? (commandHistory.find((c) => c.id === selectedCommandDetailId) ?? null)
@@ -603,7 +621,7 @@ export default function BackendProgramControls(): React.ReactElement {
         }
       }
     },
-    [token]
+    [token, selectedRobotId]
   )
 
   useEffect(() => {
@@ -624,6 +642,17 @@ export default function BackendProgramControls(): React.ReactElement {
       window.clearInterval(intervalId)
     }
   }, [token, busy, loadCommandHistory])
+
+  useEffect(() => {
+    setCommandHistory([])
+    setHistoryError('')
+    setLastProgramId('')
+    setSafetyDiagnostics(null)
+    setIsTelemetryModalOpen(false)
+    setSelectedCommandDetailId(null)
+    anchorRef.current = null
+  }, [selectedRobotId])
+
   const handleLogin = async (): Promise<void> => {
     setBusy(true)
     setFailed(false)
@@ -871,6 +900,7 @@ export default function BackendProgramControls(): React.ReactElement {
     setMessage('')
     setFailed(false)
     setSafetyDiagnostics(null)
+    setIsTelemetryModalOpen(false)
     setCommandHistory([])
     setHistoryError('')
     setSelectedCommandDetailId(null)
@@ -885,6 +915,14 @@ export default function BackendProgramControls(): React.ReactElement {
         <span className={token ? 'text-[10px] text-emerald-400' : 'text-[10px] text-slate-500'}>
           {token ? 'Đã đăng nhập' : 'Chưa đăng nhập'}
         </span>
+      </div>
+
+      <div className="mb-3 rounded border border-[#343849] bg-[#10131b] px-3 py-2">
+        <div className="text-[9px] font-bold uppercase tracking-wider text-slate-500">
+          Active Robot
+        </div>
+        <div className="mt-1 truncate text-xs font-semibold text-white">{activeRobotTitle}</div>
+        <div className="mt-0.5 truncate text-[10px] text-slate-400">{activeRobotSubtitle}</div>
       </div>
 
       {!token ? (
@@ -924,7 +962,7 @@ export default function BackendProgramControls(): React.ReactElement {
           <button
             onClick={() => void handleSaveAndRun()}
             disabled={busy || steps.length === 0}
-            className="flex flex-1 items-center justify-center gap-1.5 rounded bg-violet-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-40"
+            className="flex flex-1 items-center justify-center gap-1.5 rounded bg-blue-600 px-3 py-2 text-xs font-bold text-white transition hover:bg-blue-500 disabled:opacity-40"
           >
             {busy ? <LoaderCircle size={13} className="animate-spin" /> : <CloudUpload size={13} />}
             Lưu, Publish và Chạy
@@ -973,11 +1011,42 @@ export default function BackendProgramControls(): React.ReactElement {
         </div>
       )}
 
-      {/* Robot Safety Policy Panel */}
+      {/* Safety Policy & Command History Buttons */}
+      {token && (
+        <div className="mt-3 grid grid-cols-3 gap-2">
+          <button
+            type="button"
+            onClick={() => setIsSafetyModalOpen(true)}
+            className="flex flex-1 items-center justify-center gap-1.5 rounded border border-[#343849] bg-[#242833] py-2 text-[10px] font-bold uppercase tracking-wider text-slate-300 transition hover:bg-[#2d313f] hover:text-white"
+          >
+            <Shield size={12} className="text-blue-400" />
+            Safety Policy
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setIsHistoryModalOpen(true)}
+            className="flex flex-1 items-center justify-center gap-1.5 rounded border border-[#343849] bg-[#242833] py-2 text-[10px] font-bold uppercase tracking-wider text-slate-300 transition hover:bg-[#2d313f] hover:text-white"
+          >
+            <History size={12} className="text-blue-400" />
+            History ({commandHistory.length})
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setIsTelemetryModalOpen(true)}
+            className="flex items-center justify-center gap-1.5 rounded border border-[#343849] bg-[#242833] py-2 text-[10px] font-bold uppercase tracking-wider text-slate-300 transition hover:bg-[#2d313f] hover:text-white"
+          >
+            <Activity size={12} className="text-blue-400" />
+            Telemetry
+          </button>
+        </div>
+      )}
+
+      {/* Safety Policy Modal */}
       {token &&
         (() => {
           let cfg: BackendSimulatorConfig | null = null
-
           try {
             cfg = getConfig()
           } catch {
@@ -985,67 +1054,91 @@ export default function BackendProgramControls(): React.ReactElement {
           }
 
           return cfg ? (
-            <div className="mt-3">
+            <CenterModal
+              title="Robot Safety Policy"
+              subtitle={`Robot ID: ${cfg.robotId}`}
+              icon={<Shield size={16} />}
+              open={isSafetyModalOpen}
+              onClose={() => setIsSafetyModalOpen(false)}
+              size="lg"
+            >
               <RobotSafetyPolicyPanel
                 backendUrl={cfg.backendUrl}
                 robotId={cfg.robotId}
                 token={token}
+                embed={true}
               />
-            </div>
+            </CenterModal>
           ) : null
         })()}
 
+      {/* Telemetry History Modal */}
+      {token &&
+        (() => {
+          let cfg: BackendSimulatorConfig | null = null
+          try {
+            cfg = getConfig()
+          } catch {
+            /* not configured yet */
+          }
+
+          return cfg ? (
+            <CenterModal
+              title="Telemetry History"
+              subtitle={`Robot ID: ${cfg.robotId}`}
+              icon={<Activity size={16} />}
+              open={isTelemetryModalOpen}
+              onClose={() => setIsTelemetryModalOpen(false)}
+              size="xl"
+            >
+              <TelemetryHistoryPanel
+                backendUrl={cfg.backendUrl}
+                robotId={cfg.robotId}
+                token={token}
+                runtimeSessionId={getCachedDeviceRuntimeSessionId(cfg)}
+              />
+            </CenterModal>
+          ) : null
+        })()}
+
+      {/* Command History Modal */}
       {token && (
-        <div className="mt-3 overflow-hidden rounded border border-[#393942] bg-[#101014]">
-          <div
-            className="flex items-center justify-between border-b border-[#2d2d34] px-3 py-2 cursor-pointer select-none"
-            onClick={() => setHistoryCollapsed((v) => !v)}
-          >
-            <div className="flex items-center gap-1.5">
-              <History size={12} className="text-blue-400" />
-
-              <span className="text-[10px] font-bold uppercase text-slate-400">
-                Command History
-              </span>
-
-              {commandHistory.length > 0 && (
-                <span className="text-[9px] text-slate-600">({commandHistory.length})</span>
-              )}
-            </div>
-
-            <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+        <CenterModal
+          title="Command History"
+          subtitle="Các lệnh đã gửi tới Robot từ Backend"
+          icon={<History size={16} />}
+          open={isHistoryModalOpen}
+          onClose={() => {
+            setIsHistoryModalOpen(false)
+            setSelectedCommandDetailId(null)
+            anchorRef.current = null
+          }}
+          size="lg"
+        >
+          <div className="flex flex-col h-[60vh] text-slate-200">
+            <div className="flex justify-between items-center mb-3">
+              <span className="text-xs text-slate-400">Hiển thị 10 command gần nhất</span>
               <button
                 type="button"
                 disabled={historyLoading || busy}
                 onClick={() => void loadCommandHistory(true)}
-                title="Refresh command history"
-                className="rounded p-1 text-slate-400 hover:bg-[#25252b] hover:text-white disabled:opacity-40"
+                className="flex items-center gap-1 px-3 py-1 rounded border border-[#343849] bg-[#242833] text-xs text-slate-300 hover:bg-[#2d313f] hover:text-white transition disabled:opacity-40"
               >
                 <RefreshCw size={12} className={historyLoading ? 'animate-spin' : ''} />
-              </button>
-
-              <button
-                type="button"
-                title={historyCollapsed ? 'Mở Command History' : 'Thu gọn Command History'}
-                onClick={() => setHistoryCollapsed((v) => !v)}
-                className="rounded p-1 text-slate-400 hover:bg-[#25252b] hover:text-white transition"
-              >
-                {historyCollapsed ? <ChevronDown size={12} /> : <ChevronUp size={12} />}
+                Refresh
               </button>
             </div>
-          </div>
 
-          {!historyCollapsed && historyError && (
-            <p className="border-b border-red-500/30 bg-red-950/20 px-3 py-2 text-[10px] text-red-300">
-              {historyError}
-            </p>
-          )}
+            {historyError && (
+              <p className="mb-3 rounded border border-red-500/30 bg-red-950/20 px-3 py-2 text-xs text-red-300">
+                {historyError}
+              </p>
+            )}
 
-          {!historyCollapsed && (
-            <div className="max-h-44 overflow-y-auto">
+            <div className="flex-1 overflow-y-auto border border-[#343849] rounded-lg bg-[#0c0e16]">
               {commandHistory.length === 0 ? (
-                <p className="px-3 py-4 text-center text-[10px] text-slate-500">
-                  No command history.
+                <p className="p-8 text-center text-xs text-slate-500">
+                  Chưa có lịch sử lệnh nào được thực thi.
                 </p>
               ) : (
                 commandHistory.map((command) => {
@@ -1059,49 +1152,35 @@ export default function BackendProgramControls(): React.ReactElement {
                   const isDetailOpen = selectedCommandDetailId === command.id
 
                   return (
-                    <div
-                      key={command.id}
-                      className="flex items-center justify-between gap-2 border-b border-[#24242a] px-3 py-2 last:border-b-0"
-                    >
-                      <div className="min-w-0 flex-1">
-                        <p className="truncate text-[10px] font-semibold text-slate-200">
-                          {command.commandType}
-                        </p>
-
-                        <p
-                          className="truncate font-mono text-[9px] text-slate-500"
-                          title={command.id}
-                        >
-                          {command.id.slice(0, 8)}
-                        </p>
-
-                        {failureMessage && (
-                          <p
-                            className="mt-1 max-w-40 truncate text-[9px] text-red-300"
-                            title={failureMessage}
-                          >
-                            {failureMessage}
+                    <div key={command.id} className="border-b border-[#242833] p-4 last:border-b-0">
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-bold text-white">
+                              {command.commandType}
+                            </span>
+                            <span
+                              className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${commandStatusClass(command.status)}`}
+                            >
+                              {command.status}
+                            </span>
+                          </div>
+                          <p className="mt-1 font-mono text-[10px] text-slate-500">
+                            ID: {command.id}
                           </p>
-                        )}
-                      </div>
-
-                      <div className="flex shrink-0 items-center gap-1.5 text-right">
-                        <div>
-                          <span
-                            className={`inline-block rounded px-1.5 py-0.5 text-[9px] font-bold ${commandStatusClass(command.status)}`}
-                          >
-                            {command.status}
-                          </span>
-
-                          <p className="mt-1 text-[9px] text-slate-500">
-                            {formatCommandTime(command.createdAt)}
+                          <p className="mt-1 text-[10px] text-slate-400">
+                            Thời gian tạo: {new Date(command.createdAt).toLocaleString()}
                           </p>
+                          {failureMessage && (
+                            <div className="mt-2 rounded border border-red-500/35 bg-red-950/40 p-2 text-[10px] text-red-300">
+                              <span className="font-semibold block mb-0.5">Failure Detail:</span>
+                              {failureMessage}
+                            </div>
+                          )}
                         </div>
 
-                        {/* Detail button */}
                         <button
                           type="button"
-                          title="Xem chi tiết command"
                           ref={(el) => {
                             if (el) {
                               buttonRefs.current.set(command.id, el)
@@ -1114,13 +1193,13 @@ export default function BackendProgramControls(): React.ReactElement {
                             const btn = buttonRefs.current.get(command.id)
                             if (btn) handleToggleDetail(command.id, btn)
                           }}
-                          className={`rounded p-1 transition ${
+                          className={`rounded px-2 py-1 text-xs font-semibold transition ${
                             isDetailOpen
-                              ? 'bg-blue-600/30 text-blue-300'
-                              : 'text-slate-500 hover:bg-[#25252b] hover:text-slate-200'
+                              ? 'bg-blue-600 text-white'
+                              : 'border border-[#343849] bg-[#242833] text-slate-300 hover:text-white'
                           }`}
                         >
-                          <Eye size={11} />
+                          {isDetailOpen ? 'Ẩn chi tiết' : 'Chi tiết'}
                         </button>
                       </div>
                     </div>
@@ -1128,8 +1207,8 @@ export default function BackendProgramControls(): React.ReactElement {
                 })
               )}
             </div>
-          )}
-        </div>
+          </div>
+        </CenterModal>
       )}
 
       {/* Floating detail popover – rendered at fixed position */}

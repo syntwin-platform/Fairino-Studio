@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
   AlertOctagon,
   AlertTriangle,
@@ -418,12 +418,14 @@ interface RobotSafetyPolicyPanelProps {
   backendUrl: string
   robotId: string
   token: string
+  embed?: boolean
 }
 
 export default function RobotSafetyPolicyPanel({
   backendUrl,
   robotId,
-  token
+  token,
+  embed = false
 }: RobotSafetyPolicyPanelProps): React.ReactElement {
   const [expanded, setExpanded] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -456,6 +458,18 @@ export default function RobotSafetyPolicyPanel({
       setLoading(false)
     }
   }, [backendUrl, robotId, token])
+
+  useEffect(() => {
+    if (embed && !data && !loading) {
+      const timer = window.setTimeout(() => {
+        void load()
+      }, 0)
+
+      return () => window.clearTimeout(timer)
+    }
+
+    return undefined
+  }, [embed, data, loading, load])
 
   const handleToggle = (): void => {
     const nextExpanded = !expanded
@@ -521,40 +535,48 @@ export default function RobotSafetyPolicyPanel({
   const busy = saving || deleting || loading
 
   return (
-    <div className="rounded border border-[#2d2d34] overflow-hidden">
+    <div className={embed ? '' : 'rounded border border-[#2d2d34] overflow-hidden'}>
       {/* Header toggle */}
-      <button
-        type="button"
-        onClick={handleToggle}
-        className="flex w-full items-center justify-between px-3 py-2 bg-[#141417] hover:bg-[#1b1b1f] transition select-none"
-      >
-        <div className="flex items-center gap-1.5">
-          <Shield size={12} className="text-blue-400" />
-          <span className="text-[10px] font-bold uppercase text-slate-400">Safety Policy</span>
-          {data && (
-            <span
-              className={`inline-block rounded px-1.5 py-0.5 text-[8px] font-bold ${
-                data.source === 'Robot'
-                  ? 'bg-blue-950/60 text-blue-400'
-                  : 'bg-slate-800 text-slate-500'
-              }`}
-            >
-              {data.source === 'Robot' ? 'Robot' : 'Base'}
-            </span>
-          )}
-        </div>
-        <div className="flex items-center gap-1.5">
-          {loading && <LoaderCircle size={10} className="animate-spin text-slate-500" />}
-          {expanded ? (
-            <ChevronUp size={12} className="text-slate-500" />
-          ) : (
-            <ChevronDown size={12} className="text-slate-500" />
-          )}
-        </div>
-      </button>
+      {!embed && (
+        <button
+          type="button"
+          onClick={handleToggle}
+          className="flex w-full items-center justify-between px-3 py-2 bg-[#141417] hover:bg-[#1b1b1f] transition select-none"
+        >
+          <div className="flex items-center gap-1.5">
+            <Shield size={12} className="text-blue-400" />
+            <span className="text-[10px] font-bold uppercase text-slate-400">Safety Policy</span>
+            {data && (
+              <span
+                className={`inline-block rounded px-1.5 py-0.5 text-[8px] font-bold ${
+                  data.source === 'Robot'
+                    ? 'bg-blue-950/60 text-blue-400'
+                    : 'bg-slate-800 text-slate-500'
+                }`}
+              >
+                {data.source === 'Robot' ? 'Robot' : 'Base'}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-1.5">
+            {loading && <LoaderCircle size={10} className="animate-spin text-slate-500" />}
+            {expanded ? (
+              <ChevronUp size={12} className="text-slate-500" />
+            ) : (
+              <ChevronDown size={12} className="text-slate-500" />
+            )}
+          </div>
+        </button>
+      )}
 
-      {expanded && (
-        <div className="max-h-[calc(100vh-12rem)] space-y-3 overflow-y-auto overscroll-contain bg-[#18181c] p-3">
+      {(expanded || embed) && (
+        <div
+          className={
+            embed
+              ? 'space-y-3'
+              : 'max-h-[calc(100vh-12rem)] space-y-3 overflow-y-auto overscroll-contain bg-[#18181c] p-3'
+          }
+        >
           {loading && !data && (
             <div className="flex items-center gap-2 py-2 text-[10px] text-slate-400">
               <LoaderCircle size={12} className="animate-spin" />
@@ -671,7 +693,6 @@ export default function RobotSafetyPolicyPanel({
                   )}
                 </div>
               )}
-
             </>
           )}
         </div>

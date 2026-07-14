@@ -1,30 +1,14 @@
-import { useEffect, useState } from 'react'
-import { ChevronDown, ChevronUp, Link, Link2Off, Server } from 'lucide-react'
-import {
-  BackendSimulatorConfig,
-  BackendSimulatorStatus,
-  defaultBackendSimulatorConfig,
-  defaultRobotRuntimeConfig
-} from '../types/backendDevice'
-import { backendDeviceSimulator } from '../services/backendDeviceSimulator'
+import React from 'react'
+import { Link, Link2Off } from 'lucide-react'
+import { BackendSimulatorConfig, BackendSimulatorStatus } from '../types/backendDevice'
 import { useRobotStore } from '../store/robotStore'
-import { getRobotRuntimeConfig as fetchRobotRuntimeConfig } from '../services/backendRuntimeConfigClient'
-import { setRobotRuntimeConfig } from '../services/robotMotionRuntime'
 
-const STORAGE_KEY = 'syntwin.backendSimulator.config'
-const TOKEN_KEY = 'syntwin.backendProgram.accessToken'
-function loadConfig(): BackendSimulatorConfig {
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY)
-    if (!raw) return defaultBackendSimulatorConfig
-
-    return {
-      ...defaultBackendSimulatorConfig,
-      ...JSON.parse(raw)
-    }
-  } catch {
-    return defaultBackendSimulatorConfig
-  }
+export interface BackendSimulatorPanelProps {
+  config: BackendSimulatorConfig
+  status: BackendSimulatorStatus
+  onConfigChange: (config: BackendSimulatorConfig) => void
+  onConnect: () => Promise<void>
+  onDisconnect: () => void
 }
 
 function formatTime(value?: string): string {
@@ -32,204 +16,59 @@ function formatTime(value?: string): string {
   return new Date(value).toLocaleTimeString()
 }
 
-async function loadRuntimeConfigForSimulator(
-  config: BackendSimulatorConfig
-): Promise<string | null> {
-  const token = window.sessionStorage.getItem(TOKEN_KEY)
-
-  if (!token) {
-    setRobotRuntimeConfig({
-      ...defaultRobotRuntimeConfig,
-      robotId: config.robotId
-    })
-
-    return null
-  }
-
-  try {
-    const runtimeConfig = await fetchRobotRuntimeConfig(config.backendUrl, config.robotId, token)
-
-    setRobotRuntimeConfig(runtimeConfig)
-    return null
-  } catch (error) {
-    setRobotRuntimeConfig({
-      ...defaultRobotRuntimeConfig,
-      robotId: config.robotId
-    })
-
-    return error instanceof Error ? error.message : 'Failed to load runtime config.'
-  }
-}
-
-function statusLabel(status: BackendSimulatorStatus): string {
-  if (status.isConnected) return 'Online'
-  if (status.isRunning) return 'Connecting'
-  return 'Offline'
-}
-
-export default function BackendSimulatorPanel(): React.ReactElement {
-  const [config, setConfig] = useState<BackendSimulatorConfig>(() => loadConfig())
-  const [status, setStatus] = useState<BackendSimulatorStatus>({
-    isRunning: false,
-    isConnected: false
-  })
-  const [isOpen, setIsOpen] = useState(false)
-
+export default function BackendSimulatorPanel({
+  config,
+  status,
+  onConfigChange,
+  onConnect,
+  onDisconnect
+}: BackendSimulatorPanelProps): React.ReactElement {
   const cabinetDigitalOutputs = useRobotStore((state) => state.cabinetDigitalOutputs)
-
   const toolDigitalOutputs = useRobotStore((state) => state.toolDigitalOutputs)
-
   const gripperState = useRobotStore((state) => state.gripperState)
-
-  useEffect(() => {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(config))
-  }, [config])
-
-  useEffect(() => {
-    return () => {
-      backendDeviceSimulator.stop()
-    }
-  }, [])
 
   const updateConfig = <K extends keyof BackendSimulatorConfig>(
     key: K,
     value: BackendSimulatorConfig[K]
   ): void => {
-    setConfig((current) => ({
-      ...current,
+    onConfigChange({
+      ...config,
       [key]: value
-    }))
-  }
-
-  const handleConnect = async (): Promise<void> => {
-    try {
-      const runtimeConfigWarning = await loadRuntimeConfigForSimulator(config)
-
-      if (runtimeConfigWarning) {
-        console.warn(`Runtime config fallback: ${runtimeConfigWarning}`)
-      }
-      backendDeviceSimulator.start(
-        {
-          ...config,
-          enabled: true
-        },
-        {
-          onStatusChange: (partial) => {
-            setStatus((current) => ({
-              ...current,
-              ...partial
-            }))
-          }
-        }
-      )
-
-      setConfig((current) => ({
-        ...current,
-        enabled: true
-      }))
-    } catch (error) {
-      setStatus((current) => ({
-        ...current,
-        isRunning: false,
-        isConnected: false,
-        lastError: error instanceof Error ? error.message : 'Connect failed'
-      }))
-    }
-  }
-
-  const handleDisconnect = (): void => {
-    backendDeviceSimulator.stop()
-
-    setConfig((current) => ({
-      ...current,
-      enabled: false
-    }))
-
-    setStatus((current) => ({
-      ...current,
-      isRunning: false,
-      isConnected: false
-    }))
-  }
-
-  if (!isOpen) {
-    return (
-      <button
-        onClick={() => setIsOpen(true)}
-        className="absolute bottom-4 left-4 z-20 flex h-10 items-center gap-2 rounded border border-[#2d2d34] bg-[#141417]/95 px-3 text-xs font-semibold text-slate-200 shadow-lg backdrop-blur transition hover:border-blue-500 hover:text-white"
-        title="Open Backend Simulator"
-      >
-        <span
-          className={`h-2.5 w-2.5 rounded-full ${
-            status.isConnected
-              ? 'bg-emerald-400'
-              : status.isRunning
-                ? 'bg-amber-400'
-                : 'bg-slate-500'
-          }`}
-        />
-        <Server size={14} className="text-blue-400" />
-        <span>Backend</span>
-        <span className="rounded bg-[#0f0f12] px-1.5 py-0.5 text-[10px] text-slate-400">
-          {statusLabel(status)}
-        </span>
-        <ChevronUp size={14} className="text-slate-500" />
-      </button>
-    )
+    })
   }
 
   return (
-    <div className="absolute bottom-4 left-4 z-20 flex max-h-[calc(100%_-_2rem)] w-72 flex-col overflow-hidden rounded border border-[#2d2d34] bg-[#141417]/95 text-slate-200 shadow-xl backdrop-blur">
-      <button
-        onClick={() => setIsOpen(false)}
-        className="flex w-full shrink-0 items-center justify-between border-b border-[#2d2d34] px-3 py-2 text-left transition hover:bg-[#1e1e24]"
-        title="Collapse Backend Simulator"
-      >
-        <div className="flex items-center gap-2">
-          <span
-            className={`h-2.5 w-2.5 rounded-full ${
-              status.isConnected
-                ? 'bg-emerald-400'
-                : status.isRunning
-                  ? 'bg-amber-400'
-                  : 'bg-slate-500'
-            }`}
-          />
-          <Server size={14} className="text-blue-400" />
-          <div>
-            <h3 className="text-xs font-bold text-white">Backend Simulator</h3>
-            <p className="text-[10px] text-slate-500">{statusLabel(status)}</p>
-          </div>
-        </div>
-        <ChevronDown size={15} className="text-slate-500" />
-      </button>
-
-      <div className="min-h-0 flex-1 overflow-y-auto p-3">
-        <div className="space-y-2">
+    <div className="flex w-full flex-col text-slate-200 bg-[#1b1b1f] p-4 select-none">
+      <div className="min-h-0 flex-1">
+        <div className="space-y-4">
           <label className="block">
-            <span className="text-[10px] font-semibold uppercase text-slate-400">Backend URL</span>
+            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+              Backend URL
+            </span>
             <input
               value={config.backendUrl}
               onChange={(event) => updateConfig('backendUrl', event.target.value)}
               disabled={status.isRunning}
-              className="mt-1 w-full rounded border border-[#2d2d34] bg-[#0f0f12] px-2 py-1.5 text-xs text-white outline-none focus:border-blue-500 disabled:opacity-60"
+              className="mt-1 w-full rounded-md border border-[#2d2d34] bg-[#0c0e16] px-3 py-2 text-xs text-white outline-none focus:border-blue-500 disabled:opacity-60 transition"
               placeholder="http://localhost:5200"
             />
           </label>
 
           <label className="block">
-            <span className="text-[10px] font-semibold uppercase text-slate-400">Robot ID</span>
+            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+              Robot ID
+            </span>
             <input
               value={config.robotId}
               onChange={(event) => updateConfig('robotId', event.target.value)}
               disabled={status.isRunning}
-              className="mt-1 w-full rounded border border-[#2d2d34] bg-[#0f0f12] px-2 py-1.5 text-xs text-white outline-none focus:border-blue-500 disabled:opacity-60"
+              className="mt-1 w-full rounded-md border border-[#2d2d34] bg-[#0c0e16] px-3 py-2 text-xs text-white outline-none focus:border-blue-500 disabled:opacity-60 transition"
               placeholder="11111111-1111-1111-1111-111111111111"
             />
           </label>
 
           <label className="block">
-            <span className="text-[10px] font-semibold uppercase text-slate-400">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
               Device Secret
             </span>
             <input
@@ -237,14 +76,16 @@ export default function BackendSimulatorPanel(): React.ReactElement {
               onChange={(event) => updateConfig('deviceSecret', event.target.value)}
               disabled={status.isRunning}
               type="password"
-              className="mt-1 w-full rounded border border-[#2d2d34] bg-[#0f0f12] px-2 py-1.5 text-xs text-white outline-none focus:border-blue-500 disabled:opacity-60"
+              className="mt-1 w-full rounded-md border border-[#2d2d34] bg-[#0c0e16] px-3 py-2 text-xs text-white outline-none focus:border-blue-500 disabled:opacity-60 transition"
               placeholder="raw secret from Backend"
             />
           </label>
 
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-2 gap-2">
             <label className="block">
-              <span className="text-[10px] font-semibold uppercase text-slate-400">Heartbeat</span>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                Heartbeat (ms)
+              </span>
               <input
                 value={config.heartbeatIntervalMs}
                 onChange={(event) =>
@@ -254,12 +95,14 @@ export default function BackendSimulatorPanel(): React.ReactElement {
                 type="number"
                 min={1000}
                 step={500}
-                className="mt-1 w-full rounded border border-[#2d2d34] bg-[#0f0f12] px-2 py-1.5 text-xs text-white outline-none focus:border-blue-500 disabled:opacity-60"
+                className="mt-1 w-full rounded-md border border-[#2d2d34] bg-[#0c0e16] px-3 py-2 text-xs text-white outline-none focus:border-blue-500 disabled:opacity-60 transition"
               />
             </label>
 
             <label className="block">
-              <span className="text-[10px] font-semibold uppercase text-slate-400">Telemetry</span>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                Telemetry (ms)
+              </span>
               <input
                 value={config.telemetryIntervalMs}
                 onChange={(event) =>
@@ -269,90 +112,85 @@ export default function BackendSimulatorPanel(): React.ReactElement {
                 type="number"
                 min={100}
                 step={50}
-                className="mt-1 w-full rounded border border-[#2d2d34] bg-[#0f0f12] px-2 py-1.5 text-xs text-white outline-none focus:border-blue-500 disabled:opacity-60"
-              />
-            </label>
-
-            <label className="block">
-              <span
-                className="text-[10px] font-semibold uppercase text-slate-500"
-                title="Long-polling (waitSeconds=25) is now used. This input is kept for legacy compatibility only."
-              >
-                Legacy Poll
-              </span>
-              <input
-                value={config.commandPollIntervalMs}
-                onChange={(event) =>
-                  updateConfig('commandPollIntervalMs', Number(event.target.value))
-                }
-                disabled={true}
-                type="number"
-                className="mt-1 w-full rounded border border-[#2d2d34] bg-[#0f0f12] px-2 py-1.5 text-xs text-slate-500 outline-none opacity-40 cursor-not-allowed"
-                title="Long-polling (waitSeconds=25) is now used. This input is kept for legacy compatibility only."
+                className="mt-1 w-full rounded-md border border-[#2d2d34] bg-[#0c0e16] px-3 py-2 text-xs text-white outline-none focus:border-blue-500 disabled:opacity-60 transition"
               />
             </label>
           </div>
         </div>
 
-        <div className="mt-3 grid grid-cols-2 gap-2">
+        <div className="mt-5 grid grid-cols-2 gap-2">
           <button
-            onClick={() => void handleConnect()}
+            onClick={() => void onConnect()}
             disabled={status.isRunning}
-            className="flex items-center justify-center gap-1.5 rounded bg-blue-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+            className="flex items-center justify-center gap-1.5 rounded-md bg-blue-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50 shadow-md"
           >
-            <Link size={14} />
+            <Link size={13} />
             Connect
           </button>
 
           <button
-            onClick={handleDisconnect}
+            onClick={onDisconnect}
             disabled={!status.isRunning}
-            className="flex items-center justify-center gap-1.5 rounded border border-[#393942] bg-[#1e1e24] px-3 py-2 text-xs font-semibold text-slate-200 transition hover:border-red-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+            className="flex items-center justify-center gap-1.5 rounded-md border border-[#343849] bg-[#242833] px-3 py-2 text-xs font-semibold text-slate-200 transition hover:border-red-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
           >
-            <Link2Off size={14} />
+            <Link2Off size={13} />
             Disconnect
           </button>
         </div>
 
-        <div className="mt-3 space-y-1 border-t border-[#2d2d34] pt-3 text-[11px]">
+        <div className="mt-5 space-y-2 border-t border-[#2d2d34] pt-4 text-[11px] leading-relaxed">
           <div className="flex justify-between">
             <span className="text-slate-400">Running</span>
-            <span>{status.isRunning ? 'Yes' : 'No'}</span>
+            <span
+              className={
+                status.isRunning ? 'text-blue-400 font-bold' : 'text-slate-500 font-medium'
+              }
+            >
+              {status.isRunning ? 'Yes' : 'No'}
+            </span>
           </div>
 
           <div className="flex justify-between">
             <span className="text-slate-400">Connected</span>
-            <span>{status.isConnected ? 'Yes' : 'No'}</span>
+            <span
+              className={
+                status.isConnected ? 'text-emerald-400 font-bold' : 'text-slate-500 font-medium'
+              }
+            >
+              {status.isConnected ? 'Yes' : 'No'}
+            </span>
           </div>
 
           <div className="flex justify-between">
             <span className="text-slate-400">Last heartbeat</span>
-            <span>{formatTime(status.lastHeartbeatAt)}</span>
+            <span className="font-mono">{formatTime(status.lastHeartbeatAt)}</span>
           </div>
 
           <div className="flex justify-between">
             <span className="text-slate-400">Last telemetry</span>
-            <span>{formatTime(status.lastTelemetryAt)}</span>
+            <span className="font-mono">{formatTime(status.lastTelemetryAt)}</span>
           </div>
 
           <div className="flex justify-between">
             <span className="text-slate-400">Last command</span>
-            <span>{formatTime(status.lastCommandAt)}</span>
+            <span className="font-mono">{formatTime(status.lastCommandAt)}</span>
           </div>
 
           <div className="flex justify-between">
             <span className="text-slate-400">Last result</span>
-            <span>{formatTime(status.lastResultAt)}</span>
+            <span className="font-mono">{formatTime(status.lastResultAt)}</span>
           </div>
 
           <div className="flex justify-between">
             <span className="text-slate-400">Gripper</span>
-            <span>{gripperState === 'open' ? 'Open' : 'Closed'}</span>
+            <span className="font-medium text-slate-200">
+              {gripperState === 'open' ? 'Open' : 'Closed'}
+            </span>
           </div>
 
           <div className="flex justify-between gap-2">
-            <span className="text-slate-400">Cabinet DO</span>
-            <span className="text-right">
+            <span className="text-slate-400 shrink-0">Cabinet DO</span>
+            <span className="text-right font-mono text-slate-300">
               {Object.entries(cabinetDigitalOutputs)
                 .map(([index, value]) => `${index}:${value}`)
                 .join(', ') || '-'}
@@ -360,8 +198,8 @@ export default function BackendSimulatorPanel(): React.ReactElement {
           </div>
 
           <div className="flex justify-between gap-2">
-            <span className="text-slate-400">Tool DO</span>
-            <span className="text-right">
+            <span className="text-slate-400 shrink-0">Tool DO</span>
+            <span className="text-right font-mono text-slate-300">
               {Object.entries(toolDigitalOutputs)
                 .map(([index, value]) => `${index}:${value}`)
                 .join(', ') || '-'}
@@ -369,7 +207,7 @@ export default function BackendSimulatorPanel(): React.ReactElement {
           </div>
 
           {status.lastError && (
-            <div className="mt-2 rounded border border-red-500/40 bg-red-950/30 px-2 py-1.5 text-red-200">
+            <div className="mt-3 rounded-md border border-red-500/30 bg-red-950/20 px-3 py-2 text-red-300 leading-snug">
               {status.lastError}
             </div>
           )}
