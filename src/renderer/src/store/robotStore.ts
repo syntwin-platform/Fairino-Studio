@@ -12,6 +12,93 @@ import {
 import type { BackendSimulatorStatus } from '../types/backendDevice'
 export type WorkspaceMode = 'factory' | 'train'
 export type RobotPlacementTransformMode = 'translate' | 'rotate'
+
+const TRAINING_VIEW_STATE_STORAGE_KEY = 'fai.trainingViewState.v1'
+
+interface PersistedTrainingViewState {
+  workspaceMode: WorkspaceMode
+  jointAngles: JointAngles
+  selectedRobotId: string | null
+}
+
+function isPersistedJointAngles(value: unknown): value is JointAngles {
+  return (
+    Array.isArray(value) &&
+    value.length === 6 &&
+    value.every(
+      (angle) => typeof angle === 'number' && Number.isFinite(angle) && Math.abs(angle) <= 360
+    )
+  )
+}
+
+function loadPersistedTrainingViewState(): PersistedTrainingViewState {
+  const fallback: PersistedTrainingViewState = {
+    workspaceMode: 'factory',
+    jointAngles: [...DEFAULT_JOINT_ANGLES],
+    selectedRobotId: null
+  }
+
+  if (typeof window === 'undefined') return fallback
+
+  try {
+    const raw = window.localStorage.getItem(TRAINING_VIEW_STATE_STORAGE_KEY)
+    if (!raw) return fallback
+
+    const value = JSON.parse(raw) as Partial<PersistedTrainingViewState>
+    return {
+      workspaceMode: value.workspaceMode === 'train' ? 'train' : 'factory',
+      jointAngles: isPersistedJointAngles(value.jointAngles)
+        ? [...value.jointAngles]
+        : fallback.jointAngles,
+      selectedRobotId:
+        typeof value.selectedRobotId === 'string' && value.selectedRobotId.trim()
+          ? value.selectedRobotId.trim()
+          : null
+    }
+  } catch {
+    return fallback
+  }
+}
+
+let persistedTrainingViewState = loadPersistedTrainingViewState()
+let persistTrainingViewStateTimer: ReturnType<typeof setTimeout> | null = null
+
+function flushPersistedTrainingViewState(): void {
+  if (typeof window === 'undefined') return
+
+  if (persistTrainingViewStateTimer !== null) {
+    clearTimeout(persistTrainingViewStateTimer)
+    persistTrainingViewStateTimer = null
+  }
+
+  try {
+    window.localStorage.setItem(
+      TRAINING_VIEW_STATE_STORAGE_KEY,
+      JSON.stringify(persistedTrainingViewState)
+    )
+  } catch {
+    // Storage can be unavailable in privacy-restricted renderer sessions.
+  }
+}
+
+function persistTrainingViewState(patch: Partial<PersistedTrainingViewState>): void {
+  persistedTrainingViewState = {
+    ...persistedTrainingViewState,
+    ...patch,
+    jointAngles: patch.jointAngles
+      ? [...patch.jointAngles]
+      : persistedTrainingViewState.jointAngles
+  }
+
+  if (typeof window === 'undefined') return
+  if (persistTrainingViewStateTimer !== null) clearTimeout(persistTrainingViewStateTimer)
+  persistTrainingViewStateTimer = setTimeout(flushPersistedTrainingViewState, 120)
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', flushPersistedTrainingViewState)
+}
+
 export interface RobotExecutionState {
   isPlaying: boolean
   currentStepIndex: number
@@ -124,11 +211,11 @@ interface RobotState {
 export const useRobotStore = create<RobotState>((set) => ({
   robots: [],
   selectedRobotId: null,
-  workspaceMode: 'factory',
+  workspaceMode: persistedTrainingViewState.workspaceMode,
   robotRuntimeById: {},
   robotExecutionById: {},
   robotModel: 'FR5',
-  jointAngles: [...DEFAULT_JOINT_ANGLES],
+  jointAngles: [...persistedTrainingViewState.jointAngles],
   jointAnglesByRobotId: {},
   tcpPoseByRobotId: {},
   tcpPose: { ...DEFAULT_TCP_POSE },
@@ -160,12 +247,19 @@ export const useRobotStore = create<RobotState>((set) => ({
       const nextSelectedRobotId =
         state.selectedRobotId && robots.some((robot) => robot.id === state.selectedRobotId)
           ? state.selectedRobotId
-          : (robots[0]?.id ?? null)
+          : persistedTrainingViewState.selectedRobotId &&
+              robots.some((robot) => robot.id === persistedTrainingViewState.selectedRobotId)
+            ? persistedTrainingViewState.selectedRobotId
+            : (robots[0]?.id ?? null)
 
       const jointAnglesByRobotId = robots.reduce<Record<string, JointAngles>>((acc, robot) => {
         acc[robot.id] =
           state.jointAnglesByRobotId[robot.id] ??
-          (robot.id === state.selectedRobotId ? state.jointAngles : [...DEFAULT_JOINT_ANGLES])
+          (robot.id === state.selectedRobotId
+            ? state.jointAngles
+            : robot.id === persistedTrainingViewState.selectedRobotId
+              ? [...persistedTrainingViewState.jointAngles]
+              : [...DEFAULT_JOINT_ANGLES])
         return acc
       }, {})
 
@@ -183,7 +277,7 @@ export const useRobotStore = create<RobotState>((set) => ({
         tcpPoseByRobotId,
         jointAngles: nextSelectedRobotId
           ? jointAnglesByRobotId[nextSelectedRobotId]
-          : [...DEFAULT_JOINT_ANGLES],
+          : [...persistedTrainingViewState.jointAngles],
         tcpPose: nextSelectedRobotId
           ? (tcpPoseByRobotId[nextSelectedRobotId] ?? { ...DEFAULT_TCP_POSE })
           : { ...DEFAULT_TCP_POSE }
@@ -253,7 +347,7 @@ export const useRobotStore = create<RobotState>((set) => ({
         tcpPoseByRobotId,
         jointAngles: nextSelectedRobotId
           ? (jointAnglesByRobotId[nextSelectedRobotId] ?? [...DEFAULT_JOINT_ANGLES])
-          : [...DEFAULT_JOINT_ANGLES],
+          : [...persistedTrainingViewState.jointAngles],
         tcpPose: nextSelectedRobotId
           ? (tcpPoseByRobotId[nextSelectedRobotId] ?? { ...DEFAULT_TCP_POSE })
           : { ...DEFAULT_TCP_POSE }
@@ -276,19 +370,28 @@ export const useRobotStore = create<RobotState>((set) => ({
     set((state) => {
       const nextRobotId =
         robotId && state.robots.some((robot) => robot.id === robotId) ? robotId : null
+      const nextJointAngles = nextRobotId
+        ? (state.jointAnglesByRobotId[nextRobotId] ?? [...DEFAULT_JOINT_ANGLES])
+        : state.jointAngles
+
+      if (nextRobotId) {
+        persistTrainingViewState({
+          selectedRobotId: nextRobotId,
+          jointAngles: nextJointAngles
+        })
+      }
 
       return {
         selectedRobotId: nextRobotId,
-        jointAngles: nextRobotId
-          ? (state.jointAnglesByRobotId[nextRobotId] ?? [...DEFAULT_JOINT_ANGLES])
-          : [...DEFAULT_JOINT_ANGLES],
+        jointAngles: nextJointAngles,
         tcpPose: nextRobotId
           ? (state.tcpPoseByRobotId[nextRobotId] ?? { ...DEFAULT_TCP_POSE })
           : { ...DEFAULT_TCP_POSE }
       }
     }),
 
-  setWorkspaceMode: (workspaceMode) =>
+  setWorkspaceMode: (workspaceMode) => {
+    persistTrainingViewState({ workspaceMode })
     set((state) => ({
       workspaceMode,
       isIKMode: workspaceMode === 'factory' ? false : state.isIKMode,
@@ -296,7 +399,8 @@ export const useRobotStore = create<RobotState>((set) => ({
       robotPlacementTransformMode:
         workspaceMode === 'train' ? 'translate' : state.robotPlacementTransformMode,
       selectedJointName: null
-    })),
+    }))
+  },
   setRobotExecution: (robotId, execution) =>
     set((state) => {
       const normalizedRobotId = robotId.trim()
@@ -385,7 +489,8 @@ export const useRobotStore = create<RobotState>((set) => ({
       robotRuntimeById: {}
     }),
 
-  setJointAngles: (angles) =>
+  setJointAngles: (angles) => {
+    persistTrainingViewState({ jointAngles: angles })
     set((state) => ({
       jointAngles: angles,
       jointAnglesByRobotId: state.selectedRobotId
@@ -394,15 +499,22 @@ export const useRobotStore = create<RobotState>((set) => ({
             [state.selectedRobotId]: angles
           }
         : state.jointAnglesByRobotId
-    })),
+    }))
+  },
   setJointAnglesForRobot: (robotId, angles) =>
-    set((state) => ({
-      jointAngles: state.selectedRobotId === robotId ? angles : state.jointAngles,
-      jointAnglesByRobotId: {
-        ...state.jointAnglesByRobotId,
-        [robotId]: angles
+    set((state) => {
+      if (state.selectedRobotId === robotId) {
+        persistTrainingViewState({ jointAngles: angles })
       }
-    })),
+
+      return {
+        jointAngles: state.selectedRobotId === robotId ? angles : state.jointAngles,
+        jointAnglesByRobotId: {
+          ...state.jointAnglesByRobotId,
+          [robotId]: angles
+        }
+      }
+    }),
 
   setJointAnglesForRobots: (patch) =>
     set((state) => {
@@ -417,6 +529,8 @@ export const useRobotStore = create<RobotState>((set) => ({
       const selectedAngles = state.selectedRobotId
         ? normalizedPatch[state.selectedRobotId]
         : undefined
+
+      if (selectedAngles) persistTrainingViewState({ jointAngles: selectedAngles })
 
       return {
         jointAngles: selectedAngles ?? state.jointAngles,

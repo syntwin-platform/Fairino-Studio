@@ -4,10 +4,10 @@ import type { SceneObject, Transform3D } from '../types/scene.types'
 
 interface SceneState {
   objects: SceneObject[]
+  objectTransformRevisionById: Record<string, number>
   selectedObjectId: string | null
   robotFaultsById: Record<string, RobotFaultState>
   robotContactsById: Record<string, RobotSafetyContactState>
-  collisionWarning: boolean
   isDebugHitbox: boolean
 
   // Actions
@@ -19,7 +19,6 @@ interface SceneState {
   setRobotFault: (robotId: string, fault: RobotFaultState | null) => void
   setRobotContact: (robotId: string, contact: RobotSafetyContactState | null) => void
   clearRobotSafetyState: (robotId: string) => void
-  setCollisionWarning: (warning: boolean) => void
   setDebugHitbox: (debug: boolean) => void
   clearScene: () => void
 }
@@ -38,10 +37,10 @@ const DEFAULT_TRANSFORM: Transform3D = {
 
 export const useSceneStore = create<SceneState>((set) => ({
   objects: [],
+  objectTransformRevisionById: {},
   selectedObjectId: null,
   robotFaultsById: {},
   robotContactsById: {},
-  collisionWarning: false,
   isDebugHitbox: false,
 
   addObject: (obj) =>
@@ -54,27 +53,57 @@ export const useSceneStore = create<SceneState>((set) => ({
       }
       return {
         objects: [...state.objects, newObj],
+        objectTransformRevisionById: {
+          ...state.objectTransformRevisionById,
+          [newObj.id]: 1
+        },
         selectedObjectId: newObj.id
       }
     }),
 
   removeObject: (id) =>
-    set((state) => ({
-      objects: state.objects.filter((o) => o.id !== id),
-      selectedObjectId: state.selectedObjectId === id ? null : state.selectedObjectId
-    })),
+    set((state) => {
+      if (!state.objects.some((object) => object.id === id)) return state
+      const objectTransformRevisionById = { ...state.objectTransformRevisionById }
+      delete objectTransformRevisionById[id]
+      return {
+        objects: state.objects.filter((object) => object.id !== id),
+        objectTransformRevisionById,
+        selectedObjectId: state.selectedObjectId === id ? null : state.selectedObjectId
+      }
+    }),
 
   updateObjectTransform: (id, transform) =>
-    set((state) => ({
-      objects: state.objects.map((o) =>
-        o.id === id ? { ...o, transform: { ...o.transform, ...transform } } : o
-      )
-    })),
+    set((state) => {
+      const current = state.objects.find((object) => object.id === id)
+      if (!current || isTransformPatchEqual(current.transform, transform)) return state
+      return {
+        objects: state.objects.map((object) =>
+          object.id === id
+            ? { ...object, transform: { ...object.transform, ...transform } }
+            : object
+        ),
+        objectTransformRevisionById: {
+          ...state.objectTransformRevisionById,
+          [id]: (state.objectTransformRevisionById[id] ?? 0) + 1
+        }
+      }
+    }),
 
   updateObjectVisibility: (id, visible) =>
-    set((state) => ({
-      objects: state.objects.map((o) => (o.id === id ? { ...o, visible } : o))
-    })),
+    set((state) => {
+      const current = state.objects.find((object) => object.id === id)
+      if (!current || current.visible === visible) return state
+      return {
+        objects: state.objects.map((object) =>
+          object.id === id ? { ...object, visible } : object
+        ),
+        objectTransformRevisionById: {
+          ...state.objectTransformRevisionById,
+          [id]: (state.objectTransformRevisionById[id] ?? 0) + 1
+        }
+      }
+    }),
 
   setSelectedObjectId: (id) => set({ selectedObjectId: id }),
 
@@ -111,12 +140,7 @@ export const useSceneStore = create<SceneState>((set) => ({
         delete robotContactsById[normalizedRobotId]
       }
 
-      return {
-        robotContactsById,
-        collisionWarning: Object.values(robotContactsById).some(
-          (robotContact) => robotContact.level === 'collision'
-        )
-      }
+      return { robotContactsById }
     }),
 
   clearRobotSafetyState: (robotId) =>
@@ -135,23 +159,37 @@ export const useSceneStore = create<SceneState>((set) => ({
 
       return {
         robotFaultsById,
-        robotContactsById,
-        collisionWarning: Object.values(robotContactsById).some(
-          (robotContact) => robotContact.level === 'collision'
-        )
+        robotContactsById
       }
     }),
-
-  setCollisionWarning: (warning) => set({ collisionWarning: warning }),
 
   setDebugHitbox: (debug) => set({ isDebugHitbox: debug }),
 
   clearScene: () =>
     set({
       objects: [],
+      objectTransformRevisionById: {},
       selectedObjectId: null,
       robotContactsById: {},
-      collisionWarning: false,
       isDebugHitbox: false
     })
 }))
+
+function isTransformPatchEqual(current: Transform3D, patch: Partial<Transform3D>): boolean {
+  return Object.entries(patch).every(([key, value]) => current[key as keyof Transform3D] === value)
+}
+
+export function selectCollisionWarning(state: SceneState): boolean {
+  return Object.values(state.robotContactsById).some((contact) => contact.level === 'collision')
+}
+
+// Presentation-only selector: keep the alert visible after motion stops and live contact clears.
+// Command/workflow guards must continue using selectCollisionWarning so their behavior is unchanged.
+export function selectSafetyAlert(state: SceneState): boolean {
+  return (
+    Object.keys(state.robotContactsById).length > 0 ||
+    Object.values(state.robotFaultsById).some(
+      (fault) => fault.active && (fault.kind === 'collision' || fault.code.startsWith('COLLISION_'))
+    )
+  )
+}

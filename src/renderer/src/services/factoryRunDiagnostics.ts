@@ -23,6 +23,7 @@ export type FactoryRunDiagnosticEventName =
   | 'robot.arm.poll'
   | 'robot.cohort.joined'
   | 'robot.cohort.released'
+  | 'robot.independent.ready'
   | 'robot.run.started'
   | 'robot.step.started'
   | 'robot.step.completed'

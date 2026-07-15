@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from 'react'
+import { useCallback, useEffect, useMemo } from 'react'
 import {
   AlertTriangle,
   Factory,
@@ -14,6 +14,7 @@ import {
 import { generateLua } from '../../engine/codegen/luaCodegen'
 import { translations } from '../../i18n/translations'
 import { electronService } from '../../services/electronService'
+import { buildCollisionAlertPresentation } from '../../services/collision/collisionPresentation'
 import { previewLuaProgram } from '../../services/backendLuaImportClient'
 import { toWorkflowStep } from '../../services/backendLuaWorkflowMapper'
 import { useRobotStore } from '../../store/robotStore'
@@ -59,7 +60,8 @@ export default function Header(): React.JSX.Element {
   const selectedRobotId = useRobotStore((state) => state.selectedRobotId)
   const workspaceMode = useRobotStore((state) => state.workspaceMode)
   const setWorkspaceMode = useRobotStore((state) => state.setWorkspaceMode)
-  const collisionWarning = useSceneStore((state) => state.collisionWarning)
+  const robotFaultsById = useSceneStore((state) => state.robotFaultsById)
+  const robotContactsById = useSceneStore((state) => state.robotContactsById)
 
   const setProjectName = useRobotStore((state) => state.setProjectName)
   const setCurrentFilePath = useRobotStore((state) => state.setCurrentFilePath)
@@ -75,6 +77,16 @@ export default function Header(): React.JSX.Element {
     [language]
   )
   const selectedRobot = robots.find((robot) => robot.id === selectedRobotId) ?? null
+  const collisionAlert = useMemo(
+    () =>
+      buildCollisionAlertPresentation(
+        robots.map((robot) => ({ id: robot.id, name: robot.name })),
+        robotContactsById,
+        robotFaultsById,
+        language
+      ),
+    [language, robotContactsById, robotFaultsById, robots]
+  )
   const handleNewProject = useCallback((): void => {
     if (confirm(t('newProjectConfirm'))) {
       reorderSteps([])
@@ -416,9 +428,27 @@ export default function Header(): React.JSX.Element {
         )}
       </div>
 
-      {collisionWarning && (
-        <div className="flex animate-pulse items-center gap-1.5 rounded-full border border-rose-500/35 bg-rose-950/40 px-3 py-1 text-xs font-bold text-rose-400">
-          <AlertTriangle size={14} /> {t('collisionWarning')}
+      {collisionAlert && (
+        <div
+          className={`flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-bold ${
+            collisionAlert.level === 'proximity'
+              ? 'border-amber-500/45 bg-amber-950/55 text-amber-300'
+              : 'border-rose-500/45 bg-rose-950/55 text-rose-300 shadow-[0_0_16px_rgba(244,63,94,0.16)]'
+          }`}
+          title={collisionAlert.detail}
+        >
+          <span
+            className={`h-1.5 w-1.5 rounded-full motion-safe:animate-pulse ${
+              collisionAlert.level === 'proximity' ? 'bg-amber-400' : 'bg-rose-400'
+            }`}
+          />
+          <AlertTriangle size={14} />
+          {collisionAlert.level === 'proximity'
+            ? language === 'vi'
+              ? 'Gần va chạm'
+              : 'Near collision'
+            : t('collisionWarning')}
+          <span>({collisionAlert.robotIds.length})</span>
         </div>
       )}
 

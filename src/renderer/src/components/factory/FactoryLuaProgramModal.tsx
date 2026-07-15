@@ -1,4 +1,4 @@
-import { useRef, useSyncExternalStore } from 'react'
+import { useRef, useState, useSyncExternalStore } from 'react'
 import type { JSX } from 'react'
 import { AlertTriangle, FileCode2, Play, Square } from 'lucide-react'
 
@@ -15,6 +15,10 @@ import {
 import { cancelActiveCommandForRobot } from '../../services/commandExecutionRuntime'
 import { getRobotRuntimeConfig as fetchRobotRuntimeConfig } from '../../services/backendRuntimeConfigClient'
 import { setRobotRuntimeConfig } from '../../services/robotMotionRuntime'
+import type {
+  FactoryCoordinationMode,
+  FactoryFailurePolicy
+} from '../../types/factoryProgram.types'
 import {
   getFactoryRunDiagnosticSnapshot,
   recordFactoryRunDiagnostic,
@@ -35,6 +39,7 @@ export default function FactoryLuaProgramModal({
   simulatorConfigByRobotId
 }: FactoryLuaProgramModalProps): JSX.Element {
   const abortRef = useRef<AbortController | null>(null)
+  const [programAssignmentTarget, setProgramAssignmentTarget] = useState<string>('all')
   const diagnosticSnapshot = useSyncExternalStore(
     subscribeFactoryRunDiagnostics,
     getFactoryRunDiagnosticSnapshot,
@@ -45,12 +50,16 @@ export default function FactoryLuaProgramModal({
   const activeRobotId = useFactoryProgramStore((state) => state.activeRobotId)
   const targetRobotIds = useFactoryProgramStore((state) => state.targetRobotIds)
   const program = useFactoryProgramStore((state) => state.program)
+  const programsByKey = useFactoryProgramStore((state) => state.programsByKey)
+  const targetProgramKeyByRobotId = useFactoryProgramStore(
+    (state) => state.targetProgramKeyByRobotId
+  )
   const robotStates = useFactoryProgramStore((state) => state.robotStates)
   const run = useFactoryProgramStore((state) => state.run)
   const isBusy = useFactoryProgramStore((state) => state.isBusy)
 
   const closeModal = useFactoryProgramStore((state) => state.closeModal)
-  const setProgram = useFactoryProgramStore((state) => state.setProgram)
+  const assignProgramToTargets = useFactoryProgramStore((state) => state.assignProgramToTargets)
   const setTargetSelected = useFactoryProgramStore((state) => state.setTargetSelected)
   const setTargets = useFactoryProgramStore((state) => state.setTargets)
   const setRunMetadata = useFactoryProgramStore((state) => state.setRunMetadata)
@@ -58,7 +67,16 @@ export default function FactoryLuaProgramModal({
   const runtimeById = useRobotStore((state) => state.robotRuntimeById)
   const executionById = useRobotStore((state) => state.robotExecutionById)
 
-  const validatorRobotId = scope === 'single' ? activeRobotId : (targetRobotIds[0] ?? null)
+  const effectiveAssignmentTarget =
+    programAssignmentTarget === 'all' || targetRobotIds.includes(programAssignmentTarget)
+      ? programAssignmentTarget
+      : 'all'
+  const validatorRobotId =
+    scope === 'single'
+      ? activeRobotId
+      : effectiveAssignmentTarget === 'all'
+        ? (targetRobotIds[0] ?? null)
+        : effectiveAssignmentTarget
 
   const getReadinessErrors = (robot: BackendRobot): string[] => {
     const errors: string[] = []
@@ -93,6 +111,18 @@ export default function FactoryLuaProgramModal({
   }))
 
   const allReady = selectedRobots.length > 0 && readiness.every((item) => item.errors.length === 0)
+  const allProgramsAssigned = selectedRobots.every((robot) => {
+    const programKey = targetProgramKeyByRobotId[robot.id]
+
+    return Boolean(programKey && programsByKey[programKey])
+  })
+  const assignedProgramKeys = [
+    ...new Set(
+      selectedRobots
+        .map((robot) => targetProgramKeyByRobotId[robot.id])
+        .filter((programKey): programKey is string => Boolean(programKey))
+    )
+  ]
 
   const selectedRobotStates = selectedRobots.map((robot) => robotStates[robot.id])
 
@@ -105,10 +135,10 @@ export default function FactoryLuaProgramModal({
   const progressLabel = `${completedCount}/${selectedRobots.length} completed`
 
   const handleRun = async (): Promise<void> => {
-    if (!program) {
+    if (!program || !allProgramsAssigned) {
       setRunMetadata({
         status: 'failed',
-        error: 'Import and accept a LUA program first.'
+        error: 'Import and assign a LUA program to every selected robot first.'
       })
       return
     }
@@ -130,6 +160,17 @@ export default function FactoryLuaProgramModal({
       })
       return
     }
+
+    if (run.coordinationMode === 'Synchronized' && assignedProgramKeys.length > 1) {
+      setRunMetadata({
+        status: 'failed',
+        error:
+          'Synchronized mode currently requires every robot to use the same LUA program. ' +
+          'Use Parallel independent for different LUA programs.'
+      })
+      return
+    }
+
     const runtimePolicyStartedAtMonotonicMs = performance.now()
 
     recordFactoryRunDiagnostic('runtime-policy.started', {
@@ -171,15 +212,20 @@ export default function FactoryLuaProgramModal({
 
     const controller = new AbortController()
     abortRef.current = controller
+    const sourcePrograms = assignedProgramKeys.map((key) => ({
+      key,
+      program: programsByKey[key]
+    }))
 
     try {
       await executeFactoryProgramV2(
         { backendUrl, token },
-        program,
+        sourcePrograms,
         selectedRobots.map((robot) => ({
           robotId: robot.id,
           robotName: robot.robotName,
-          companyId: robot.companyId
+          companyId: robot.companyId,
+          programKey: targetProgramKeyByRobotId[robot.id]
         })),
         controller.signal
       )
@@ -224,16 +270,44 @@ export default function FactoryLuaProgramModal({
           ? `LUA Program - ${
               robots.find((robot) => robot.id === activeRobotId)?.robotName ?? 'Robot'
             }`
-          : 'Factory synchronized LUA program'
+          : 'Factory LUA programs'
       }
       subtitle={
         scope === 'single'
           ? 'Validate and run without switching to Train mode'
-          : 'Prepare one LUA program for multiple robots'
+          : run.coordinationMode === 'Synchronized'
+            ? 'Run multiple robots on a shared synchronized timeline'
+            : 'Run each robot independently without timing barriers'
       }
     >
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_300px]">
         <div className="min-w-0">
+          {scope === 'batch' && targetRobotIds.length > 0 && (
+            <div className="mb-3 rounded border border-[#343849] bg-[#0c0e16] p-3">
+              <label className="grid gap-1 text-[10px] font-semibold uppercase text-slate-300">
+                Apply next imported LUA to
+                <select
+                  value={effectiveAssignmentTarget}
+                  disabled={isBusy}
+                  onChange={(event) => setProgramAssignmentTarget(event.target.value)}
+                  className="rounded border border-[#343849] bg-[#080a10] px-2 py-2 text-xs font-normal normal-case text-white"
+                >
+                  <option value="all">All selected robots</option>
+                  {selectedRobots.map((robot) => (
+                    <option key={robot.id} value={robot.id}>
+                      {robot.robotName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <p className="mt-1 text-[9px] text-slate-500">
+                Importing again replaces only the selected assignment. Identical LUA content is
+                stored once and reused by every assigned robot.
+              </p>
+            </div>
+          )}
+
           {validatorRobotId ? (
             <ProgramImportPanel
               luaOnly
@@ -243,8 +317,20 @@ export default function FactoryLuaProgramModal({
                 robotId: validatorRobotId,
                 token
               }}
-              actionLabel="Use this LUA program"
-              onProgramAccepted={setProgram}
+              actionLabel={
+                effectiveAssignmentTarget === 'all'
+                  ? 'Assign LUA to selected robots'
+                  : `Assign LUA to ${
+                      selectedRobots.find((robot) => robot.id === effectiveAssignmentTarget)
+                        ?.robotName ?? 'robot'
+                    }`
+              }
+              onProgramAccepted={(acceptedProgram) =>
+                assignProgramToTargets(
+                  acceptedProgram,
+                  effectiveAssignmentTarget === 'all' ? targetRobotIds : [effectiveAssignmentTarget]
+                )
+              }
             />
           ) : (
             <p className="rounded border border-amber-500/40 p-3 text-xs text-amber-200">
@@ -282,6 +368,10 @@ export default function FactoryLuaProgramModal({
                 const selected = targetRobotIds.includes(robot.id)
                 const errors = getReadinessErrors(robot)
                 const state = robotStates[robot.id]
+                const assignedProgramKey = targetProgramKeyByRobotId[robot.id]
+                const assignedProgram = assignedProgramKey
+                  ? programsByKey[assignedProgramKey]
+                  : undefined
 
                 return (
                   <label
@@ -302,6 +392,18 @@ export default function FactoryLuaProgramModal({
 
                       <p className="text-[10px] text-slate-500">{state?.status ?? 'idle'}</p>
 
+                      {selected && (
+                        <p
+                          className={`mt-1 truncate text-[9px] ${
+                            assignedProgram ? 'text-emerald-300' : 'text-amber-300'
+                          }`}
+                        >
+                          {assignedProgram
+                            ? `LUA: ${assignedProgram.fileName}`
+                            : 'LUA: not assigned'}
+                        </p>
+                      )}
+
                       {errors.map((error) => (
                         <p key={error} className="text-[9px] text-amber-300">
                           {error}
@@ -321,7 +423,66 @@ export default function FactoryLuaProgramModal({
 
           {program && (
             <div className="rounded border border-emerald-500/30 bg-emerald-950/20 p-2 text-[10px] text-emerald-200">
-              {program.fileName}: {program.steps.length} valid step(s)
+              {assignedProgramKeys.length} source LUA(s),{' '}
+              {
+                selectedRobots.filter((robot) => Boolean(targetProgramKeyByRobotId[robot.id]))
+                  .length
+              }
+              /{selectedRobots.length} robot(s) assigned
+            </div>
+          )}
+
+          {scope === 'batch' && (
+            <div className="grid gap-2 rounded border border-[#343849] bg-[#0c0e16] p-2">
+              <label className="grid gap-1 text-[10px] text-slate-300">
+                Coordination mode
+                <select
+                  value={run.coordinationMode}
+                  disabled={isBusy}
+                  onChange={(event) =>
+                    setRunMetadata({
+                      coordinationMode: event.target.value as FactoryCoordinationMode
+                    })
+                  }
+                  className="rounded border border-[#343849] bg-[#080a10] px-2 py-1.5 text-xs text-white"
+                >
+                  <option value="ParallelIndependent">Parallel independent</option>
+                  <option value="Synchronized">Synchronized timeline</option>
+                </select>
+                <span className="text-[9px] text-slate-500">
+                  {run.coordinationMode === 'Synchronized'
+                    ? 'Robots wait for a shared start and step timing.'
+                    : 'Each robot starts and advances on its own timeline.'}
+                </span>
+              </label>
+
+              <label className="grid gap-1 text-[10px] text-slate-300">
+                Failure policy
+                <select
+                  value={run.failurePolicy}
+                  disabled={isBusy}
+                  onChange={(event) =>
+                    setRunMetadata({
+                      failurePolicy: event.target.value as FactoryFailurePolicy
+                    })
+                  }
+                  className="rounded border border-[#343849] bg-[#080a10] px-2 py-1.5 text-xs text-white"
+                >
+                  <option value="IsolateTarget">Isolate failed robot</option>
+                  <option value="AbortExecutionGroup">Stop execution group</option>
+                </select>
+                <span
+                  className={`text-[9px] ${
+                    run.failurePolicy === 'AbortExecutionGroup'
+                      ? 'text-amber-300'
+                      : 'text-slate-500'
+                  }`}
+                >
+                  {run.failurePolicy === 'AbortExecutionGroup'
+                    ? 'A single robot failure stops every robot in this run.'
+                    : 'A failed robot turns faulted while surviving robots continue.'}
+                </span>
+              </label>
             </div>
           )}
 
@@ -445,7 +606,7 @@ export default function FactoryLuaProgramModal({
           <div className="grid grid-cols-2 gap-2">
             <button
               type="button"
-              disabled={isBusy || !program || !allReady || !token}
+              disabled={isBusy || !program || !allProgramsAssigned || !allReady || !token}
               onClick={() => void handleRun()}
               className="flex items-center justify-center gap-1 rounded bg-emerald-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-40"
             >

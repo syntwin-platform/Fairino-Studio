@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Cpu,
   FileCode2,
   HelpCircle,
@@ -10,15 +11,26 @@ import {
   Settings,
   Server,
   Square,
-  Trash2
+  Trash2,
+  ChevronsLeft,
+  ChevronsRight
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import type { ReactElement } from 'react'
+import {
+  waitForRobotCommand,
+  type BackendCommandResponse,
+  type BackendProgramContext
+} from '../../services/backendProgramClient'
 import FactoryLuaProgramModal from '../factory/FactoryLuaProgramModal'
 import { useFactoryProgramStore } from '../../store/factoryProgramStore'
 import { translations } from '../../i18n/translations'
 import { useRobotStore } from '../../store/robotStore'
 import { useSceneStore } from '../../store/sceneStore'
+import {
+  buildRobotCollisionPresentation,
+  isTechnicalCollisionError
+} from '../../services/collision/collisionPresentation'
 import {
   DEFAULT_JOINT_ANGLES,
   type JointAngles,
@@ -267,7 +279,8 @@ export default function RobotSidebar({
 
   const isDebugHitbox = useSceneStore((state) => state.isDebugHitbox)
   const setDebugHitbox = useSceneStore((state) => state.setDebugHitbox)
-  const setCollisionWarning = useSceneStore((state) => state.setCollisionWarning)
+  const robotFaultsById = useSceneStore((state) => state.robotFaultsById)
+  const robotContactsById = useSceneStore((state) => state.robotContactsById)
 
   const language = useRobotStore((state) => state.language)
   const t = (key: keyof typeof translations.vi): string => translations[language][key]
@@ -282,6 +295,142 @@ export default function RobotSidebar({
   const selectRobot = useRobotStore((state) => state.selectRobot)
   const removeRobot = useRobotStore((state) => state.removeRobot)
   const updateRobotSceneBinding = useRobotStore((state) => state.updateRobotSceneBinding)
+  const setJointAnglesForRobot = useRobotStore((state) => state.setJointAnglesForRobot)
+
+  const [width, setWidth] = useState<number>(() => {
+    const saved = window.localStorage.getItem('fai_sidebar_width')
+    if (saved) {
+      const val = parseInt(saved, 10)
+      if (!isNaN(val)) return Math.max(320, Math.min(620, val))
+    }
+    return 400 // default
+  })
+
+  const [isCollapsed, setIsCollapsed] = useState<boolean>(() => {
+    const saved = window.localStorage.getItem('fai_sidebar_collapsed')
+    return saved === 'true'
+  })
+
+  const [homingStatuses, setHomingStatuses] = useState<Record<string, 'idle' | 'homing' | 'success' | 'failed'>>({})
+
+  const latestWidthRef = useRef(width)
+  useEffect(() => {
+    latestWidthRef.current = width
+  }, [width])
+
+  const isResizingRef = useRef(false)
+  const dragStartXRef = useRef(0)
+  const dragStartWidthRef = useRef(0)
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>): void => {
+    isResizingRef.current = true
+    dragStartXRef.current = e.clientX
+    dragStartWidthRef.current = width
+    e.currentTarget.setPointerCapture(e.pointerId)
+    e.stopPropagation()
+  }
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>): void => {
+    if (!isResizingRef.current) return
+    e.stopPropagation()
+    const currentX = e.clientX
+    const deltaX = currentX - dragStartXRef.current
+    const nextWidth = dragStartWidthRef.current + deltaX
+    const maxWidth = Math.min(620, window.innerWidth * 0.45)
+    const clamped = Math.max(320, Math.min(maxWidth, nextWidth))
+
+    window.requestAnimationFrame(() => {
+      if (isResizingRef.current) {
+        setWidth(clamped)
+      }
+    })
+  }
+
+  const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>): void => {
+    if (!isResizingRef.current) return
+    isResizingRef.current = false
+    e.currentTarget.releasePointerCapture(e.pointerId)
+    e.stopPropagation()
+    window.localStorage.setItem('fai_sidebar_width', latestWidthRef.current.toString())
+  }
+
+  const handleDoubleClick = (e: React.MouseEvent): void => {
+    e.stopPropagation()
+    setWidth(400)
+    window.localStorage.setItem('fai_sidebar_width', '400')
+  }
+
+  const toggleCollapse = (): void => {
+    const next = !isCollapsed
+    setIsCollapsed(next)
+    window.localStorage.setItem('fai_sidebar_collapsed', next.toString())
+  }
+
+  const isFactoryRunning = backendRobots.some((r) => robotExecutionById[r.id]?.isPlaying)
+
+  const enqueueMoveJCommand = async (
+    context: BackendProgramContext,
+    robotId: string,
+    jointAngles: number[],
+    speed = 30
+  ): Promise<BackendCommandResponse> => {
+    const response = await fetch(`${context.backendUrl.trim().replace(/\/+$/, '')}/api/robots/${encodeURIComponent(robotId)}/commands`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${context.token.trim()}`
+      },
+      body: JSON.stringify({
+        commandType: 'MoveJ',
+        payload: {
+          jointAngles,
+          speed
+        }
+      })
+    })
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${await response.text()}`)
+    }
+    return (await response.json()) as BackendCommandResponse
+  }
+
+  const homeSingleRobot = async (robot: BackendRobot): Promise<void> => {
+    const isOnline = isBackendRobotRuntimeActive(robot)
+    setHomingStatuses((prev) => ({ ...prev, [robot.id]: 'homing' }))
+
+    try {
+      if (isOnline) {
+        const context = { backendUrl: simulatorConfig.backendUrl, token: backendToken }
+        const cmd = await enqueueMoveJCommand(context, robot.id, DEFAULT_JOINT_ANGLES)
+        const result = await waitForRobotCommand(context, robot.id, cmd.id)
+        if (result.status === 'Completed') {
+          setHomingStatuses((prev) => ({ ...prev, [robot.id]: 'success' }))
+        } else {
+          throw new Error(result.failureReason || 'Command failed')
+        }
+      } else {
+        setJointAnglesForRobot(robot.id, [...DEFAULT_JOINT_ANGLES])
+        setHomingStatuses((prev) => ({ ...prev, [robot.id]: 'success' }))
+      }
+    } catch (err) {
+      console.error(`Homing failed for robot ${robot.id}:`, err)
+      setHomingStatuses((prev) => ({ ...prev, [robot.id]: 'failed' }))
+    }
+  }
+
+  const handleReturnAllHome = async (): Promise<void> => {
+    if (isFactoryRunning) return
+    const msg = language === 'vi'
+      ? 'Đưa toàn bộ robot trong Factory về tư thế Home?'
+      : 'Return all robots in the Factory to the Home pose?'
+    if (!window.confirm(msg)) {
+      return
+    }
+
+    const promises = backendRobots.map((robot) => homeSingleRobot(robot))
+    await Promise.allSettled(promises)
+  }
+
   const selectedRobot = robots.find((robot) => robot.id === selectedRobotId) ?? null
   const selectedRobotRuntime = selectedRobotId ? robotRuntimeById[selectedRobotId] : undefined
   const selectedRobotBadge = getRobotRuntimeBadge(selectedRobotRuntime ?? simulatorStatus)
@@ -303,12 +452,12 @@ export default function RobotSidebar({
     return storeRobot?.sceneBinding ?? toRobotSceneBinding(robot)
   }
 
-  const getRobotSimulatorConfig = (
+  function getRobotSimulatorConfig(
     robot: BackendRobot,
     options?: {
       deviceSecret?: string
     }
-  ): BackendSimulatorConfig => {
+  ): BackendSimulatorConfig {
     const savedConfig = simulatorConfigByRobotId[robot.id]
     const isCurrentConfig = simulatorConfig.robotId.trim() === robot.id
     const deviceSecret =
@@ -325,7 +474,7 @@ export default function RobotSidebar({
     }
   }
 
-  const canConnectBackendRobot = (robot: BackendRobot): boolean => {
+  function canConnectBackendRobot(robot: BackendRobot): boolean {
     const robotRuntime = robotRuntimeById[robot.id]
     const robotSimulatorConfig = getRobotSimulatorConfig(robot)
 
@@ -339,7 +488,7 @@ export default function RobotSidebar({
     )
   }
 
-  const isBackendRobotRuntimeActive = (robot: BackendRobot): boolean => {
+  function isBackendRobotRuntimeActive(robot: BackendRobot): boolean {
     const robotRuntime = robotRuntimeById[robot.id]
 
     return Boolean(robotRuntime?.isRunning || robotRuntime?.isConnected)
@@ -739,7 +888,6 @@ export default function RobotSidebar({
 
       if (homeRunIdRef.current === runId) {
         setJointAngles([...DEFAULT_JOINT_ANGLES])
-        setCollisionWarning(false)
       }
     } finally {
       if (homeRunIdRef.current === runId) {
@@ -758,7 +906,6 @@ export default function RobotSidebar({
     setSelectedStepId(null)
     setSelectedJointName(null)
     setIKMode(false)
-    setCollisionWarning(false)
     setIsHoming(true)
 
     void animateHome(runId, [...useRobotStore.getState().jointAngles] as JointAngles)
@@ -773,21 +920,93 @@ export default function RobotSidebar({
   const dotColor =
     isPlaying && selectedRobotRuntime?.isConnected ? 'bg-emerald-400' : selectedRobotBadge.dot
 
+  if (isCollapsed) {
+    return (
+      <div
+        className="relative flex h-full w-[60px] shrink-0 select-none flex-col border-r border-[#2d2d34] bg-[#1b1b1f] text-slate-200 items-center py-4 gap-4"
+        style={{ width: '60px' }}
+      >
+        <button
+          type="button"
+          onClick={toggleCollapse}
+          title={language === 'vi' ? 'Mở rộng Sidebar' : 'Expand Sidebar'}
+          className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#343849] bg-[#1e1e24] text-slate-300 transition hover:bg-[#282830] hover:text-white"
+        >
+          <ChevronsRight size={16} />
+        </button>
+
+        <div className="h-px w-8 bg-[#2d2d34]" />
+
+        <div className="flex flex-col gap-3 overflow-y-auto max-h-[calc(100%-80px)] w-full items-center px-1">
+          {backendRobots.map((robot) => {
+            const robotRuntime = robotRuntimeById[robot.id]
+            const robotBadge = getRobotRuntimeBadge(robotRuntime)
+
+            const contact = robotContactsById[robot.id]
+            const isCollision = contact?.level === 'collision' || (robotFaultsById[robot.id]?.active && (robotFaultsById[robot.id]?.kind === 'collision' || robotFaultsById[robot.id]?.code.startsWith('COLLISION_')))
+            const isProximity = contact?.level === 'proximity'
+
+            const statusColor = isCollision
+              ? 'bg-red-500 shadow-[0_0_8px_#ef4444]'
+              : isProximity
+                ? 'bg-amber-500 shadow-[0_0_8px_#f59e0b]'
+                : robotBadge.dot.includes('bg-emerald')
+                  ? 'bg-emerald-500'
+                  : robotBadge.dot.includes('bg-blue')
+                    ? 'bg-blue-500'
+                    : 'bg-slate-500'
+
+            return (
+              <div
+                key={robot.id}
+                className={`h-3 w-3 rounded-full ${statusColor}`}
+                title={`${robot.robotName}: ${isCollision ? 'Va chạm' : isProximity ? 'Gần va chạm' : robotBadge.label}`}
+              />
+            )
+          })}
+        </div>
+      </div>
+    )
+  }
+
   return (
-    <div className="flex h-full w-80 shrink-0 select-none flex-col border-r border-[#2d2d34] bg-[#1b1b1f] text-slate-200">
+    <div
+      className="relative flex h-full shrink-0 select-none flex-col border-r border-[#2d2d34] bg-[#1b1b1f] text-slate-200"
+      style={{ width: `${width}px` }}
+    >
+      <div
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onDoubleClick={handleDoubleClick}
+        className="absolute top-0 right-0 z-50 h-full w-1.5 cursor-col-resize bg-transparent hover:bg-blue-500/50 active:bg-blue-500 transition-colors"
+        title={language === 'vi' ? 'Kéo để đổi kích thước, nhấn đúp để khôi phục' : 'Drag to resize, double click to reset'}
+      />
+
       <div className="border-b border-[#2d2d34] p-4 bg-[#141417]/20">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-2">
           <h2
-            className="truncate text-sm font-bold leading-tight text-white"
+            className="truncate text-sm font-bold leading-tight text-white flex-1"
             title={sidebarRobotName}
           >
             {sidebarRobotName}
           </h2>
-          <div
-            className={`flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-bold ${statusBadgeColor}`}
-          >
-            <span className={`h-1.5 w-1.5 rounded-full ${dotColor}`} />
-            <span>{statusBadgeLabel}</span>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <div
+              className={`flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-bold ${statusBadgeColor}`}
+            >
+              <span className={`h-1.5 w-1.5 rounded-full ${dotColor}`} />
+              <span>{statusBadgeLabel}</span>
+            </div>
+
+            <button
+              type="button"
+              onClick={toggleCollapse}
+              title={language === 'vi' ? 'Thu nhỏ Sidebar' : 'Collapse Sidebar'}
+              className="flex h-5 w-5 items-center justify-center rounded border border-[#343849] bg-[#1e1e24] text-slate-300 transition hover:bg-[#282830] hover:text-white"
+            >
+              <ChevronsLeft size={12} />
+            </button>
           </div>
         </div>
         <p className="mt-1.5 truncate text-[10px] text-slate-400" title={sidebarRobotSubtitle}>
@@ -1136,83 +1355,98 @@ export default function RobotSidebar({
             )}
 
             <div className="mt-3 border-t border-[#2d2d34] pt-3">
+              <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2">
+                Factory Actions
+              </p>
               <button
                 type="button"
                 disabled={backendRobots.length === 0 || !backendToken || factoryActionBusy}
                 onClick={() => openBatchFactoryProgram(backendRobots.map((robot) => robot.id))}
-                className="mb-3 flex w-full items-center justify-center gap-2 rounded bg-violet-600 px-3 py-2 text-xs font-bold text-white transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-40"
+                className="mb-3 flex w-full items-center justify-center gap-2 rounded-lg bg-violet-600 px-3 py-2 text-xs font-bold text-white transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <FileCode2 size={14} />
                 Import LUA & Run Factory
               </button>
-              <div className="mb-2 flex items-center justify-between gap-2">
-                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                  Robots từ Backend
-                </span>
 
-                <div className="flex shrink-0 items-center gap-1">
-                  <button
-                    type="button"
-                    onClick={() => void handleConnectReadyRobots()}
-                    disabled={
-                      factoryActionBusy ||
-                      backendRobots.every((robot) => !canConnectBackendRobot(robot))
-                    }
-                    className="rounded border border-emerald-500/40 px-2 py-1 text-[10px] font-semibold text-emerald-200 transition hover:bg-emerald-950/40 disabled:cursor-not-allowed disabled:opacity-40"
-                    title="Connect tất cả robot đã có Device Secret"
-                  >
-                    Connect Ready
-                  </button>
+              <div className="grid grid-cols-2 gap-2 mb-3">
+                <button
+                  type="button"
+                  onClick={() => void handleConnectReadyRobots()}
+                  disabled={
+                    factoryActionBusy ||
+                    backendRobots.every((robot) => !canConnectBackendRobot(robot))
+                  }
+                  className="rounded-lg border border-emerald-500/40 bg-emerald-950/10 px-2 py-1.5 text-xs font-bold text-emerald-300 transition hover:bg-emerald-950/30 disabled:cursor-not-allowed disabled:opacity-40 text-center"
+                  title="Connect tất cả robot đã có Device Secret"
+                >
+                  Connect Ready
+                </button>
 
-                  <button
-                    type="button"
-                    onClick={handleStopAllRobotMotion}
-                    disabled={factoryRuntimeSummary.running === 0}
-                    className="flex items-center gap-1 rounded border border-red-500/50 bg-red-950/20 px-2 py-1 text-[10px] font-bold text-red-300 transition hover:bg-red-950/50 disabled:cursor-not-allowed disabled:opacity-40"
-                    title="Dừng toàn bộ workflow và backend command đang chạy"
-                  >
-                    <Square size={10} />
-                    Stop All
-                  </button>
+                <button
+                  type="button"
+                  onClick={handleStopAllRobotMotion}
+                  disabled={factoryRuntimeSummary.running === 0}
+                  className="flex items-center justify-center gap-1.5 rounded-lg border border-red-500/50 bg-red-950/15 px-2 py-1.5 text-xs font-bold text-red-300 transition hover:bg-red-950/35 disabled:cursor-not-allowed disabled:opacity-40"
+                  title="Dừng toàn bộ workflow và backend command đang chạy"
+                >
+                  <Square size={12} />
+                  Stop All
+                </button>
 
-                  <button
-                    type="button"
-                    onClick={() => void handleDisconnectOnlineRobots()}
-                    disabled={
-                      factoryActionBusy ||
-                      backendRobots.every((robot) => !isBackendRobotRuntimeActive(robot))
-                    }
-                    className="rounded border border-amber-500/40 px-2 py-1 text-[10px] font-semibold text-amber-200 transition hover:bg-amber-950/40 disabled:cursor-not-allowed disabled:opacity-40"
-                    title="Disconnect tất cả robot đang online/running"
-                  >
-                    Disconnect Online
-                  </button>
+                <button
+                  type="button"
+                  onClick={() => void handleDisconnectOnlineRobots()}
+                  disabled={
+                    factoryActionBusy ||
+                    backendRobots.every((robot) => !isBackendRobotRuntimeActive(robot))
+                  }
+                  className="rounded-lg border border-amber-500/40 bg-amber-950/10 px-2 py-1.5 text-xs font-bold text-amber-300 transition hover:bg-amber-950/30 disabled:cursor-not-allowed disabled:opacity-40 text-center"
+                  title="Disconnect tất cả robot đang online/running"
+                >
+                  Disconnect Online
+                </button>
 
-                  <button
-                    type="button"
-                    onClick={() => void loadBackendRobots()}
-                    disabled={
-                      robotListLoading ||
-                      factoryActionBusy ||
-                      !backendToken ||
-                      !simulatorConfig.backendUrl.trim() ||
-                      !addRobotCompanyId.trim()
-                    }
-                    className="flex items-center gap-1 rounded border border-[#343849] px-2 py-1 text-[10px] font-semibold text-slate-300 transition hover:bg-[#242833] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
-                  >
-                    <RefreshCw size={11} className={robotListLoading ? 'animate-spin' : ''} />
-                    Refresh
-                  </button>
-                </div>
+                <button
+                  type="button"
+                  onClick={handleReturnAllHome}
+                  disabled={isFactoryRunning}
+                  className="flex items-center justify-center gap-1.5 rounded-lg border border-blue-500/45 bg-blue-950/15 px-2 py-1.5 text-xs font-bold text-blue-300 transition hover:bg-blue-950/35 disabled:cursor-not-allowed disabled:opacity-40"
+                  title={isFactoryRunning ? "Hãy dừng Factory Run trước khi đưa toàn bộ robot về Home." : "Đưa toàn bộ robot trong Factory về tư thế Home"}
+                >
+                  <Home size={12} />
+                  Return All Home
+                </button>
               </div>
 
-              {backendRobots.length > 0 && (
-                <div className="mb-2 grid grid-cols-3 gap-1 rounded border border-[#2d2d34] bg-[#080a10] p-2">
+              <div className="flex justify-end gap-2 mb-4">
+                <button
+                  type="button"
+                  onClick={() => void loadBackendRobots()}
+                  disabled={
+                    robotListLoading ||
+                    factoryActionBusy ||
+                    !backendToken ||
+                    !simulatorConfig.backendUrl.trim() ||
+                    !addRobotCompanyId.trim()
+                  }
+                  className="flex items-center gap-1 rounded border border-[#343849] px-2 py-1.5 text-[10px] font-semibold text-slate-300 transition hover:bg-[#242833] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <RefreshCw size={11} className={robotListLoading ? 'animate-spin' : ''} />
+                  Refresh
+                </button>
+              </div>
+            </div>
+
+            {backendRobots.length > 0 && (
+              <div className="mt-4 border-t border-[#2d2d34] pt-4">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2">
+                  Factory Summary
+                </p>
+                <div className="mb-4 grid grid-cols-3 gap-1 rounded border border-[#2d2d34] bg-[#080a10] p-2">
                   <div className="col-span-3 flex items-center justify-between rounded border border-violet-500/30 bg-violet-950/20 px-3 py-2">
                     <p className="text-[9px] font-bold uppercase tracking-wider text-violet-300">
                       Running Robots
                     </p>
-
                     <p className="text-base font-bold text-violet-200">
                       {factoryRuntimeSummary.running}
                     </p>
@@ -1265,13 +1499,19 @@ export default function RobotSidebar({
                     </p>
                   </div>
                 </div>
-              )}
+              </div>
+            )}
 
-              {robotListError && (
-                <p className="mb-2 rounded border border-red-500/40 bg-red-950/30 px-3 py-2 text-[11px] text-red-200">
-                  {robotListError}
-                </p>
-              )}
+            {robotListError && (
+              <p className="mb-2 rounded border border-red-500/40 bg-red-950/30 px-3 py-2 text-[11px] text-red-200">
+                {robotListError}
+              </p>
+            )}
+
+            <div className="mt-4 border-t border-[#2d2d34] pt-4">
+              <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2">
+                Robots từ Backend
+              </p>
 
               <div className="space-y-2">
                 {backendRobots.length === 0 ? (
@@ -1291,11 +1531,74 @@ export default function RobotSidebar({
                     const saveFeedback = sceneBindingSaveFeedback[robot.id]
                     const liveSceneBinding = getLiveRobotSceneBinding(robot)
                     const isSceneBindingDirty = !hasPersistedSceneBinding(robot, liveSceneBinding)
+                    const robotCollisionPresentation = buildRobotCollisionPresentation(
+                      robot.id,
+                      backendRobots.map((item) => ({ id: item.id, name: item.robotName })),
+                      robotContactsById,
+                      robotFaultsById,
+                      language
+                    )
 
                     const visibleSaveFeedback =
                       isSceneBindingDirty && saveFeedback?.status === 'success'
                         ? undefined
                         : saveFeedback
+
+                    const contact = robotContactsById[robot.id]
+                    const isCollision = contact?.level === 'collision'
+                    const isProximity = contact?.level === 'proximity'
+                    const isFaultActive = robotFaultsById[robot.id]?.active && (robotFaultsById[robot.id]?.kind === 'collision' || robotFaultsById[robot.id]?.code.startsWith('COLLISION_'))
+                    const isLatchedFaultWaitingReset = isFaultActive && !contact
+
+                    const cardBorderClass = isCollision
+                      ? 'border-red-500 bg-red-950/15 shadow-[0_0_12px_rgba(239,68,68,0.15)] hover:border-red-400'
+                      : isProximity
+                        ? 'border-amber-500 bg-amber-950/15 shadow-[0_0_12px_rgba(245,158,11,0.15)] hover:border-amber-400'
+                        : isLatchedFaultWaitingReset
+                          ? 'border-rose-500/40 bg-rose-950/5 hover:border-rose-400/50'
+                          : isSelected
+                            ? 'border-blue-500/60 bg-blue-950/20 shadow-[0_0_12px_rgba(59,130,246,0.15)]'
+                            : 'border-[#2d2d34] bg-[#0c0e16] hover:border-blue-500/35'
+
+                    const proximityDetails = (() => {
+                      if (!isProximity || !contact) return null
+                      const counterpartNames = (contact.counterpartRobotIds ?? []).map((cid) => {
+                        const found = backendRobots.find((r) => r.id === cid)
+                        return found ? found.robotName : 'Robot'
+                      })
+                      const obstacleNames = contact.objectIds ?? []
+                      const subjects = [...counterpartNames, ...obstacleNames].join(
+                        language === 'vi' ? ' và ' : ' & '
+                      )
+
+                      if (language === 'vi') {
+                        switch (contact.kind) {
+                          case 'robot':
+                            return `Quá gần robot ${subjects || 'khác'}`
+                          case 'ground':
+                            return 'Quá gần mặt phẳng an toàn của sàn'
+                          case 'self':
+                            return 'Các bộ phận robot đang ở quá gần nhau'
+                          case 'obstacle':
+                            return `Quá gần vật cản${subjects ? ` ${subjects}` : ''}`
+                          default:
+                            return 'Đã vào vùng cảnh báo an toàn'
+                        }
+                      }
+
+                      switch (contact.kind) {
+                        case 'robot':
+                          return `Too close to ${subjects || 'another robot'}`
+                        case 'ground':
+                          return 'Too close to the ground safety plane'
+                        case 'self':
+                          return 'Robot links are too close to each other'
+                        case 'obstacle':
+                          return `Too close to obstacle${subjects ? ` ${subjects}` : ''}`
+                        default:
+                          return 'Inside a safety warning zone'
+                      }
+                    })()
 
                     return (
                       <div
@@ -1308,11 +1611,7 @@ export default function RobotSidebar({
                             switchToConnection: false
                           })
                         }
-                        className={`cursor-pointer rounded border p-3 transition ${
-                          isSelected
-                            ? 'border-blue-500/60 bg-blue-950/20'
-                            : 'border-[#2d2d34] bg-[#0c0e16] hover:border-blue-500/35'
-                        }`}
+                        className={`cursor-pointer rounded border p-3 transition ${cardBorderClass}`}
                       >
                         <div className="flex items-start justify-between gap-2">
                           <div className="min-w-0">
@@ -1320,9 +1619,16 @@ export default function RobotSidebar({
                               {robot.robotName}
                             </p>
                             <p className="mt-0.5 text-[10px] text-slate-500">{robot.model}</p>
-                            <p className="mt-1 break-all font-mono text-[9px] text-slate-500">
-                              {robot.id}
-                            </p>
+                            <span
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                navigator.clipboard.writeText(robot.id)
+                              }}
+                              className="mt-1 font-mono text-[9px] text-slate-500 hover:text-blue-400 select-all cursor-pointer transition flex items-center gap-1"
+                              title="Click để copy ID"
+                            >
+                              ID: {robot.id.slice(0, 8)}...
+                            </span>
                             <div className="mt-2 flex flex-wrap items-center gap-1">
                               <span
                                 className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold ${robotBadge.color}`}
@@ -1336,88 +1642,52 @@ export default function RobotSidebar({
                                   CONFIG
                                 </span>
                               )}
+
+                              {isCollision && (
+                                <span className="inline-flex items-center gap-1 rounded bg-red-500/25 px-1.5 py-0.5 text-[9px] font-bold text-red-300 border border-red-500/30">
+                                  Va chạm
+                                </span>
+                              )}
+                              {isProximity && (
+                                <span className="inline-flex items-center gap-1 rounded bg-amber-500/25 px-1.5 py-0.5 text-[9px] font-bold text-amber-300 border border-amber-500/30">
+                                  Gần va chạm
+                                </span>
+                              )}
+                              {isLatchedFaultWaitingReset && (
+                                <span className="inline-flex items-center gap-1 rounded bg-rose-500/10 px-1.5 py-0.5 text-[9px] font-bold text-rose-300 border border-rose-500/20">
+                                  Đã dừng – chờ reset
+                                </span>
+                              )}
+
+                              {homingStatuses[robot.id] === 'homing' && (
+                                <span className="inline-flex items-center gap-1 rounded bg-amber-600/20 px-1.5 py-0.5 text-[9px] font-bold text-amber-300 border border-amber-500/30 animate-pulse">
+                                  Homing...
+                                </span>
+                              )}
+                              {homingStatuses[robot.id] === 'success' && (
+                                <span className="inline-flex items-center gap-1 rounded bg-emerald-600/20 px-1.5 py-0.5 text-[9px] font-bold text-emerald-300 border border-emerald-500/30">
+                                  Home thành công
+                                </span>
+                              )}
+                              {homingStatuses[robot.id] === 'failed' && (
+                                <span className="inline-flex items-center gap-1 rounded bg-red-600/20 px-1.5 py-0.5 text-[9px] font-bold text-red-300 border border-red-500/30">
+                                  Home thất bại
+                                </span>
+                              )}
                             </div>
-                          </div>
-
-                          <div className="flex shrink-0 items-center gap-1">
-                            <button
-                              type="button"
-                              disabled={!backendToken}
-                              onClick={(event) => {
-                                event.stopPropagation()
-
-                                handleSelectBackendRobot(robot, {
-                                  switchToConnection: false
-                                })
-
-                                openSingleFactoryProgram(robot.id)
-                              }}
-                              className="flex items-center gap-1 rounded border border-violet-500/40 px-2 py-1 text-[10px] font-bold text-violet-200 transition hover:bg-violet-950/40 disabled:opacity-40"
-                              title={`Import và chạy LUA cho ${robot.robotName}`}
-                            >
-                              <FileCode2 size={11} />
-                              LUA
-                            </button>
-
-                            {isRobotRuntimeActive ? (
-                              <button
-                                type="button"
-                                onClick={(event) => {
-                                  event.stopPropagation()
-                                  onSimulatorDisconnectRobot(robot.id)
-                                }}
-                                className="rounded border border-amber-500/40 px-2 py-1 text-[10px] font-bold text-amber-200 transition hover:bg-amber-950/40"
-                                title="Disconnect robot này"
-                              >
-                                Disconnect
-                              </button>
-                            ) : (
-                              <button
-                                type="button"
-                                onClick={(event) => {
-                                  event.stopPropagation()
-                                  void onSimulatorConnectRobot(robotSimulatorConfig)
-                                }}
-                                disabled={!canConnectRobot}
-                                className="rounded border border-emerald-500/40 px-2 py-1 text-[10px] font-bold text-emerald-200 transition hover:bg-emerald-950/40 disabled:cursor-not-allowed disabled:opacity-40"
-                                title={
-                                  canConnectRobot
-                                    ? 'Connect robot này'
-                                    : 'Nhập Device Secret trong tab Connection trước'
-                                }
-                              >
-                                Connect
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              onClick={(event) => {
-                                event.stopPropagation()
-                                void handleDeleteBackendRobot(robot)
-                              }}
-                              disabled={deletingRobotId === robot.id || isRobotRuntimeActive}
-                              className="rounded border border-red-500/40 p-1.5 text-red-300 transition hover:bg-red-950/40 hover:text-red-100 disabled:cursor-not-allowed disabled:opacity-40"
-                              title={
-                                isRobotRuntimeActive
-                                  ? 'Disconnect robot trước khi xóa'
-                                  : 'Xóa robot'
-                              }
-                            >
-                              <Trash2 size={12} />
-                            </button>
                           </div>
                         </div>
 
-                        <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-slate-400">
-                          <span>BE Status: {robot.status}</span>
+                        <div className="mt-2.5 grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] text-slate-400">
+                          <span>BE: {robot.status}</span>
                           <span>Mode: {robot.connectionType}</span>
-                          <span>Heartbeat: {formatRuntimeTime(robotRuntime?.lastHeartbeatAt)}</span>
-                          <span>Telemetry: {formatRuntimeTime(robotRuntime?.lastTelemetryAt)}</span>
+                          <span className="truncate">Heartbeat: {formatRuntimeTime(robotRuntime?.lastHeartbeatAt)}</span>
+                          <span className="truncate">Telemetry: {formatRuntimeTime(robotRuntime?.lastTelemetryAt)}</span>
                           <span
                             className={
                               robotExecution?.isPlaying
-                                ? 'font-bold text-violet-300'
-                                : 'text-slate-500'
+                                ? 'font-bold text-violet-300 col-span-2'
+                                : 'text-slate-500 col-span-2'
                             }
                           >
                             Execution:{' '}
@@ -1427,16 +1697,110 @@ export default function RobotSidebar({
                           </span>
                         </div>
 
-                        {robotRuntime?.lastError && (
-                          <p className="mt-2 rounded border border-red-500/30 bg-red-950/25 px-2 py-1 text-[10px] text-red-200">
-                            {robotRuntime.lastError}
-                          </p>
+                        {isCollision && robotCollisionPresentation && (
+                          <div className="mt-2 flex gap-1.5 rounded border border-red-500/40 bg-red-950/25 px-2 py-1.5 text-[9px] text-red-200">
+                            <AlertTriangle className="mt-0.5 shrink-0 text-red-400" size={12} />
+                            <div className="min-w-0 flex-1">
+                              <p className="font-bold truncate">{robotCollisionPresentation.title}</p>
+                              <p className="text-[8px] text-red-200/80 mt-0.5 leading-relaxed">{robotCollisionPresentation.detail}</p>
+                            </div>
+                          </div>
                         )}
-                        {robotExecution?.lastError && (
-                          <p className="mt-2 rounded border border-red-500/30 bg-red-950/25 px-2 py-1 text-[10px] text-red-200">
-                            Execution: {robotExecution.lastError}
-                          </p>
+
+                        {isProximity && proximityDetails && (
+                          <div className="mt-2 flex gap-1.5 rounded border border-amber-500/40 bg-amber-950/25 px-2 py-1.5 text-[9px] text-amber-200">
+                            <AlertTriangle className="mt-0.5 shrink-0 text-amber-400" size={12} />
+                            <span className="truncate flex-1">{proximityDetails}</span>
+                          </div>
                         )}
+
+                        {robotRuntime?.lastError &&
+                          !(
+                            robotCollisionPresentation &&
+                            isTechnicalCollisionError(robotRuntime.lastError)
+                          ) && (
+                            <p className="mt-2 rounded border border-red-500/30 bg-red-950/25 px-2 py-1 text-[9px] text-red-200">
+                              {robotRuntime.lastError}
+                            </p>
+                          )}
+                        {robotExecution?.lastError &&
+                          !(
+                            robotCollisionPresentation &&
+                            isTechnicalCollisionError(robotExecution.lastError)
+                          ) && (
+                            <p className="mt-2 rounded border border-red-500/30 bg-red-950/25 px-2 py-1 text-[9px] text-red-200">
+                              Execution: {robotExecution.lastError}
+                            </p>
+                          )}
+
+                        <div className="mt-3 grid grid-cols-3 gap-1 pt-2 border-t border-[#2d2d34]/60">
+                          <button
+                            type="button"
+                            disabled={!backendToken}
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              handleSelectBackendRobot(robot, {
+                                switchToConnection: false
+                              })
+                              openSingleFactoryProgram(robot.id)
+                            }}
+                            className="flex items-center justify-center gap-1 rounded bg-violet-600/15 border border-violet-500/30 py-1 text-[9px] font-bold text-violet-300 transition hover:bg-violet-600/30 hover:text-white disabled:opacity-45"
+                            title={`Import và chạy LUA cho ${robot.robotName}`}
+                          >
+                            <FileCode2 size={10} />
+                            LUA
+                          </button>
+
+                          {isRobotRuntimeActive ? (
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                onSimulatorDisconnectRobot(robot.id)
+                              }}
+                              className="flex items-center justify-center rounded bg-amber-600/15 border border-amber-500/30 py-1 text-[9px] font-bold text-amber-300 transition hover:bg-amber-600/30 hover:text-white"
+                              title="Disconnect robot này"
+                            >
+                              Disconnect
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                void onSimulatorConnectRobot(robotSimulatorConfig)
+                              }}
+                              disabled={!canConnectRobot}
+                              className="flex items-center justify-center rounded bg-emerald-600/15 border border-emerald-500/30 py-1 text-[9px] font-bold text-emerald-300 transition hover:bg-emerald-600/30 hover:text-white disabled:opacity-45"
+                              title={
+                                canConnectRobot
+                                  ? 'Connect robot này'
+                                  : 'Nhập Device Secret trong tab Connection trước'
+                              }
+                            >
+                              Connect
+                            </button>
+                          )}
+
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              void handleDeleteBackendRobot(robot)
+                            }}
+                            disabled={deletingRobotId === robot.id || isRobotRuntimeActive}
+                            className="flex items-center justify-center gap-1 rounded bg-red-600/10 border border-red-500/30 py-1 text-[9px] font-bold text-red-300 transition hover:bg-red-600/25 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed"
+                            title={
+                              isRobotRuntimeActive
+                                ? 'Disconnect robot trước khi xóa'
+                                : 'Xóa robot'
+                            }
+                          >
+                            <Trash2 size={10} />
+                            Xóa
+                          </button>
+                        </div>
+
                         {isSelected && workspaceMode === 'factory' && (
                           <div className="mt-3 rounded border border-[#2d2d34] bg-[#080a10] p-2">
                             {isRobotRuntimeActive && (

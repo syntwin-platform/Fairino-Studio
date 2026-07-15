@@ -23,11 +23,18 @@ import {
   endFactoryRunDiagnosticSession,
   recordFactoryRunDiagnostic
 } from './factoryRunDiagnostics'
+import { executionGroupRegistry } from './safety/executionGroupRegistry'
 
 export interface FactoryRunTarget {
   robotId: string
   robotName: string
   companyId: string
+  programKey: string
+}
+
+export interface FactoryRunSourceProgram {
+  key: string
+  program: ValidatedLuaProgram
 }
 
 const TERMINAL_FACTORY_RUN_STATUSES = new Set([
@@ -194,7 +201,7 @@ function getSingleCompanyId(targets: FactoryRunTarget[]): string {
 
 export async function executeFactoryProgramV2(
   context: BackendFactoryRunContext,
-  program: ValidatedLuaProgram,
+  sourcePrograms: FactoryRunSourceProgram[],
   targets: FactoryRunTarget[],
   signal?: AbortSignal
 ): Promise<void> {
@@ -202,10 +209,28 @@ export async function executeFactoryProgramV2(
     throw new Error('No robot was selected.')
   }
 
+  if (sourcePrograms.length === 0) {
+    throw new Error('No LUA program was assigned to the selected robots.')
+  }
+
+  const sourceProgramsByKey = new Map(
+    sourcePrograms.map((sourceProgram) => [sourceProgram.key, sourceProgram])
+  )
+  const missingProgramTarget = targets.find(
+    (target) => !target.programKey || !sourceProgramsByKey.has(target.programKey)
+  )
+
+  if (missingProgramTarget) {
+    throw new Error(
+      `Robot ${missingProgramTarget.robotName} does not have an assigned LUA program.`
+    )
+  }
+
   const store = useFactoryProgramStore.getState()
   const coordinationMode = store.run.coordinationMode
   const failurePolicy = store.run.failurePolicy
   const companyId = getSingleCompanyId(targets)
+  let declaredExecutionGroupId: string | null = null
 
   store.setBusy(true)
   store.setRunMetadata({
@@ -238,6 +263,7 @@ export async function executeFactoryProgramV2(
     recordFactoryRunDiagnostic('factory.create.started', {
       details: {
         targetCount: targets.length,
+        sourceProgramCount: sourcePrograms.length,
         coordinationMode,
         failurePolicy
       }
@@ -248,12 +274,25 @@ export async function executeFactoryProgramV2(
         companyId,
         coordinationMode,
         failurePolicy,
-        programName: program.projectName || program.fileName.replace(/\.lua$/i, ''),
-        luaFileName: program.fileName,
-        luaContent: program.luaContent,
-        robotIds: targets.map((target) => target.robotId)
+        programs: sourcePrograms.map(({ key, program }) => ({
+          key,
+          programName: program.projectName || program.fileName.replace(/\.lua$/i, ''),
+          luaFileName: program.fileName,
+          luaContent: program.luaContent
+        })),
+        targets: targets.map((target) => ({
+          robotId: target.robotId,
+          programKey: target.programKey
+        }))
       },
       signal
+    )
+
+    declaredExecutionGroupId = created.id
+    executionGroupRegistry.setDeclaredGroupMembers(
+      created.id,
+      targets.map((target) => target.robotId),
+      failurePolicy
     )
 
     attachFactoryRunDiagnosticId(created.id)
@@ -362,6 +401,9 @@ export async function executeFactoryProgramV2(
       throw finalError
     }
   } finally {
+    if (declaredExecutionGroupId) {
+      executionGroupRegistry.clearDeclaredGroup(declaredExecutionGroupId)
+    }
     store.setBusy(false)
   }
 }
