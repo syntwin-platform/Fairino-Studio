@@ -15,7 +15,11 @@ import {
   throwIfCommandCancelled
 } from './commandExecutionRuntime'
 import { recordFactoryRunDiagnostic } from './factoryRunDiagnostics'
-import { latchRobotFault, throwIfRobotMotionBlocked } from './robotFaultRuntime'
+import {
+  latchRobotFault,
+  reportSafetyFaultEvent,
+  throwIfRobotMotionBlocked
+} from './robotFaultRuntime'
 const FACTORY_RUN_DEBUG =
   typeof window !== 'undefined' &&
   window.localStorage.getItem('syntwin.factoryRun.debug') === 'true'
@@ -83,6 +87,7 @@ interface PreparedRunProgramExecution {
 interface FactoryRunArmPayload {
   factoryRunId: string
   targetId: string
+  coordinationMode: 'ParallelIndependent' | 'Synchronized'
   failurePolicy: 'IsolateTarget' | 'AbortExecutionGroup'
 }
 
@@ -447,16 +452,25 @@ function parseFactoryRunArmPayload(payload: unknown): FactoryRunArmPayload | nul
   const factoryRunId = typeof payload.factoryRunId === 'string' ? payload.factoryRunId : ''
   const targetId = typeof payload.targetId === 'string' ? payload.targetId : ''
   const syncMode = typeof payload.syncMode === 'string' ? payload.syncMode : ''
+  const coordinationMode =
+    payload.coordinationMode === 'ParallelIndependent'
+      ? 'ParallelIndependent'
+      : payload.coordinationMode === 'Synchronized' || syncMode === 'Barrier'
+        ? 'Synchronized'
+        : syncMode === 'Independent'
+          ? 'ParallelIndependent'
+          : null
   const failurePolicy =
     payload.failurePolicy === 'AbortExecutionGroup' ? 'AbortExecutionGroup' : 'IsolateTarget'
 
-  if (!factoryRunId || !targetId || syncMode !== 'Barrier') {
+  if (!factoryRunId || !targetId || !coordinationMode) {
     return null
   }
 
   return {
     factoryRunId,
     targetId,
+    coordinationMode,
     failurePolicy
   }
 }
@@ -759,6 +773,7 @@ async function executeRunProgram(
 ): Promise<void> {
   const steps = parseRunProgramSteps(payload)
   const armPayload = parseFactoryRunArmPayload(payload)
+  const usesSynchronizedBarrier = armPayload?.coordinationMode === 'Synchronized'
 
   let barrierResponse: FactoryRunArmResponse | null = null
   let preparedProgramExecution: PreparedRunProgramExecution | null = null
@@ -805,49 +820,62 @@ async function executeRunProgram(
         }
       })
 
-      barrierResponse = await waitForFactoryRunBarrierStart(
-        armPayload,
-        preparedProgramExecution.estimatedStepDurationsMs,
-        context,
-        signal,
-        robotId
-      )
+      if (usesSynchronizedBarrier) {
+        barrierResponse = await waitForFactoryRunBarrierStart(
+          armPayload,
+          preparedProgramExecution.estimatedStepDurationsMs,
+          context,
+          signal,
+          robotId
+        )
 
-      const scheduledStartAtUtc = barrierResponse.scheduledStartAtUtc
+        const scheduledStartAtUtc = barrierResponse.scheduledStartAtUtc
 
-      if (!scheduledStartAtUtc) {
-        throw new Error('Factory run barrier became ready without a synchronized start timestamp.')
+        if (!scheduledStartAtUtc) {
+          throw new Error(
+            'Factory run barrier became ready without a synchronized start timestamp.'
+          )
+        }
+
+        const cohortJoinedAtMonotonicMs = performance.now()
+
+        recordFactoryRunDiagnostic('robot.cohort.joined', {
+          factoryRunId: armPayload.factoryRunId,
+          robotId,
+          targetId: armPayload.targetId,
+          details: {
+            expectedParticipantCount: barrierResponse.expectedParticipantCount
+          }
+        })
+
+        stepStartedAtMonotonicMs = await factoryRunLocalStartBarrier.waitForStart(
+          armPayload.factoryRunId,
+          armPayload.targetId,
+          scheduledStartAtUtc,
+          barrierResponse.expectedParticipantCount,
+          signal,
+          armPayload.failurePolicy
+        )
+
+        recordFactoryRunDiagnostic('robot.cohort.released', {
+          factoryRunId: armPayload.factoryRunId,
+          robotId,
+          targetId: armPayload.targetId,
+          durationMs: performance.now() - cohortJoinedAtMonotonicMs,
+          details: {
+            expectedParticipantCount: barrierResponse.expectedParticipantCount
+          }
+        })
+      } else {
+        // Independent targets start from their own monotonic clock. They never
+        // register with the cohort or step coordinators.
+        stepStartedAtMonotonicMs = performance.now()
+        recordFactoryRunDiagnostic('robot.independent.ready', {
+          factoryRunId: armPayload.factoryRunId,
+          robotId,
+          targetId: armPayload.targetId
+        })
       }
-
-      const cohortJoinedAtMonotonicMs = performance.now()
-
-      recordFactoryRunDiagnostic('robot.cohort.joined', {
-        factoryRunId: armPayload.factoryRunId,
-        robotId,
-        targetId: armPayload.targetId,
-        details: {
-          expectedParticipantCount: barrierResponse.expectedParticipantCount
-        }
-      })
-
-      stepStartedAtMonotonicMs = await factoryRunLocalStartBarrier.waitForStart(
-        armPayload.factoryRunId,
-        armPayload.targetId,
-        scheduledStartAtUtc,
-        barrierResponse.expectedParticipantCount,
-        signal,
-        armPayload.failurePolicy
-      )
-
-      recordFactoryRunDiagnostic('robot.cohort.released', {
-        factoryRunId: armPayload.factoryRunId,
-        robotId,
-        targetId: armPayload.targetId,
-        durationMs: performance.now() - cohortJoinedAtMonotonicMs,
-        details: {
-          expectedParticipantCount: barrierResponse.expectedParticipantCount
-        }
-      })
     } else {
       await waitUntilScheduledStart(payload, signal, robotId)
     }
@@ -861,9 +889,10 @@ async function executeRunProgram(
       new Map<number, PreparedMoveLTrajectory>()
 
     if (FACTORY_RUN_DEBUG && armPayload) {
-      console.debug('[FactoryRun] program prepared before synchronized start', {
+      console.debug('[FactoryRun] program prepared before factory execution', {
         robotId,
         factoryRunId: armPayload.factoryRunId,
+        coordinationMode: armPayload.coordinationMode,
         preparedMoveLStepCount: preparedMoveLTrajectoriesByStepIndex.size,
         estimatedStepDurationsMs: preparedProgramExecution?.estimatedStepDurationsMs ?? [],
         sharedStepDurationsMs
@@ -877,7 +906,8 @@ async function executeRunProgram(
       robotId,
       targetId: armPayload?.targetId,
       details: {
-        barrier: Boolean(armPayload)
+        barrier: usesSynchronizedBarrier,
+        coordinationMode: armPayload?.coordinationMode ?? null
       }
     })
 
@@ -902,7 +932,8 @@ async function executeRunProgram(
       console.debug('[FactoryRun] RunProgram started', {
         robotId,
         startedAtUtc: actualStartedAtUtc,
-        barrier: Boolean(armPayload)
+        barrier: usesSynchronizedBarrier,
+        coordinationMode: armPayload?.coordinationMode ?? null
       })
     }
 
@@ -933,7 +964,11 @@ async function executeRunProgram(
           step.stepType === 'MoveTCP' ||
           step.stepType === 'RotateJoint'
 
-        if (armPayload && requiresSharedMotionDuration && sharedDurationMs === undefined) {
+        if (
+          usesSynchronizedBarrier &&
+          requiresSharedMotionDuration &&
+          sharedDurationMs === undefined
+        ) {
           throw new Error(
             `FactoryRun step ${step.orderIndex} (${step.stepType}) ` +
               `does not have a shared motion duration.`
@@ -1036,7 +1071,7 @@ async function executeRunProgram(
           }
         })
 
-        if (armPayload) {
+        if (armPayload && usesSynchronizedBarrier) {
           const stepBarrierResult = await factoryRunStepCoordinator.arriveAtStep({
             factoryRunId: armPayload.factoryRunId,
             participantId: armPayload.targetId,
@@ -1095,16 +1130,20 @@ async function executeRunProgram(
       const reason = `Factory run ${armPayload.factoryRunId}: ${coordinatorError.message}`
 
       if (armPayload.failurePolicy === 'IsolateTarget') {
-        factoryRunLocalStartBarrier.dropParticipant(
-          armPayload.factoryRunId,
-          armPayload.targetId,
-          reason
-        )
-        const activeParticipantCount = factoryRunStepCoordinator.dropParticipant(
-          armPayload.factoryRunId,
-          armPayload.targetId,
-          coordinatorError
-        )
+        let activeParticipantCount: number | null = null
+
+        if (usesSynchronizedBarrier) {
+          factoryRunLocalStartBarrier.dropParticipant(
+            armPayload.factoryRunId,
+            armPayload.targetId,
+            reason
+          )
+          activeParticipantCount = factoryRunStepCoordinator.dropParticipant(
+            armPayload.factoryRunId,
+            armPayload.targetId,
+            coordinatorError
+          )
+        }
 
         if (robotId) {
           cancelActiveCommandForRobot(robotId, reason)
@@ -1116,11 +1155,14 @@ async function executeRunProgram(
           targetId: armPayload.targetId,
           details: {
             activeParticipantCount,
-            failurePolicy: armPayload.failurePolicy
+            failurePolicy: armPayload.failurePolicy,
+            coordinationMode: armPayload.coordinationMode
           }
         })
       } else {
-        factoryRunStepCoordinator.abortRun(armPayload.factoryRunId, coordinatorError)
+        if (usesSynchronizedBarrier) {
+          factoryRunStepCoordinator.abortRun(armPayload.factoryRunId, coordinatorError)
+        }
         cancelActiveCommandsForGroup(armPayload.factoryRunId, reason)
       }
     }
@@ -1135,7 +1177,7 @@ async function executeRunProgram(
 
     throw error
   } finally {
-    if (armPayload && runCompletedSuccessfully) {
+    if (armPayload && usesSynchronizedBarrier && runCompletedSuccessfully) {
       factoryRunStepCoordinator.completeParticipant(armPayload.factoryRunId, armPayload.targetId)
     }
   }
@@ -1331,14 +1373,22 @@ async function executeGripper(
 }
 
 function executeEmergencyStop(robotId: string, commandId: string): void {
-  cancelActiveCommandForRobot(robotId, `Emergency stop requested by command ${commandId}`)
+  const resolution = reportSafetyFaultEvent({
+    type: 'global-estop',
+    rootRobotIds: [robotId],
+    stopScope: 'All',
+    code: 'GLOBAL_ESTOP',
+    message: `Global emergency stop requested by command ${commandId}.`
+  })
 
   const store = useRobotStore.getState()
 
-  store.setRobotExecution(robotId, {
-    isPlaying: false,
-    currentStepIndex: 0
-  })
+  for (const stoppedRobotId of resolution.stopRobotIds) {
+    store.setRobotExecution(stoppedRobotId, {
+      isPlaying: false,
+      currentStepIndex: 0
+    })
+  }
 
   syncGlobalPlayingState()
 }
@@ -1356,7 +1406,8 @@ export async function executeBackendCommand(
   const signal = beginCommandExecutionForRobot(
     command.robotId,
     command.commandId,
-    factoryRunPayload?.factoryRunId
+    factoryRunPayload?.factoryRunId,
+    factoryRunPayload?.failurePolicy
   )
 
   if (command.commandType !== 'RunProgram') {

@@ -36,6 +36,8 @@ interface FactoryProgramStore {
   activeRobotId: string | null
   targetRobotIds: string[]
   program: ValidatedLuaProgram | null
+  programsByKey: Record<string, ValidatedLuaProgram>
+  targetProgramKeyByRobotId: Record<string, string>
   robotStates: Record<string, FactoryRobotProgramState>
   run: FactoryRunMetadata
   isBusy: boolean
@@ -44,6 +46,7 @@ interface FactoryProgramStore {
   openBatch: (robotIds: string[]) => void
   closeModal: () => void
   setProgram: (program: ValidatedLuaProgram | null) => void
+  assignProgramToTargets: (program: ValidatedLuaProgram, robotIds: string[]) => void
   setTargetSelected: (robotId: string, selected: boolean) => void
   setTargets: (robotIds: string[]) => void
   patchRobotState: (robotId: string, openSingle: Partial<FactoryRobotProgramState>) => void
@@ -52,12 +55,90 @@ interface FactoryProgramStore {
   reset: () => void
 }
 
+function createProgramKey(
+  program: ValidatedLuaProgram,
+  programsByKey: Record<string, ValidatedLuaProgram>
+): string {
+  const existingEntry = Object.entries(programsByKey).find(
+    ([, existingProgram]) => existingProgram.luaContent === program.luaContent
+  )
+
+  if (existingEntry) return existingEntry[0]
+
+  let checksum = 2166136261
+
+  for (let index = 0; index < program.luaContent.length; index++) {
+    checksum ^= program.luaContent.charCodeAt(index)
+    checksum = Math.imul(checksum, 16777619)
+  }
+
+  const name = (program.projectName || program.fileName.replace(/\.lua$/i, ''))
+    .replace(/[^a-zA-Z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60)
+  const baseKey = `${name || 'lua-program'}-${(checksum >>> 0).toString(16)}`
+  let candidate = baseKey
+  let suffix = 2
+
+  while (programsByKey[candidate]) {
+    candidate = `${baseKey}-${suffix}`
+    suffix++
+  }
+
+  return candidate
+}
+
+function createProgramAssignmentPatch(
+  state: FactoryProgramStore,
+  program: ValidatedLuaProgram,
+  programKey: string,
+  robotIds: string[]
+): Partial<FactoryProgramStore> {
+  const selectedRobotIds = new Set(state.targetRobotIds)
+  const assignmentTargets = robotIds.filter((robotId) => selectedRobotIds.has(robotId))
+  const targetProgramKeyByRobotId = { ...state.targetProgramKeyByRobotId }
+
+  for (const robotId of assignmentTargets) {
+    targetProgramKeyByRobotId[robotId] = programKey
+  }
+
+  return {
+    program,
+    programsByKey: {
+      ...state.programsByKey,
+      [programKey]: program
+    },
+    targetProgramKeyByRobotId,
+    run: {
+      ...defaultRun,
+      coordinationMode: state.run.coordinationMode,
+      failurePolicy: state.run.failurePolicy
+    },
+    robotStates: Object.fromEntries(
+      Object.entries(state.robotStates).map(([robotId, robotState]) => [
+        robotId,
+        {
+          ...robotState,
+          status: 'idle',
+          readinessErrors: [],
+          programId: undefined,
+          prepareCommandId: undefined,
+          commandId: undefined,
+          message: undefined
+        }
+      ])
+    )
+  }
+}
+
 export const useFactoryProgramStore = create<FactoryProgramStore>((set) => ({
   isModalOpen: false,
   scope: 'single',
   activeRobotId: null,
   targetRobotIds: [],
   program: null,
+  programsByKey: {},
+  targetProgramKeyByRobotId: {},
   robotStates: {},
   run: { ...defaultRun },
   isBusy: false,
@@ -78,6 +159,8 @@ export const useFactoryProgramStore = create<FactoryProgramStore>((set) => ({
         targetRobotIds: [robotId],
         robotStates: { [robotId]: createRobotState(robotId) },
         program: null,
+        programsByKey: {},
+        targetProgramKeyByRobotId: {},
         run: { ...defaultRun },
         isBusy: false
       }
@@ -103,6 +186,8 @@ export const useFactoryProgramStore = create<FactoryProgramStore>((set) => ({
           uniqueIds.map((robotId) => [robotId, createRobotState(robotId)])
         ),
         program: null,
+        programsByKey: {},
+        targetProgramKeyByRobotId: {},
         run: { ...defaultRun },
         isBusy: false
       }
@@ -111,23 +196,31 @@ export const useFactoryProgramStore = create<FactoryProgramStore>((set) => ({
   closeModal: () => set({ isModalOpen: false }),
 
   setProgram: (program) =>
-    set((state) => ({
-      program,
-      run: { ...defaultRun },
-      robotStates: Object.fromEntries(
-        Object.entries(state.robotStates).map(([robotId, robotState]) => [
-          robotId,
-          {
-            ...robotState,
-            status: 'idle',
-            readinessErrors: [],
-            programId: undefined,
-            commandId: undefined,
-            message: undefined
+    set((state) => {
+      if (!program) {
+        return {
+          program: null,
+          programsByKey: {},
+          targetProgramKeyByRobotId: {},
+          run: {
+            ...defaultRun,
+            coordinationMode: state.run.coordinationMode,
+            failurePolicy: state.run.failurePolicy
           }
-        ])
-      )
-    })),
+        }
+      }
+
+      const programKey = createProgramKey(program, state.programsByKey)
+
+      return createProgramAssignmentPatch(state, program, programKey, state.targetRobotIds)
+    }),
+
+  assignProgramToTargets: (program, robotIds) =>
+    set((state) => {
+      const programKey = createProgramKey(program, state.programsByKey)
+
+      return createProgramAssignmentPatch(state, program, programKey, robotIds)
+    }),
 
   setTargetSelected: (robotId, selected) =>
     set((state) => {
@@ -183,6 +276,8 @@ export const useFactoryProgramStore = create<FactoryProgramStore>((set) => ({
       activeRobotId: null,
       targetRobotIds: [],
       program: null,
+      programsByKey: {},
+      targetProgramKeyByRobotId: {},
       robotStates: {},
       run: { ...defaultRun },
       isBusy: false

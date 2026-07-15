@@ -15,16 +15,41 @@ export interface CreateFactoryRunRequest {
   companyId: string
   coordinationMode: FactoryCoordinationMode
   failurePolicy: FactoryFailurePolicy
+  programName?: string
+  luaFileName?: string
+  luaContent?: string
+  robotIds?: string[]
+  programs?: CreateFactoryRunProgramRequest[]
+  targets?: CreateFactoryRunTargetRequest[]
+}
+
+export interface CreateFactoryRunProgramRequest {
+  key: string
   programName: string
   luaFileName: string
   luaContent: string
-  robotIds: string[]
+}
+
+export interface CreateFactoryRunTargetRequest {
+  robotId: string
+  programKey: string
+}
+
+export interface FactoryRunProgramResponse {
+  id: string
+  factoryRunId: string
+  programKey: string
+  programName: string
+  luaFileName: string
+  luaContentHash: string
+  syncPlanHash?: string | null
 }
 
 export interface FactoryRunTargetResponse {
   id: string
   factoryRunId: string
   robotId: string
+  factoryRunProgramId?: string | null
   programId?: string | null
   prepareCommandId?: string | null
   commandId?: string | null
@@ -66,6 +91,7 @@ export interface FactoryRunResponse {
   failureReason?: string | null
   createdAtUtc: string
   updatedAtUtc?: string | null
+  programs?: FactoryRunProgramResponse[]
   targets: FactoryRunTargetResponse[]
 }
 

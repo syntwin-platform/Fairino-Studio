@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
@@ -18,12 +18,15 @@ import {
   registerMoveLRunnerForRobot
 } from '../../services/robotMotionRuntime'
 import { createViewportPerformanceMonitor } from '../../services/viewportPerformanceMonitor'
+import { buildCollisionAlertPresentation } from '../../services/collision/collisionPresentation'
+import { CollisionEngine } from '../../services/collision/collisionEngine'
+import { CollisionScheduler } from '../../services/collision/collisionScheduler'
+import { FAIRINO_FR5_COLLISION_POLICY } from '../../services/collision/collisionTypes'
 import type { MoveLRunOptions, PreparedMoveLTrajectory } from '../../services/robotMotionRuntime'
 import { throwIfCommandCancelled } from '../../services/commandExecutionRuntime'
 import { runScheduledJointTrajectory } from '../../services/factoryMotionScheduler'
 import {
   clearRobotSafetyContact,
-  getRobotSafetyContact,
   removeRobotSafetyState,
   reportRobotSafetyContact,
   throwIfRobotMotionBlocked
@@ -59,9 +62,9 @@ const ROBOT_MODEL_ALIGNMENT = new THREE.Quaternion().setFromEuler(
 
 const ROBOT_MODEL_ALIGNMENT_INVERSE = ROBOT_MODEL_ALIGNMENT.clone().invert()
 const ROBOT_WORLD_UP = new THREE.Vector3(0, 1, 0)
-const COLLISION_CHECK_INTERVAL_MS = 50
-const COLLISION_CONFIRMATION_SAMPLES = 3
-const GROUND_PENETRATION_TOLERANCE_METERS = 0.002
+const PREVIEW_COLLISION_ROBOT_ID = '__viewport_preview_robot__'
+const COLLISION_SCHEDULER_INTERVAL_MS = 1000 / 15
+const MEASUREMENT_SCHEDULER_INTERVAL_MS = 100
 const ROBOT_FAULT_COLOR = 0x7f1d1d
 const ROBOT_FAULT_EMISSIVE = 0xff1f1f
 const ROBOT_PROXIMITY_COLOR = 0x78350f
@@ -94,31 +97,13 @@ type ColorMaterial = THREE.Material & {
 }
 
 interface RobotMaterialSnapshot {
-  material: HighlightableMaterial
+  material: THREE.Material
   originalColor: THREE.Color | null
-  originalEmissive: THREE.Color
-  originalEmissiveIntensity: number
+  originalEmissive: THREE.Color | null
+  originalEmissiveIntensity: number | null
 }
 
 type RobotSafetyVisualState = 'normal' | 'proximity' | 'fault'
-
-interface DetectedRobotCollision {
-  kind: 'ground' | 'self' | 'obstacle'
-  signature: string
-  objectIds: string[]
-  message: string
-}
-
-interface CollisionCandidate {
-  signature: string
-  consecutiveSamples: number
-}
-
-interface LinkLocalPoint {
-  x: number
-  y: number
-  z: number
-}
 
 function isHighlightableMaterial(material: THREE.Material): material is HighlightableMaterial {
   return (
@@ -130,6 +115,67 @@ function isHighlightableMaterial(material: THREE.Material): material is Highligh
 
 function isColorMaterial(material: THREE.Material): material is ColorMaterial {
   return 'color' in material && material.color instanceof THREE.Color
+}
+
+function createWarningCircle(color: number): THREE.Mesh {
+  const geometry = new THREE.RingGeometry(0.32, 0.38, 64)
+  const material = new THREE.MeshBasicMaterial({
+    color: color,
+    side: THREE.DoubleSide,
+    transparent: true,
+    opacity: 0.6,
+    depthWrite: false
+  })
+  const mesh = new THREE.Mesh(geometry, material)
+  mesh.rotation.x = -Math.PI / 2
+  return mesh
+}
+
+function createWarningSprite(color: string, isCollision: boolean): THREE.Sprite {
+  const canvas = document.createElement('canvas')
+  canvas.width = 128
+  canvas.height = 128
+  const ctx = canvas.getContext('2d')
+  if (ctx) {
+    ctx.clearRect(0, 0, 128, 128)
+    if (isCollision) {
+      ctx.beginPath()
+      ctx.arc(64, 64, 55, 0, 2 * Math.PI)
+      ctx.fillStyle = color
+      ctx.fill()
+      ctx.lineWidth = 6
+      ctx.strokeStyle = '#ffffff'
+      ctx.stroke()
+
+      ctx.font = 'bold 75px sans-serif'
+      ctx.fillStyle = '#ffffff'
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.fillText('!', 64, 64)
+    } else {
+      ctx.beginPath()
+      ctx.moveTo(64, 10)
+      ctx.lineTo(118, 110)
+      ctx.lineTo(10, 110)
+      ctx.closePath()
+      ctx.fillStyle = color
+      ctx.fill()
+      ctx.lineWidth = 6
+      ctx.strokeStyle = '#ffffff'
+      ctx.stroke()
+
+      ctx.font = 'bold 60px sans-serif'
+      ctx.fillStyle = '#000000'
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.fillText('!', 64, 68)
+    }
+  }
+  const texture = new THREE.CanvasTexture(canvas)
+  const material = new THREE.SpriteMaterial({ map: texture, transparent: true })
+  const sprite = new THREE.Sprite(material)
+  sprite.scale.set(0.28, 0.28, 1)
+  return sprite
 }
 
 function waitForMoveLFrame(milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -214,20 +260,29 @@ const SELF_COLLISION_PAIRS = [
   { a: 'forearm_link', b: 'wrist3_link' }
 ]
 
+export interface SafetyVisualHelper {
+  warningCircle?: THREE.Mesh
+  warningSprite?: THREE.Sprite
+}
+
 export default function Viewport3D(): React.JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null)
   const robotRef = useRef<FairinoRobotObject | null>(null)
   const robotRefs = useRef<Map<string, FairinoRobotObject>>(new Map())
+  const collisionEngineRef = useRef<CollisionEngine | null>(null)
+  const collisionSchedulerRef = useRef<CollisionScheduler | null>(null)
+  const sceneGenerationRef = useRef(0)
+  const robotLoadGenerationByIdRef = useRef<Map<string, number>>(new Map())
+  const objectLoadGenerationByIdRef = useRef<Map<string, number>>(new Map())
   const robotMaterialSnapshotsByRobotIdRef = useRef<Map<string, RobotMaterialSnapshot[]>>(new Map())
   const robotSafetyVisualStateByRobotIdRef = useRef<Map<string, RobotSafetyVisualState>>(new Map())
-  const lastCollisionCheckAtMsRef = useRef(0)
-  const collisionCandidateByRobotIdRef = useRef<Map<string, CollisionCandidate>>(new Map())
-  const groundVerticesByLinkNameRef = useRef<Map<string, readonly LinkLocalPoint[]>>(new Map())
+  const safetyHelpersRef = useRef<Map<string, SafetyVisualHelper>>(new Map())
   const moveLRunnerUnregisterByRobotIdRef = useRef<Map<string, () => void>>(new Map())
   const previewRobotRef = useRef<FairinoRobotObject | null>(null)
   const previewRobotLoadingRef = useRef(false)
   const previewRobotLoadGenerationRef = useRef(0)
   const loadingRobotIdsRef = useRef<Set<string>>(new Set())
+  const loadingObjectIdsRef = useRef<Set<string>>(new Set())
   const robotsRef = useRef<RobotInstance[]>([])
   const sceneRef = useRef<THREE.Scene | null>(null)
   const controlsRef = useRef<OrbitControls | null>(null)
@@ -239,6 +294,7 @@ export default function Viewport3D(): React.JSX.Element {
   const hitboxHelpersRef = useRef<THREE.LineSegments[]>([])
   const keysPressedRef = useRef<Set<string>>(new Set())
   const [isRobotLoaded, setIsRobotLoaded] = useState(false)
+  const [isTechnicalDetailsExpanded, setIsTechnicalDetailsExpanded] = useState(false)
 
   // Helper to dispose robot 3D geometries and materials
   function disposeRobotObject(robotObj: THREE.Object3D): void {
@@ -277,14 +333,21 @@ export default function Viewport3D(): React.JSX.Element {
       child.material = Array.isArray(child.material) ? clonedMaterials : clonedMaterials[0]
 
       for (const material of clonedMaterials) {
-        if (!isHighlightableMaterial(material) || snapshottedMaterials.has(material)) continue
+        if (
+          (!isColorMaterial(material) && !isHighlightableMaterial(material)) ||
+          snapshottedMaterials.has(material)
+        ) {
+          continue
+        }
         snapshottedMaterials.add(material)
 
         snapshots.push({
           material,
           originalColor: isColorMaterial(material) ? material.color.clone() : null,
-          originalEmissive: material.emissive.clone(),
-          originalEmissiveIntensity: material.emissiveIntensity
+          originalEmissive: isHighlightableMaterial(material) ? material.emissive.clone() : null,
+          originalEmissiveIntensity: isHighlightableMaterial(material)
+            ? material.emissiveIntensity
+            : null
         })
       }
     })
@@ -300,12 +363,35 @@ export default function Viewport3D(): React.JSX.Element {
   function removeRobotMaterialCache(robotId: string): void {
     robotMaterialSnapshotsByRobotIdRef.current.delete(robotId)
     robotSafetyVisualStateByRobotIdRef.current.delete(robotId)
+
+    const helpers = safetyHelpersRef.current.get(robotId)
+    if (helpers) {
+      const scene = sceneRef.current
+      if (scene) {
+        if (helpers.warningCircle) {
+          scene.remove(helpers.warningCircle)
+          helpers.warningCircle.geometry.dispose()
+          if (Array.isArray(helpers.warningCircle.material)) {
+            helpers.warningCircle.material.forEach((m) => m.dispose())
+          } else {
+            helpers.warningCircle.material.dispose()
+          }
+        }
+        if (helpers.warningSprite) {
+          scene.remove(helpers.warningSprite)
+          helpers.warningSprite.material.map?.dispose()
+          helpers.warningSprite.material.dispose()
+        }
+      }
+      safetyHelpersRef.current.delete(robotId)
+    }
   }
 
   function getRobotSafetyVisualState(robotId: string): RobotSafetyVisualState {
     const sceneState = useSceneStore.getState()
-    if (sceneState.robotFaultsById[robotId]?.active) return 'fault'
-    if (sceneState.robotContactsById[robotId]?.level === 'proximity') return 'proximity'
+    const contactLevel = sceneState.robotContactsById[robotId]?.level
+    if (contactLevel === 'collision') return 'fault'
+    if (contactLevel === 'proximity') return 'proximity'
 
     return 'normal'
   }
@@ -317,29 +403,113 @@ export default function Viewport3D(): React.JSX.Element {
     const nextState = getRobotSafetyVisualState(robotId)
     if (!force && robotSafetyVisualStateByRobotIdRef.current.get(robotId) === nextState) return
 
+    const scene = sceneRef.current
+
     for (const snapshot of snapshots) {
       if (snapshot.originalColor && isColorMaterial(snapshot.material)) {
         snapshot.material.color.copy(snapshot.originalColor)
       }
 
-      snapshot.material.emissive.copy(snapshot.originalEmissive)
-      snapshot.material.emissiveIntensity = snapshot.originalEmissiveIntensity
+      if (
+        snapshot.originalEmissive &&
+        snapshot.originalEmissiveIntensity !== null &&
+        isHighlightableMaterial(snapshot.material)
+      ) {
+        snapshot.material.emissive.copy(snapshot.originalEmissive)
+        snapshot.material.emissiveIntensity = snapshot.originalEmissiveIntensity
+      }
 
       if (nextState === 'fault') {
         if (isColorMaterial(snapshot.material)) {
           snapshot.material.color.setHex(ROBOT_FAULT_COLOR)
         }
-        snapshot.material.emissive.setHex(ROBOT_FAULT_EMISSIVE)
-        snapshot.material.emissiveIntensity = 1.35
+        if (isHighlightableMaterial(snapshot.material)) {
+          snapshot.material.emissive.setHex(ROBOT_FAULT_EMISSIVE)
+          snapshot.material.emissiveIntensity = 1.35
+        }
       } else if (nextState === 'proximity') {
         if (isColorMaterial(snapshot.material)) {
           snapshot.material.color.setHex(ROBOT_PROXIMITY_COLOR)
         }
-        snapshot.material.emissive.setHex(ROBOT_PROXIMITY_EMISSIVE)
-        snapshot.material.emissiveIntensity = 0.85
+        if (isHighlightableMaterial(snapshot.material)) {
+          snapshot.material.emissive.setHex(ROBOT_PROXIMITY_EMISSIVE)
+          snapshot.material.emissiveIntensity = 0.85
+        }
       }
 
       snapshot.material.needsUpdate = true
+    }
+
+    if (scene) {
+      let helpers = safetyHelpersRef.current.get(robotId)
+      const prevState = robotSafetyVisualStateByRobotIdRef.current.get(robotId)
+
+      if (nextState === 'normal' || (helpers && prevState !== nextState)) {
+        if (helpers) {
+          if (helpers.warningCircle) {
+            scene.remove(helpers.warningCircle)
+            helpers.warningCircle.geometry.dispose()
+            if (Array.isArray(helpers.warningCircle.material)) {
+              helpers.warningCircle.material.forEach((m) => m.dispose())
+            } else {
+              helpers.warningCircle.material.dispose()
+            }
+          }
+          if (helpers.warningSprite) {
+            scene.remove(helpers.warningSprite)
+            helpers.warningSprite.material.map?.dispose()
+            helpers.warningSprite.material.dispose()
+          }
+          safetyHelpersRef.current.delete(robotId)
+          helpers = undefined
+        }
+      }
+
+      if (nextState !== 'normal') {
+        const isCollision = nextState === 'fault'
+        const circleColor = isCollision ? 0xff1f1f : 0xf59e0b
+        const spriteColor = isCollision ? '#ff1f1f' : '#f59e0b'
+
+        if (!helpers) {
+          const warningCircle = createWarningCircle(circleColor)
+          const warningSprite = isCollision ? createWarningSprite(spriteColor, true) : undefined
+
+          const robot =
+            robotId === PREVIEW_COLLISION_ROBOT_ID
+              ? previewRobotRef.current
+              : robotRefs.current.get(robotId)
+          if (robot) {
+            warningCircle.position.copy(robot.position)
+            warningCircle.position.y += 0.01
+            scene.add(warningCircle)
+
+            if (warningSprite) {
+              warningSprite.position.copy(robot.position)
+              warningSprite.position.y += 1.1
+              scene.add(warningSprite)
+            }
+
+            safetyHelpersRef.current.set(robotId, { warningCircle, warningSprite })
+          }
+        } else {
+          const robot =
+            robotId === PREVIEW_COLLISION_ROBOT_ID
+              ? previewRobotRef.current
+              : robotRefs.current.get(robotId)
+          if (robot) {
+            if (helpers.warningCircle) {
+              helpers.warningCircle.visible = robot.visible
+              helpers.warningCircle.position.copy(robot.position)
+              helpers.warningCircle.position.y += 0.01
+            }
+            if (helpers.warningSprite) {
+              helpers.warningSprite.visible = robot.visible
+              helpers.warningSprite.position.copy(robot.position)
+              helpers.warningSprite.position.y += 1.1
+            }
+          }
+        }
+      }
     }
 
     robotSafetyVisualStateByRobotIdRef.current.set(robotId, nextState)
@@ -368,6 +538,7 @@ export default function Viewport3D(): React.JSX.Element {
   const selectedJointName = useRobotStore((state) => state.selectedJointName)
   const steps = useRobotStore((state) => state.steps)
   const robots = useRobotStore((state) => state.robots)
+  const language = useRobotStore((state) => state.language)
   const selectedRobotId = useRobotStore((state) => state.selectedRobotId)
   const workspaceMode = useRobotStore((state) => state.workspaceMode)
   const selectedRobot = robots.find((robot) => robot.id === selectedRobotId) ?? null
@@ -375,9 +546,58 @@ export default function Viewport3D(): React.JSX.Element {
 
   const objects = useSceneStore((state) => state.objects)
   const selectedObjectId = useSceneStore((state) => state.selectedObjectId)
-  const collisionWarning = useSceneStore((state) => state.collisionWarning)
   const robotFaultsById = useSceneStore((state) => state.robotFaultsById)
   const robotContactsById = useSceneStore((state) => state.robotContactsById)
+  const collisionAlert = useMemo(
+    () =>
+      buildCollisionAlertPresentation(
+        robots.map((robot) => ({ id: robot.id, name: robot.name })),
+        robotContactsById,
+        robotFaultsById,
+        language
+      ),
+    [language, robotContactsById, robotFaultsById, robots]
+  )
+
+  const getTechnicalInfoSummary = (): string => {
+    const sceneState = useSceneStore.getState()
+    const lines: string[] = []
+
+    for (const [id, contact] of Object.entries(sceneState.robotContactsById)) {
+      lines.push(`[Contact] Robot: ${id}`)
+      lines.push(`  Level: ${contact.level}`)
+      lines.push(`  Kind: ${contact.kind}`)
+      if (contact.counterpartRobotIds.length > 0) {
+        lines.push(`  Counterparts: ${contact.counterpartRobotIds.join(', ')}`)
+      }
+      if (contact.objectIds.length > 0) {
+        lines.push(`  Objects: ${contact.objectIds.join(', ')}`)
+      }
+      if (contact.message) {
+        lines.push(`  Message: ${contact.message}`)
+      }
+    }
+
+    for (const [id, fault] of Object.entries(sceneState.robotFaultsById)) {
+      if (fault.active) {
+        lines.push(`[Fault] Robot: ${id}`)
+        lines.push(`  Kind: ${fault.kind}`)
+        lines.push(`  Code: ${fault.code}`)
+        lines.push(`  Message: ${fault.message}`)
+      }
+    }
+
+    return (
+      lines.join('\n') ||
+      (language === 'vi' ? 'Không có chi tiết kỹ thuật' : 'No technical details available')
+    )
+  }
+
+  useEffect(() => {
+    if (!collisionAlert) {
+      setIsTechnicalDetailsExpanded(false)
+    }
+  }, [collisionAlert])
 
   // Sync robots to ref for async loader check
   useEffect(() => {
@@ -406,6 +626,7 @@ export default function Viewport3D(): React.JSX.Element {
     for (const robotId of robotRefs.current.keys()) {
       applyRobotSafetyVisual(robotId)
     }
+    if (previewRobotRef.current) applyRobotSafetyVisual(PREVIEW_COLLISION_ROBOT_ID)
 
     if (selectedRobotId && getRobotSafetyVisualState(selectedRobotId) === 'normal') {
       highlightJointLink(selectedJointName)
@@ -1104,89 +1325,6 @@ export default function Viewport3D(): React.JSX.Element {
     return new OBB(worldCenter, halfSize, rotMat)
   }
 
-  // OBB is intentionally used only as a cheap broad phase. For the ground plane,
-  // a rotated OBB can extend below the real mesh and produce a false collision.
-  // Cache the real link vertices in link-local coordinates and evaluate them only
-  // when the OBB reports a possible penetration.
-  const getLinkLocalGroundVertices = (
-    linkName: string,
-    linkObj: THREE.Object3D,
-    allLinkObjs: Set<THREE.Object3D>
-  ): readonly LinkLocalPoint[] => {
-    const cacheKey = linkName.toLowerCase()
-    const cached = groundVerticesByLinkNameRef.current.get(cacheKey)
-    if (cached) return cached
-
-    const invLinkMatrix = new THREE.Matrix4().copy(linkObj.matrixWorld).invert()
-    const localPoint = new THREE.Vector3()
-    const uniquePoints = new Map<string, LinkLocalPoint>()
-
-    const collectVertices = (node: THREE.Object3D): void => {
-      if (node !== linkObj && allLinkObjs.has(node)) return
-
-      if (node instanceof THREE.Mesh && node.geometry) {
-        const position = node.geometry.getAttribute('position')
-
-        if (position) {
-          const meshToLink = new THREE.Matrix4().multiplyMatrices(invLinkMatrix, node.matrixWorld)
-
-          for (let index = 0; index < position.count; index++) {
-            localPoint
-              .set(position.getX(index), position.getY(index), position.getZ(index))
-              .applyMatrix4(meshToLink)
-
-            // STL repeats vertices for every triangle. Quantizing to one micrometre
-            // removes duplicates and keeps the narrow phase inexpensive.
-            const key =
-              `${Math.round(localPoint.x * 1_000_000)}:` +
-              `${Math.round(localPoint.y * 1_000_000)}:` +
-              `${Math.round(localPoint.z * 1_000_000)}`
-
-            if (!uniquePoints.has(key)) {
-              uniquePoints.set(key, {
-                x: localPoint.x,
-                y: localPoint.y,
-                z: localPoint.z
-              })
-            }
-          }
-        }
-      }
-
-      for (const child of node.children) {
-        collectVertices(child)
-      }
-    }
-
-    collectVertices(linkObj)
-
-    const vertices = [...uniquePoints.values()]
-    groundVerticesByLinkNameRef.current.set(cacheKey, vertices)
-    return vertices
-  }
-
-  const getExactLinkMinimumWorldY = (
-    linkName: string,
-    linkObj: THREE.Object3D,
-    allLinkObjs: Set<THREE.Object3D>
-  ): number => {
-    const vertices = getLinkLocalGroundVertices(linkName, linkObj, allLinkObjs)
-    if (vertices.length === 0) return Infinity
-
-    const elements = linkObj.matrixWorld.elements
-    let minimumY = Infinity
-
-    // Matrix4 is column-major. Computing only the Y component avoids allocating
-    // thousands of Vector3 objects during the collision loop.
-    for (const point of vertices) {
-      const worldY =
-        elements[1] * point.x + elements[5] * point.y + elements[9] * point.z + elements[13]
-      minimumY = Math.min(minimumY, worldY)
-    }
-
-    return minimumY
-  }
-
   // Calculate approximate closest points between two OBBs using iterative clamp
   const getOBBDistance = (obbA: OBB, obbB: OBB): ObbDistanceResult => {
     const pointB = new THREE.Vector3()
@@ -1383,6 +1521,8 @@ export default function Viewport3D(): React.JSX.Element {
     if (!containerRef.current) return
 
     const container = containerRef.current
+    const sceneGeneration = sceneGenerationRef.current + 1
+    sceneGenerationRef.current = sceneGeneration
     const width = Math.max(1, container.clientWidth)
     const height = Math.max(1, container.clientHeight)
 
@@ -2198,7 +2338,114 @@ export default function Viewport3D(): React.JSX.Element {
       }
     }
 
-    // Animation Loop
+    const collisionEngine = new CollisionEngine({
+      getSnapshot: () => {
+        const sceneState = useSceneStore.getState()
+        const robotState = useRobotStore.getState()
+        const currentWorkspaceMode = robotState.workspaceMode
+        const sceneObjectsById = new Map(
+          sceneState.objects.map((sceneObject) => [sceneObject.id, sceneObject])
+        )
+        const collisionRobots = Array.from(robotRefs.current.entries())
+          .filter(([, robot]) => robot.visible)
+          .map(([robotId, robot]) => ({
+            robotId,
+            object: robot,
+            links: robot.links as Record<string, THREE.Object3D>,
+            visible: robot.visible,
+            monitoringMode:
+              currentWorkspaceMode === 'train'
+                ? ('training-preview' as const)
+                : robotState.robotRuntimeById[robotId]?.isConnected ||
+                    robotState.robotRuntimeById[robotId]?.isRunning
+                  ? ('factory-active' as const)
+                  : ('factory-static' as const)
+          }))
+
+        if (collisionRobots.length === 0 && previewRobotRef.current?.visible) {
+          collisionRobots.push({
+            robotId: PREVIEW_COLLISION_ROBOT_ID,
+            object: previewRobotRef.current,
+            links: previewRobotRef.current.links as Record<string, THREE.Object3D>,
+            visible: true,
+            monitoringMode: 'training-preview' as const
+          })
+        }
+
+        return {
+          robots: collisionRobots,
+          obstacles: Array.from(loadedObjectsRef.current.entries()).map(([objectId, object]) => ({
+            objectId,
+            object,
+            visible: sceneObjectsById.get(objectId)?.visible ?? false,
+            transformRevision: sceneState.objectTransformRevisionById[objectId] ?? 0
+          }))
+        }
+      },
+      getRobotPolicy: () => FAIRINO_FR5_COLLISION_POLICY,
+      onContactTransition: ({ robotId, monitoringMode, observation }) => {
+        if (observation) {
+          reportRobotSafetyContact(
+            robotId,
+            {
+              level: observation.level,
+              kind: observation.kind,
+              counterpartRobotIds: observation.counterpartRobotIds,
+              objectIds: observation.objectIds,
+              message: observation.message
+            },
+            {
+              triggerSafetyAction: monitoringMode === 'factory-active',
+              forceSafetyAction: monitoringMode === 'factory-active'
+            }
+          )
+          return
+        }
+
+        const currentContact = useSceneStore.getState().robotContactsById[robotId]
+        if (
+          currentContact &&
+          ['ground', 'self', 'obstacle', 'robot'].includes(currentContact.kind)
+        ) {
+          clearRobotSafetyContact(robotId)
+        }
+      }
+    })
+    collisionEngineRef.current = collisionEngine
+
+    const collisionScheduler = new CollisionScheduler({
+      intervalMs: COLLISION_SCHEDULER_INTERVAL_MS,
+      tick: () => {
+        const stageStartedAtMs = viewportPerformance.beginStage()
+        collisionEngine.tick()
+        viewportPerformance.endStage('collision', stageStartedAtMs)
+      },
+      onError: (error) => console.error('[Viewport3D] Collision scheduler failed.', error)
+    })
+    collisionSchedulerRef.current = collisionScheduler
+    const measurementScheduler = new CollisionScheduler({
+      intervalMs: MEASUREMENT_SCHEDULER_INTERVAL_MS,
+      tick: () => {
+        const stageStartedAtMs = viewportPerformance.beginStage()
+        updateMeasurementAndHitboxes()
+        viewportPerformance.endStage('measurement', stageStartedAtMs)
+      },
+      onError: (error) => console.error('[Viewport3D] Measurement scheduler failed.', error)
+    })
+    collisionScheduler.start()
+    measurementScheduler.start()
+    const unsubscribeRobotRuntime = useRobotStore.subscribe((state, previousState) => {
+      const activeRobotAdded = Object.entries(state.robotRuntimeById).some(([robotId, runtime]) => {
+        const wasActive = Boolean(
+          previousState.robotRuntimeById[robotId]?.isConnected ||
+          previousState.robotRuntimeById[robotId]?.isRunning
+        )
+        return (runtime.isConnected || runtime.isRunning) && !wasActive
+      })
+      if (activeRobotAdded) collisionScheduler.requestImmediateTick()
+    })
+
+    // Animation Loop: camera and drawing only. Collision/measurement have independent budgets.
     let animationFrameId: number
     // Real-time camera navigation via WASD keys on horizontal plane
     const updateWASDNavigation = (): void => {
@@ -2240,15 +2487,34 @@ export default function Viewport3D(): React.JSX.Element {
 
       updateWASDNavigation()
 
-      let stageStartedAtMs = viewportPerformance.beginStage()
-      checkCollisions(frameTimestampMs)
-      viewportPerformance.endStage('collision', stageStartedAtMs)
+      if (safetyHelpersRef.current) {
+        const time = frameTimestampMs * 0.003
+        for (const [id, helpers] of safetyHelpersRef.current.entries()) {
+          const robot =
+            id === PREVIEW_COLLISION_ROBOT_ID ? previewRobotRef.current : robotRefs.current.get(id)
+          if (robot && robot.visible) {
+            if (helpers.warningCircle) {
+              helpers.warningCircle.position.copy(robot.position)
+              helpers.warningCircle.position.y += 0.01
 
-      stageStartedAtMs = viewportPerformance.beginStage()
-      updateMeasurementAndHitboxes()
-      viewportPerformance.endStage('measurement', stageStartedAtMs)
+              const pulse = Math.sin(time * 2.0) * 0.5 + 0.5
+              helpers.warningCircle.scale.setScalar(1.0 + pulse * 0.15)
+              if (!Array.isArray(helpers.warningCircle.material)) {
+                helpers.warningCircle.material.opacity = 0.35 + pulse * 0.35
+              }
+            }
+            if (helpers.warningSprite) {
+              helpers.warningSprite.position.copy(robot.position)
+              helpers.warningSprite.position.y += 1.1
 
-      stageStartedAtMs = viewportPerformance.beginStage()
+              const floatOffset = Math.sin(time * 2.5) * 0.04
+              helpers.warningSprite.position.y += floatOffset
+            }
+          }
+        }
+      }
+
+      const stageStartedAtMs = viewportPerformance.beginStage()
       renderer.render(scene, camera)
       viewportPerformance.endStage('render', stageStartedAtMs)
 
@@ -2283,16 +2549,63 @@ export default function Viewport3D(): React.JSX.Element {
 
     const robotMaterialSnapshots = robotMaterialSnapshotsByRobotIdRef.current
     const robotSafetyVisualStates = robotSafetyVisualStateByRobotIdRef.current
-    const collisionCandidates = collisionCandidateByRobotIdRef.current
-    const groundVerticesByLinkName = groundVerticesByLinkNameRef.current
-
+    const loadedRobots = robotRefs.current
+    const loadingRobotIds = loadingRobotIdsRef.current
+    const loadedObjects = loadedObjectsRef.current
+    const loadingObjectIds = loadingObjectIdsRef.current
+    const safetyHelpers = safetyHelpersRef.current
     // Clean up
     return () => {
-      if (sceneRef.current === scene) {
+      const ownsCurrentScene =
+        sceneRef.current === scene && sceneGenerationRef.current === sceneGeneration
+
+      if (ownsCurrentScene) sceneGenerationRef.current += 1
+      cancelAnimationFrame(animationFrameId)
+      collisionScheduler.stop()
+      if (collisionSchedulerRef.current === collisionScheduler) {
+        collisionSchedulerRef.current = null
+      }
+      measurementScheduler.stop()
+      unsubscribeRobotRuntime()
+      // StrictMode performs an internal setup -> cleanup -> setup cycle before async models load.
+      // Avoid publishing a fake clear for that empty scene, but clear real contacts if a populated
+      // scene is genuinely replaced (for example by hot reload or component unmount).
+      collisionEngine.dispose({
+        emitClearTransitions: loadedRobots.size > 0 || Boolean(previewRobotRef.current)
+      })
+      if (collisionEngineRef.current === collisionEngine) collisionEngineRef.current = null
+      resizeObserver.disconnect()
+
+      if (ownsCurrentScene) {
+        previewRobotLoadGenerationRef.current += 1
+        previewRobotLoadingRef.current = false
+        loadingRobotIds.clear()
+        loadingObjectIds.clear()
+
+        for (const [robotId, robot] of loadedRobots) {
+          scene.remove(robot)
+          removeRobotMaterialCache(robotId)
+          unregisterLoadedRobotMoveLRunner(robotId)
+          disposeRobotObject(robot)
+        }
+        loadedRobots.clear()
+
+        const previewRobot = previewRobotRef.current
+        if (previewRobot) {
+          scene.remove(previewRobot)
+          removeRobotMaterialCache(PREVIEW_COLLISION_ROBOT_ID)
+          disposeRobotObject(previewRobot)
+        }
+        previewRobotRef.current = null
+        robotRef.current = null
+
+        for (const object of loadedObjects.values()) {
+          scene.remove(object)
+          disposeRobotObject(object)
+        }
+        loadedObjects.clear()
         sceneRef.current = null
       }
-      cancelAnimationFrame(animationFrameId)
-      resizeObserver.disconnect()
 
       window.removeEventListener('keydown', handleKeyDown)
       window.removeEventListener('keyup', handleKeyUp)
@@ -2301,8 +2614,7 @@ export default function Viewport3D(): React.JSX.Element {
       transformControls.dispose()
       robotMaterialSnapshots.clear()
       robotSafetyVisualStates.clear()
-      collisionCandidates.clear()
-      groundVerticesByLinkName.clear()
+      safetyHelpers.clear()
       if (container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement)
       }
@@ -2311,229 +2623,115 @@ export default function Viewport3D(): React.JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  function detectRobotCollision(
-    robot: FairinoRobotObject,
-    activeObjects: readonly { id: string; box: THREE.Box3 }[]
-  ): DetectedRobotCollision | null {
-    const allLinkObjects = new Set<THREE.Object3D>(
-      Object.values(robot.links as Record<string, THREE.Object3D>)
-    )
-    const linkObbs = new Map<string, OBB>()
-
-    for (const [name, linkObject] of Object.entries(
-      robot.links as Record<string, THREE.Object3D>
-    )) {
-      const obb = computeLinkOBB(linkObject, allLinkObjects)
-      if (obb) linkObbs.set(name, obb)
-    }
-
-    const groundIgnoredLinks = ['base_link', 'shoulder_link']
-    for (const [linkName, obb] of linkObbs) {
-      if (groundIgnoredLinks.some((value) => linkName.toLowerCase().includes(value))) continue
-
-      const { center, halfSize, rotation } = obb
-      let minimumY = Infinity
-
-      for (const sx of [-1, 1])
-        for (const sy of [-1, 1])
-          for (const sz of [-1, 1]) {
-            const corner = new THREE.Vector3(sx * halfSize.x, sy * halfSize.y, sz * halfSize.z)
-              .applyMatrix3(rotation)
-              .add(center)
-            minimumY = Math.min(minimumY, corner.y)
-          }
-
-      if (minimumY < -GROUND_PENETRATION_TOLERANCE_METERS) {
-        const exactMinimumY = getExactLinkMinimumWorldY(
-          linkName,
-          robot.links[linkName],
-          allLinkObjects
-        )
-
-        if (exactMinimumY >= -GROUND_PENETRATION_TOLERANCE_METERS) {
-          continue
-        }
-
-        return {
-          kind: 'ground',
-          signature: `ground:${linkName}`,
-          objectIds: [],
-          message: `Robot link ${linkName} intersects the ground safety plane (confirmed mesh contact).`
-        }
-      }
-    }
-
-    for (const pair of SELF_COLLISION_PAIRS) {
-      let firstObb: OBB | undefined
-      let secondObb: OBB | undefined
-
-      for (const [linkName, obb] of linkObbs) {
-        const normalizedLinkName = linkName.toLowerCase()
-        if (normalizedLinkName.includes(pair.a)) firstObb = obb
-        if (normalizedLinkName.includes(pair.b)) secondObb = obb
-      }
-
-      if (firstObb && secondObb && firstObb.intersectsOBB(secondObb)) {
-        return {
-          kind: 'self',
-          signature: `self:${pair.a}:${pair.b}`,
-          objectIds: [],
-          message: `Robot self-collision detected between ${pair.a} and ${pair.b}.`
-        }
-      }
-    }
-
-    for (const activeObject of activeObjects) {
-      for (const [linkName, obb] of linkObbs) {
-        if (linkName.toLowerCase().includes('base_link')) continue
-
-        if (obb.intersectsBox3(activeObject.box)) {
-          return {
-            kind: 'obstacle',
-            signature: `obstacle:${linkName}:${activeObject.id}`,
-            objectIds: [activeObject.id],
-            message: `Robot link ${linkName} collided with scene object ${activeObject.id}.`
-          }
-        }
-      }
-    }
-
-    return null
-  }
-
-  // Compatibility collision pass. Phase 7 replaces this with cached broad/narrow phases.
-  function checkCollisions(frameTimestampMs: number): void {
-    if (frameTimestampMs - lastCollisionCheckAtMsRef.current < COLLISION_CHECK_INTERVAL_MS) {
-      return
-    }
-    lastCollisionCheckAtMsRef.current = frameTimestampMs
-
-    const sceneState = useSceneStore.getState()
-    const activeObjects = Array.from(loadedObjectsRef.current.entries())
-      .map(([id, object]) => ({
-        id,
-        object,
-        sceneObject: sceneState.objects.find((candidate) => candidate.id === id)
-      }))
-      .filter((entry) => entry.sceneObject?.visible)
-      .map((entry) => ({ id: entry.id, box: new THREE.Box3().setFromObject(entry.object) }))
-
-    const visibleRobots = Array.from(robotRefs.current.entries()).filter(
-      ([, robot]) => robot.visible
-    )
-    const visibleRobotIds = new Set(visibleRobots.map(([robotId]) => robotId))
-
-    for (const robotId of collisionCandidateByRobotIdRef.current.keys()) {
-      if (!visibleRobotIds.has(robotId)) {
-        collisionCandidateByRobotIdRef.current.delete(robotId)
-      }
-    }
-
-    for (const [robotId, robot] of visibleRobots) {
-      const collision = detectRobotCollision(robot, activeObjects)
-
-      if (collision) {
-        const signature = collision.signature
-        const previousCandidate = collisionCandidateByRobotIdRef.current.get(robotId)
-        const consecutiveSamples =
-          previousCandidate?.signature === signature ? previousCandidate.consecutiveSamples + 1 : 1
-
-        collisionCandidateByRobotIdRef.current.set(robotId, {
-          signature,
-          consecutiveSamples
-        })
-
-        if (consecutiveSamples < COLLISION_CONFIRMATION_SAMPLES) {
-          continue
-        }
-
-        reportRobotSafetyContact(robotId, {
-          level: 'collision',
-          kind: collision.kind,
-          objectIds: collision.objectIds,
-          message: collision.message
-        })
-        continue
-      }
-
-      collisionCandidateByRobotIdRef.current.delete(robotId)
-
-      const currentContact = getRobotSafetyContact(robotId)
-      if (
-        currentContact?.level === 'collision' &&
-        ['ground', 'self', 'obstacle'].includes(currentContact.kind)
-      ) {
-        clearRobotSafetyContact(robotId)
-      }
-    }
-
-    // Preserve the local preview warning display without using it as an execution decision.
-    if (visibleRobots.length === 0 && previewRobotRef.current?.visible) {
-      const previewCollision = detectRobotCollision(previewRobotRef.current, activeObjects)
-      if (sceneState.collisionWarning !== Boolean(previewCollision)) {
-        sceneState.setCollisionWarning(Boolean(previewCollision))
-      }
-    } else {
-      const latestSceneState = useSceneStore.getState()
-      const hasRobotCollision = Object.values(latestSceneState.robotContactsById).some(
-        (contact) => contact.level === 'collision'
-      )
-
-      if (latestSceneState.collisionWarning !== hasRobotCollision) {
-        latestSceneState.setCollisionWarning(hasRobotCollision)
-      }
-    }
-  }
-
   // Synchronize 3D models in store with Three.js scene
   useEffect(() => {
     const scene = sceneRef.current
     if (!scene) return
 
+    const sceneGeneration = sceneGenerationRef.current
     const loadedMap = loadedObjectsRef.current
+    const nextObjectIds = new Set(objects.map((object) => object.id))
+
+    for (const loadingObjectId of Array.from(loadingObjectIdsRef.current)) {
+      if (nextObjectIds.has(loadingObjectId)) continue
+      objectLoadGenerationByIdRef.current.set(
+        loadingObjectId,
+        (objectLoadGenerationByIdRef.current.get(loadingObjectId) ?? 0) + 1
+      )
+      loadingObjectIdsRef.current.delete(loadingObjectId)
+    }
 
     // 1. Load newly added objects
     objects.forEach((obj) => {
-      if (!loadedMap.has(obj.id)) {
+      if (!loadedMap.has(obj.id) && !loadingObjectIdsRef.current.has(obj.id)) {
+        const objectLoadGeneration = (objectLoadGenerationByIdRef.current.get(obj.id) ?? 0) + 1
+        objectLoadGenerationByIdRef.current.set(obj.id, objectLoadGeneration)
+        loadingObjectIdsRef.current.add(obj.id)
+
+        const getCurrentObject = (): (typeof objects)[number] | undefined =>
+          useSceneStore.getState().objects.find((candidate) => candidate.id === obj.id)
+        const loadIsCurrent = (): boolean =>
+          sceneRef.current === scene &&
+          sceneGenerationRef.current === sceneGeneration &&
+          objectLoadGenerationByIdRef.current.get(obj.id) === objectLoadGeneration &&
+          Boolean(getCurrentObject())
+        const finishCurrentLoad = (): void => {
+          if (objectLoadGenerationByIdRef.current.get(obj.id) === objectLoadGeneration) {
+            loadingObjectIdsRef.current.delete(obj.id)
+          }
+        }
+
         if (obj.fileType === 'stl') {
           const stlLoader = new STLLoader()
-          stlLoader.load(obj.url, (geometry) => {
-            const material = new THREE.MeshStandardMaterial({
-              color: 0x90caf9,
-              roughness: 0.5,
-              metalness: 0.2
-            })
-            const mesh = new THREE.Mesh(geometry, material)
-            mesh.castShadow = true
-            mesh.receiveShadow = true
+          stlLoader.load(
+            obj.url,
+            (geometry) => {
+              const currentObject = getCurrentObject()
+              if (!loadIsCurrent() || !currentObject) {
+                geometry.dispose()
+                finishCurrentLoad()
+                return
+              }
 
-            updateThreeObjTransform(mesh, obj.transform)
-            mesh.visible = obj.visible
+              const material = new THREE.MeshStandardMaterial({
+                color: 0x90caf9,
+                roughness: 0.5,
+                metalness: 0.2
+              })
+              const mesh = new THREE.Mesh(geometry, material)
+              mesh.castShadow = true
+              mesh.receiveShadow = true
 
-            scene.add(mesh)
-            loadedMap.set(obj.id, mesh)
+              updateThreeObjTransform(mesh, currentObject.transform)
+              mesh.visible = currentObject.visible
 
-            updateSelection()
-          })
+              scene.add(mesh)
+              loadedMap.set(obj.id, mesh)
+              finishCurrentLoad()
+              updateSelection()
+              collisionSchedulerRef.current?.requestImmediateTick()
+            },
+            undefined,
+            (error) => {
+              if (loadIsCurrent()) console.error('An error occurred loading STL:', error)
+              finishCurrentLoad()
+            }
+          )
         } else {
           const gltfLoader = new GLTFLoader()
-          gltfLoader.load(obj.url, (gltf) => {
-            const model = gltf.scene
-            model.traverse((child) => {
-              if (child instanceof THREE.Mesh) {
-                child.castShadow = true
-                child.receiveShadow = true
+          gltfLoader.load(
+            obj.url,
+            (gltf) => {
+              const currentObject = getCurrentObject()
+              if (!loadIsCurrent() || !currentObject) {
+                disposeRobotObject(gltf.scene)
+                finishCurrentLoad()
+                return
               }
-            })
 
-            updateThreeObjTransform(model, obj.transform)
-            model.visible = obj.visible
+              const model = gltf.scene
+              model.traverse((child) => {
+                if (child instanceof THREE.Mesh) {
+                  child.castShadow = true
+                  child.receiveShadow = true
+                }
+              })
 
-            scene.add(model)
-            loadedMap.set(obj.id, model)
+              updateThreeObjTransform(model, currentObject.transform)
+              model.visible = currentObject.visible
 
-            updateSelection()
-          })
+              scene.add(model)
+              loadedMap.set(obj.id, model)
+              finishCurrentLoad()
+              updateSelection()
+              collisionSchedulerRef.current?.requestImmediateTick()
+            },
+            undefined,
+            (error) => {
+              if (loadIsCurrent()) console.error('An error occurred loading GLTF:', error)
+              finishCurrentLoad()
+            }
+          )
         }
       } else {
         // 2. Update existing object transform & visibility
@@ -2558,11 +2756,13 @@ export default function Viewport3D(): React.JSX.Element {
         if (threeObj) {
           scene.remove(threeObj)
           loadedMap.delete(id)
+          disposeRobotObject(threeObj)
         }
       }
     }
 
     updateSelection()
+    collisionSchedulerRef.current?.requestImmediateTick()
     // Object loading is driven by scene objects; selection is refreshed by a separate effect.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [objects])
@@ -2825,7 +3025,11 @@ export default function Viewport3D(): React.JSX.Element {
     setIsRobotLoaded(!!activeRobot)
 
     for (const [id, robot] of robotRefs.current.entries()) {
-      robot.visible = workspaceMode === 'factory' || id === selectedRobotId
+      const shouldBeVisible = workspaceMode === 'factory' || id === selectedRobotId
+      if (robot.visible && !shouldBeVisible) {
+        collisionEngineRef.current?.removeRobot(id)
+      }
+      robot.visible = shouldBeVisible
 
       const robotAngles =
         id === selectedRobotId
@@ -2840,6 +3044,8 @@ export default function Viewport3D(): React.JSX.Element {
       updateRobotJoints(jointAngles, previewRobotRef.current)
     }
 
+    collisionSchedulerRef.current?.requestImmediateTick()
+
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jointAngles, jointAnglesByRobotId, robots.length, selectedRobotId, workspaceMode])
 
@@ -2848,6 +3054,7 @@ export default function Viewport3D(): React.JSX.Element {
   useEffect(() => {
     const scene = sceneRef.current
     if (!scene) return
+    const sceneGeneration = sceneGenerationRef.current
 
     if (robots.length > 0) {
       previewRobotLoadGenerationRef.current += 1
@@ -2856,7 +3063,9 @@ export default function Viewport3D(): React.JSX.Element {
       const previewRobot = previewRobotRef.current
 
       if (previewRobot) {
+        collisionEngineRef.current?.removeRobot(PREVIEW_COLLISION_ROBOT_ID)
         scene.remove(previewRobot)
+        removeRobotMaterialCache(PREVIEW_COLLISION_ROBOT_ID)
         disposeRobotObject(previewRobot)
         previewRobotRef.current = null
 
@@ -2865,6 +3074,8 @@ export default function Viewport3D(): React.JSX.Element {
           setIsRobotLoaded(false)
         }
       }
+
+      removeRobotSafetyState(PREVIEW_COLLISION_ROBOT_ID)
 
       return
     }
@@ -2890,6 +3101,7 @@ export default function Viewport3D(): React.JSX.Element {
         const loadIsCurrent =
           previewRobotLoadGenerationRef.current === loadGeneration &&
           sceneRef.current === scene &&
+          sceneGenerationRef.current === sceneGeneration &&
           robotsRef.current.length === 0
 
         if (!loadIsCurrent) {
@@ -2915,6 +3127,8 @@ export default function Viewport3D(): React.JSX.Element {
           }
         })
 
+        cacheRobotMaterials(PREVIEW_COLLISION_ROBOT_ID, loadedRobot)
+
         scene.add(loadedRobot)
 
         previewRobotRef.current = loadedRobot
@@ -2923,6 +3137,8 @@ export default function Viewport3D(): React.JSX.Element {
         setIsRobotLoaded(true)
 
         updateRobotJoints(useRobotStore.getState().jointAngles, loadedRobot)
+        applyRobotSafetyVisual(PREVIEW_COLLISION_ROBOT_ID, true)
+        collisionSchedulerRef.current?.requestImmediateTick()
       },
       undefined,
       (error) => {
@@ -2946,6 +3162,7 @@ export default function Viewport3D(): React.JSX.Element {
   useEffect(() => {
     const scene = sceneRef.current
     if (!scene) return
+    const sceneGeneration = sceneGenerationRef.current
 
     const existingIds = new Set(robotRefs.current.keys())
     const nextIds = new Set(robots.map((r) => r.id))
@@ -2953,6 +3170,10 @@ export default function Viewport3D(): React.JSX.Element {
     // 1. Remove robots no longer in store
     for (const id of existingIds) {
       if (!nextIds.has(id)) {
+        robotLoadGenerationByIdRef.current.set(
+          id,
+          (robotLoadGenerationByIdRef.current.get(id) ?? 0) + 1
+        )
         const robotObj = robotRefs.current.get(id)
         if (robotObj) {
           scene.remove(robotObj)
@@ -2961,7 +3182,7 @@ export default function Viewport3D(): React.JSX.Element {
           unregisterLoadedRobotMoveLRunner(id)
         }
         robotRefs.current.delete(id)
-        collisionCandidateByRobotIdRef.current.delete(id)
+        collisionEngineRef.current?.removeRobot(id)
         removeRobotSafetyState(id)
         if (selectedRobotId === id) {
           robotRef.current = null
@@ -2973,6 +3194,10 @@ export default function Viewport3D(): React.JSX.Element {
     // Clean up loading flag if robot was removed from store while loading
     for (const loadingId of Array.from(loadingRobotIdsRef.current)) {
       if (!nextIds.has(loadingId)) {
+        robotLoadGenerationByIdRef.current.set(
+          loadingId,
+          (robotLoadGenerationByIdRef.current.get(loadingId) ?? 0) + 1
+        )
         loadingRobotIdsRef.current.delete(loadingId)
       }
     }
@@ -2982,7 +3207,10 @@ export default function Viewport3D(): React.JSX.Element {
       const existingRobot = robotRefs.current.get(robot.id)
       if (existingRobot) {
         applyRobotSceneBinding(existingRobot, robot.sceneBinding)
+        existingRobot.updateMatrixWorld(true)
       } else if (!loadingRobotIdsRef.current.has(robot.id)) {
+        const robotLoadGeneration = (robotLoadGenerationByIdRef.current.get(robot.id) ?? 0) + 1
+        robotLoadGenerationByIdRef.current.set(robot.id, robotLoadGeneration)
         loadingRobotIdsRef.current.add(robot.id)
 
         const loader = new URDFLoader()
@@ -2993,17 +3221,25 @@ export default function Viewport3D(): React.JSX.Element {
         loader.load(
           './fairino_description/urdf/fairino5_v6.urdf',
           (loadedRobot) => {
-            // Check race conditions: if robot was removed from store or already loaded
-            const stillExists = robotsRef.current.some((item) => item.id === robot.id)
+            const currentRobot = robotsRef.current.find((item) => item.id === robot.id)
+            const loadIsCurrent =
+              sceneRef.current === scene &&
+              sceneGenerationRef.current === sceneGeneration &&
+              robotLoadGenerationByIdRef.current.get(robot.id) === robotLoadGeneration &&
+              Boolean(currentRobot)
             const alreadyLoaded = robotRefs.current.has(robot.id)
 
-            if (!stillExists || alreadyLoaded) {
+            if (!loadIsCurrent || !currentRobot || alreadyLoaded) {
               disposeRobotObject(loadedRobot)
-              loadingRobotIdsRef.current.delete(robot.id)
+              if (robotLoadGenerationByIdRef.current.get(robot.id) === robotLoadGeneration) {
+                loadingRobotIdsRef.current.delete(robot.id)
+              }
               return
             }
 
-            applyRobotSceneBinding(loadedRobot, robot.sceneBinding)
+            const currentRobotState = useRobotStore.getState()
+
+            applyRobotSceneBinding(loadedRobot, currentRobot.sceneBinding)
 
             loadedRobot.traverse((child) => {
               if (child instanceof THREE.Mesh) {
@@ -3020,7 +3256,9 @@ export default function Viewport3D(): React.JSX.Element {
 
             cacheRobotMaterials(robot.id, loadedRobot)
 
-            loadedRobot.visible = workspaceMode === 'factory' || robot.id === selectedRobotId
+            loadedRobot.visible =
+              currentRobotState.workspaceMode === 'factory' ||
+              robot.id === currentRobotState.selectedRobotId
 
             scene.add(loadedRobot)
             robotRefs.current.set(robot.id, loadedRobot)
@@ -3029,25 +3267,34 @@ export default function Viewport3D(): React.JSX.Element {
             loadingRobotIdsRef.current.delete(robot.id)
             // Initial joints position sync
             const robotAngles =
-              robot.id === selectedRobotId
-                ? jointAngles
-                : (jointAnglesByRobotId[robot.id] ?? [...DEFAULT_JOINT_ANGLES])
+              robot.id === currentRobotState.selectedRobotId
+                ? currentRobotState.jointAngles
+                : (currentRobotState.jointAnglesByRobotId[robot.id] ?? [...DEFAULT_JOINT_ANGLES])
 
-            if (robot.id === selectedRobotId) {
+            if (robot.id === currentRobotState.selectedRobotId) {
               robotRef.current = loadedRobot
               setIsRobotLoaded(true)
             }
 
             updateRobotJoints(robotAngles, loadedRobot)
+            loadedRobot.updateMatrixWorld(true)
+            collisionSchedulerRef.current?.requestImmediateTick()
           },
           undefined,
           (error) => {
-            console.error('An error occurred loading URDF:', error)
-            loadingRobotIdsRef.current.delete(robot.id)
+            const loadIsCurrent =
+              sceneRef.current === scene &&
+              sceneGenerationRef.current === sceneGeneration &&
+              robotLoadGenerationByIdRef.current.get(robot.id) === robotLoadGeneration
+            if (loadIsCurrent) {
+              console.error('An error occurred loading URDF:', error)
+              loadingRobotIdsRef.current.delete(robot.id)
+            }
           }
         )
       }
     })
+    collisionSchedulerRef.current?.requestImmediateTick()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [robots, selectedRobotId, jointAnglesByRobotId])
 
@@ -3157,15 +3404,87 @@ export default function Viewport3D(): React.JSX.Element {
         <span id="self-measure-text">0 mm</span>
       </div>
 
-      {/* Collision Warning Overlay */}
-      {collisionWarning && (
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 bg-rose-600/95 text-white px-4 py-1.5 rounded-full shadow-lg border border-rose-500 animate-pulse">
-          <ShieldAlert size={14} />
-          <span className="text-[10px] font-bold uppercase tracking-wider">
-            Cảnh báo: Phát hiện va chạm!
+      {/* Collision warning stays mounted so appearance/disappearance can animate smoothly. */}
+      <div
+        role="alert"
+        aria-live="assertive"
+        aria-hidden={!collisionAlert}
+        className={`pointer-events-none absolute left-1/2 top-4 z-30 w-[min(560px,calc(100%-32px))] -translate-x-1/2 transition-all duration-200 ease-out ${
+          collisionAlert ? 'translate-y-0 opacity-100' : '-translate-y-2 opacity-0'
+        }`}
+      >
+        <div
+          className={`flex items-start gap-3 rounded-xl border px-4 py-3 text-white backdrop-blur-sm pointer-events-auto ${
+            collisionAlert?.level === 'proximity'
+              ? 'border-amber-400/60 bg-amber-950/95 shadow-[0_0_28px_rgba(245,158,11,0.22)]'
+              : 'border-rose-400/60 bg-rose-950/95 shadow-[0_0_28px_rgba(244,63,94,0.28)]'
+          }`}
+        >
+          <span
+            className={`relative mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full ${
+              collisionAlert?.level === 'proximity' ? 'bg-amber-500/20' : 'bg-rose-500/20'
+            }`}
+          >
+            <span
+              className={`absolute inset-0 rounded-full motion-safe:animate-ping ${
+                collisionAlert?.level === 'proximity' ? 'bg-amber-400/25' : 'bg-rose-400/25'
+              }`}
+            />
+            <ShieldAlert className="relative" size={15} />
           </span>
+          <div className="min-w-0 flex-1">
+            <p
+              className={`text-xs font-bold ${
+                collisionAlert?.level === 'proximity' ? 'text-amber-100' : 'text-rose-100'
+              }`}
+            >
+              {collisionAlert?.title ??
+                (language === 'vi' ? 'Phát hiện va chạm' : 'Collision detected')}
+            </p>
+            <p
+              className={`mt-0.5 text-[10px] leading-relaxed ${
+                collisionAlert?.level === 'proximity' ? 'text-amber-200/90' : 'text-rose-200/90'
+              }`}
+            >
+              {collisionAlert?.detail ??
+                (language === 'vi'
+                  ? 'Hãy kiểm tra vùng làm việc của robot.'
+                  : 'Check the robot work area.')}
+            </p>
+
+            {collisionAlert && (
+              <div className="mt-2">
+                <button
+                  type="button"
+                  onClick={() => setIsTechnicalDetailsExpanded(!isTechnicalDetailsExpanded)}
+                  className={`text-[9px] font-semibold underline cursor-pointer hover:opacity-80 focus:outline-none ${
+                    collisionAlert.level === 'proximity' ? 'text-amber-300' : 'text-rose-300'
+                  }`}
+                >
+                  {isTechnicalDetailsExpanded
+                    ? language === 'vi'
+                      ? 'Ẩn chi tiết kỹ thuật'
+                      : 'Hide technical details'
+                    : language === 'vi'
+                      ? 'Xem chi tiết kỹ thuật'
+                      : 'Show technical details'}
+                </button>
+                {isTechnicalDetailsExpanded && (
+                  <div
+                    className={`mt-1.5 rounded p-2 text-[9px] font-mono leading-normal whitespace-pre-wrap max-h-24 overflow-y-auto select-text ${
+                      collisionAlert.level === 'proximity'
+                        ? 'bg-amber-900/60 text-amber-200 border border-amber-500/20'
+                        : 'bg-rose-900/60 text-rose-200 border border-rose-500/20'
+                    }`}
+                  >
+                    {getTechnicalInfoSummary()}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
-      )}
+      </div>
 
       {/* Active backend robot info */}
       {selectedRobot && (

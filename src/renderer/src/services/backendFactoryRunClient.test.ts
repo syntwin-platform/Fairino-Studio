@@ -70,4 +70,49 @@ describe('backendFactoryRunClient', () => {
       })
     }
   )
+
+  it('serializes deduplicated source programs and target assignments', async () => {
+    await createFactoryRun(
+      {
+        backendUrl: 'http://localhost:5000',
+        token: 'test-token'
+      },
+      {
+        companyId: 'company-1',
+        coordinationMode: 'ParallelIndependent',
+        failurePolicy: 'IsolateTarget',
+        programs: [
+          {
+            key: 'pick-source',
+            programName: 'pick',
+            luaFileName: 'pick.lua',
+            luaContent: "print('pick')"
+          },
+          {
+            key: 'place-source',
+            programName: 'place',
+            luaFileName: 'place.lua',
+            luaContent: "print('place')"
+          }
+        ],
+        targets: [
+          { robotId: 'robot-1', programKey: 'pick-source' },
+          { robotId: 'robot-2', programKey: 'pick-source' },
+          { robotId: 'robot-3', programKey: 'place-source' }
+        ]
+      }
+    )
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    const body = JSON.parse(String(init.body))
+
+    expect(body.programs).toHaveLength(2)
+    expect(body.targets).toEqual([
+      { robotId: 'robot-1', programKey: 'pick-source' },
+      { robotId: 'robot-2', programKey: 'pick-source' },
+      { robotId: 'robot-3', programKey: 'place-source' }
+    ])
+    expect(body).not.toHaveProperty('luaContent')
+    expect(body).not.toHaveProperty('robotIds')
+  })
 })

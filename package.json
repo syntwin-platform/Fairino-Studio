@@ -33,6 +33,7 @@
     "lucide-react": "^1.16.0",
     "tailwindcss": "^4.3.0",
     "three": "^0.184.0",
+    "three-mesh-bvh": "^0.9.11",
     "urdf-loader": "^0.12.7",
     "zustand": "^5.0.13"
   },
@@ -45,6 +46,7 @@
     "@types/react-dom": "^19.2.3",
     "@types/three": "^0.184.1",
     "@vitejs/plugin-react": "^5.1.1",
+    "@xmldom/xmldom": "^0.8.13",
     "electron": "^39.2.6",
     "electron-builder": "^26.0.12",
     "electron-vite": "^5.0.0",

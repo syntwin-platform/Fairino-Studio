@@ -1,3 +1,6 @@
+import type { FactoryFailurePolicy } from '../types/factoryProgram.types'
+import { executionGroupRegistry } from './safety/executionGroupRegistry'
+
 interface ActiveCommandExecution {
   commandId: string
   executionGroupId?: string
@@ -36,7 +39,8 @@ export function beginCommandExecution(commandId: string): AbortSignal {
 export function beginCommandExecutionForRobot(
   robotId: string,
   commandId: string,
-  executionGroupId?: string
+  executionGroupId?: string,
+  failurePolicy: FactoryFailurePolicy = 'IsolateTarget'
 ): AbortSignal {
   const normalizedRobotId = normalizeRobotId(robotId)
 
@@ -52,13 +56,26 @@ export function beginCommandExecutionForRobot(
     )
   }
 
+  if (activeRobotExecution?.executionGroupId) {
+    executionGroupRegistry.unregister(activeRobotExecution.executionGroupId, normalizedRobotId)
+  }
+
   const controller = new AbortController()
+  const normalizedExecutionGroupId = executionGroupId?.trim() || undefined
 
   activeExecutionsByRobotId.set(normalizedRobotId, {
     commandId,
-    executionGroupId: executionGroupId?.trim() || undefined,
+    executionGroupId: normalizedExecutionGroupId,
     controller
   })
+
+  if (normalizedExecutionGroupId) {
+    executionGroupRegistry.register({
+      executionGroupId: normalizedExecutionGroupId,
+      robotId: normalizedRobotId,
+      failurePolicy
+    })
+  }
 
   return controller.signal
 }
@@ -135,6 +152,9 @@ export function finishCommandExecutionForRobot(robotId: string, commandId: strin
   const activeRobotExecution = activeExecutionsByRobotId.get(normalizedRobotId)
 
   if (activeRobotExecution?.commandId === commandId) {
+    if (activeRobotExecution.executionGroupId) {
+      executionGroupRegistry.unregister(activeRobotExecution.executionGroupId, normalizedRobotId)
+    }
     activeExecutionsByRobotId.delete(normalizedRobotId)
   }
 }
@@ -159,4 +179,11 @@ export function getActiveCommandIdForRobot(robotId: string): string | null {
   }
 
   return activeExecutionsByRobotId.get(normalizedRobotId)?.commandId ?? null
+}
+
+export function getActiveCommandRobotIds(): string[] {
+  return [...activeExecutionsByRobotId.entries()]
+    .filter(([, execution]) => !execution.controller.signal.aborted)
+    .map(([robotId]) => robotId)
+    .sort()
 }

@@ -1,4 +1,5 @@
 import { useSceneStore } from '../store/sceneStore'
+import { useRobotStore } from '../store/robotStore'
 import type {
   LatchRobotFaultInput,
   ResetRobotFaultOptions,
@@ -6,7 +7,9 @@ import type {
   RobotSafetyContactObservation,
   RobotSafetyContactState
 } from '../types/robotFault.types'
-import { cancelActiveCommandForRobot } from './commandExecutionRuntime'
+import { cancelActiveCommandForRobot, getActiveCommandRobotIds } from './commandExecutionRuntime'
+import { executeSafetyStop } from './safety/safetyStopResolver'
+import type { SafetyFaultEvent, SafetyStopCause, SafetyStopResolution } from './safety/safetyTypes'
 
 function normalizeRobotId(robotId: string): string {
   return robotId.trim()
@@ -113,9 +116,74 @@ export function latchRobotFault(robotId: string, input: LatchRobotFaultInput): R
   return fault
 }
 
+function getFaultInputForSafetyStop(
+  robotId: string,
+  cause: SafetyStopCause,
+  event: SafetyFaultEvent
+): LatchRobotFaultInput {
+  const eventMessage = event.message?.trim() || `Safety fault ${event.type} detected.`
+
+  switch (cause) {
+    case 'root-fault':
+      return {
+        kind: event.type === 'connection-lost' ? 'connection' : 'collision',
+        code: event.code?.trim() || event.type.toUpperCase().replace(/-/g, '_'),
+        message: eventMessage,
+        cancelMotion: false
+      }
+
+    case 'safety-group':
+      return {
+        kind: 'safety-policy',
+        code: 'SAFETY_GROUP_STOP',
+        message: `Robot ${robotId} stopped by safety-group propagation. Root cause: ${eventMessage}`,
+        cancelMotion: false
+      }
+
+    case 'execution-group':
+      return {
+        kind: 'safety-policy',
+        code: 'EXECUTION_GROUP_STOP',
+        message:
+          `Robot ${robotId} stopped because its execution group uses ` +
+          `AbortExecutionGroup. Root cause: ${eventMessage}`,
+        cancelMotion: false
+      }
+
+    case 'global':
+      return {
+        kind: 'safety-policy',
+        code: event.code?.trim() || 'GLOBAL_ESTOP',
+        message: eventMessage,
+        cancelMotion: false
+      }
+  }
+
+  const exhaustiveCause: never = cause
+  throw new Error(`Unsupported safety stop cause: ${String(exhaustiveCause)}`)
+}
+
+export function reportSafetyFaultEvent(event: SafetyFaultEvent): SafetyStopResolution {
+  const configuredRobotIds = useRobotStore.getState().robots.map((robot) => robot.id)
+
+  return executeSafetyStop(
+    event,
+    {
+      cancelRobot: cancelActiveCommandForRobot,
+      latchRobotFault: (robotId, cause, faultEvent) => {
+        latchRobotFault(robotId, getFaultInputForSafetyStop(robotId, cause, faultEvent))
+      }
+    },
+    {
+      allRobotIds: [...configuredRobotIds, ...getActiveCommandRobotIds()]
+    }
+  )
+}
+
 export function reportRobotSafetyContact(
   robotId: string,
-  observation: RobotSafetyContactObservation
+  observation: RobotSafetyContactObservation,
+  options: { triggerSafetyAction?: boolean; forceSafetyAction?: boolean } = {}
 ): RobotSafetyContactState {
   const normalizedRobotId = normalizeRobotId(robotId)
   if (!normalizedRobotId) {
@@ -130,6 +198,13 @@ export function reportRobotSafetyContact(
   const existing = store.robotContactsById[normalizedRobotId]
 
   if (existing && isSameContact(existing, observation, counterpartRobotIds, objectIds)) {
+    if (
+      existing.level === 'collision' &&
+      options.triggerSafetyAction !== false &&
+      options.forceSafetyAction
+    ) {
+      triggerCollisionSafetyAction(existing)
+    }
     return existing
   }
 
@@ -147,15 +222,31 @@ export function reportRobotSafetyContact(
 
   store.setRobotContact(normalizedRobotId, contact)
 
-  if (contact.level === 'collision') {
-    latchRobotFault(normalizedRobotId, {
-      kind: 'collision',
-      code: `COLLISION_${contact.kind.toUpperCase()}`,
-      message: contact.message || `Collision detected for robot ${normalizedRobotId}.`
-    })
+  if (contact.level === 'collision' && options.triggerSafetyAction !== false) {
+    triggerCollisionSafetyAction(contact)
   }
 
   return contact
+}
+
+function triggerCollisionSafetyAction(contact: RobotSafetyContactState): void {
+  const faultType =
+    contact.kind === 'robot'
+      ? 'robot-robot'
+      : contact.kind === 'ground'
+        ? 'ground-collision'
+        : contact.kind === 'self'
+          ? 'self-collision'
+          : 'robot-obstacle'
+
+  reportSafetyFaultEvent({
+    type: faultType,
+    rootRobotIds: [contact.robotId, ...contact.counterpartRobotIds],
+    objectIds: contact.objectIds,
+    stopScope: 'Robot',
+    code: `COLLISION_${contact.kind.toUpperCase()}`,
+    message: contact.message || `Collision detected for robot ${contact.robotId}.`
+  })
 }
 
 export function clearRobotSafetyContact(robotId: string): void {

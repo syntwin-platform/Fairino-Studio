@@ -2,7 +2,7 @@ import { useRef, useState } from 'react'
 import type { ReactElement } from 'react'
 
 import { useRobotStore } from '../../store/robotStore'
-import { useSceneStore } from '../../store/sceneStore'
+import { selectCollisionWarning, useSceneStore } from '../../store/sceneStore'
 import type { WorkflowStep } from '../../types/robot.types'
 import {
   ArrowDown,
@@ -96,7 +96,7 @@ export default function WorkflowPanel(): ReactElement {
   const currentStepIndex = selectedRobotId
     ? (selectedExecution?.currentStepIndex ?? 0)
     : legacyCurrentStepIndex
-  const collisionWarning = useSceneStore((state) => state.collisionWarning)
+  const collisionWarning = useSceneStore(selectCollisionWarning)
   const isRecordBlocked = isPlaying || collisionWarning
   const moveLPreviewAbortRef = useRef<AbortController | null>(null)
   const isRunActive = (): boolean => {

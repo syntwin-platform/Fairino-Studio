@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { useSceneStore } from '../store/sceneStore'
+import { selectCollisionWarning, selectSafetyAlert, useSceneStore } from '../store/sceneStore'
 import {
   beginCommandExecutionForRobot,
   finishCommandExecutionForRobot
 } from './commandExecutionRuntime'
+import { executionGroupRegistry } from './safety/executionGroupRegistry'
+import { safetyGroupRegistry } from './safety/safetyGroupRegistry'
 import {
   RobotMotionBlockedError,
   clearRobotSafetyContact,
@@ -24,13 +26,42 @@ describe('robotFaultRuntime', () => {
   }
 
   beforeEach(() => {
+    safetyGroupRegistry.clear()
+    executionGroupRegistry.clear()
     clearTestRobotSafetyState()
   })
 
   afterEach(() => {
     finishCommandExecutionForRobot('robot-a', 'command-a')
     finishCommandExecutionForRobot('robot-b', 'command-b')
+    safetyGroupRegistry.clear()
+    executionGroupRegistry.clear()
     clearTestRobotSafetyState()
+  })
+
+  it('stops both directly involved robots without stopping an unrelated robot', () => {
+    const robotASignal = beginCommandExecutionForRobot('robot-a', 'command-a')
+    const robotBSignal = beginCommandExecutionForRobot('robot-b', 'command-b')
+    const robotCSignal = beginCommandExecutionForRobot('robot-c', 'command-c')
+
+    try {
+      reportRobotSafetyContact('robot-a', {
+        level: 'collision',
+        kind: 'robot',
+        counterpartRobotIds: ['robot-b'],
+        message: 'Robot A collided with robot B.'
+      })
+
+      expect(robotASignal.aborted).toBe(true)
+      expect(robotBSignal.aborted).toBe(true)
+      expect(robotCSignal.aborted).toBe(false)
+      expect(useSceneStore.getState().robotFaultsById['robot-a']?.kind).toBe('collision')
+      expect(useSceneStore.getState().robotFaultsById['robot-b']?.kind).toBe('collision')
+      expect(useSceneStore.getState().robotFaultsById['robot-c']).toBeUndefined()
+    } finally {
+      finishCommandExecutionForRobot('robot-c', 'command-c')
+      useSceneStore.getState().clearRobotSafetyState('robot-c')
+    }
   })
 
   it('stops and blocks only the robot that reports a collision', () => {
@@ -62,6 +93,8 @@ describe('robotFaultRuntime', () => {
 
     expect(useSceneStore.getState().robotContactsById['robot-a']).toBeUndefined()
     expect(useSceneStore.getState().robotFaultsById['robot-a']?.latched).toBe(true)
+    expect(selectCollisionWarning(useSceneStore.getState())).toBe(false)
+    expect(selectSafetyAlert(useSceneStore.getState())).toBe(true)
     expect(() => throwIfRobotMotionBlocked('robot-a')).toThrow(RobotMotionBlockedError)
   })
 
@@ -93,8 +126,27 @@ describe('robotFaultRuntime', () => {
 
     expect(robotASignal.aborted).toBe(false)
     expect(useSceneStore.getState().robotFaultsById['robot-a']).toBeUndefined()
-    expect(useSceneStore.getState().collisionWarning).toBe(false)
+    expect(selectCollisionWarning(useSceneStore.getState())).toBe(false)
     expect(() => throwIfRobotMotionBlocked('robot-a')).not.toThrow()
+  })
+
+  it('records a Training collision without cancelling or latching a runtime fault', () => {
+    const robotASignal = beginCommandExecutionForRobot('robot-a', 'command-a')
+
+    reportRobotSafetyContact(
+      'robot-a',
+      {
+        level: 'collision',
+        kind: 'ground',
+        message: 'Offline Training preview intersects the ground.'
+      },
+      { triggerSafetyAction: false }
+    )
+
+    expect(robotASignal.aborted).toBe(false)
+    expect(useSceneStore.getState().robotContactsById['robot-a']?.level).toBe('collision')
+    expect(useSceneStore.getState().robotFaultsById['robot-a']).toBeUndefined()
+    expect(selectCollisionWarning(useSceneStore.getState())).toBe(true)
   })
 
   it('clears one robot without changing another robot fault', () => {
