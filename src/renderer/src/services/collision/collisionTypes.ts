@@ -3,6 +3,12 @@ import type { OBB } from 'three/examples/jsm/math/OBB.js'
 
 export type CollisionContactLevel = 'proximity' | 'collision'
 export type CollisionContactKind = 'ground' | 'self' | 'obstacle' | 'robot'
+export type CollisionObservationSource =
+  | 'exact-distance'
+  | 'exact-intersection'
+  | 'ground-distance'
+  | 'ground-bounds-fallback'
+  | 'robot-approach-zone'
 export type CollisionMonitoringMode = 'training-preview' | 'factory-active' | 'factory-static'
 
 export interface CollisionThresholdPolicy {
@@ -12,8 +18,12 @@ export interface CollisionThresholdPolicy {
   selfWarningDistanceMeters: number
   /** Warning clearance between links that belong to different robots. */
   robotWarningDistanceMeters: number
+  /** Horizontal safety-zone radius around a robot base used for immediate robot-pair warning. */
+  robotApproachZoneRadiusMeters: number
   /** Warning clearance between a robot link and an imported scene object. */
   obstacleWarningDistanceMeters: number
+  /** Maximum exact mesh measurements reserved for this robot in one scheduler tick. */
+  maxExactMeasurementsPerTick?: number
   confirmTicks: number
   clearTicks: number
   broadPhaseMarginMeters: number
@@ -98,6 +108,7 @@ export interface CollisionObservation {
   objectIds: string[]
   distanceMeters: number
   message: string
+  source?: CollisionObservationSource
 }
 
 export interface CollisionContactTransition {
@@ -136,10 +147,14 @@ export const DEFAULT_COLLISION_THRESHOLD_POLICY: CollisionThresholdPolicy = {
   // non-adjacent link shells similarly close. Those clearances are valid and must not inherit
   // the much larger robot/obstacle approach warning zone.
   groundWarningDistanceMeters: 0.005,
-  selfWarningDistanceMeters: 0,
-  robotWarningDistanceMeters: 0.08,
+  selfWarningDistanceMeters: 0.01,
+  robotWarningDistanceMeters: 0.12,
+  // This is also the outer radius of the orange circle rendered below a warned robot. Two
+  // robots therefore enter proximity at the exact moment their 380 mm approach zones touch.
+  robotApproachZoneRadiusMeters: 0.38,
   obstacleWarningDistanceMeters: 0.08,
-  confirmTicks: 3,
+  maxExactMeasurementsPerTick: 2,
+  confirmTicks: 2,
   clearTicks: 3,
   broadPhaseMarginMeters: 0.1,
   groundPenetrationToleranceMeters: 0.002

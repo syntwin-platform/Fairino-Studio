@@ -8,6 +8,7 @@ export class CollisionScheduler {
   private readonly clearTimer: NonNullable<CollisionSchedulerOptions['clearTimer']>
   private readonly now: () => number
   private timerId: ReturnType<typeof setTimeout> | null = null
+  private immediateTimerScheduled = false
   private running = false
   private inFlight = false
   private immediateTickRequested = false
@@ -28,6 +29,7 @@ export class CollisionScheduler {
   stop(): void {
     this.running = false
     this.immediateTickRequested = false
+    this.immediateTimerScheduled = false
     if (this.timerId !== null) {
       this.clearTimer(this.timerId)
       this.timerId = null
@@ -48,8 +50,12 @@ export class CollisionScheduler {
       this.immediateTickRequested = true
       return
     }
+    // Coalesce event storms (TransformControls, telemetry and joint state can all request the
+    // same tick). Repeated clear/setTimeout(0) calls can otherwise postpone the tick indefinitely.
+    if (this.immediateTimerScheduled) return
     if (this.timerId !== null) this.clearTimer(this.timerId)
     this.timerId = null
+    this.immediateTimerScheduled = true
     this.schedule(0)
   }
 
@@ -57,6 +63,7 @@ export class CollisionScheduler {
     if (!this.running) return
     this.timerId = this.setTimer(() => {
       this.timerId = null
+      this.immediateTimerScheduled = false
       void this.runTick()
     }, delayMs)
   }

@@ -1,6 +1,6 @@
 import * as THREE from 'three'
 import { OBB } from 'three/examples/jsm/math/OBB.js'
-import { MeshBVH } from 'three-mesh-bvh'
+import { MeshBVH, type HitPointInfo } from 'three-mesh-bvh'
 
 import type {
   CachedObstacleBounds,
@@ -21,11 +21,35 @@ interface RobotGeometryCacheEntry {
   links: Map<string, RobotLinkCollisionGeometry>
   bounds: THREE.Box3
   boundsRevision: number
+  poseSignature: number[] | null
+  linkSnapshot: RobotLinkObbSnapshot | null
 }
 
 interface CollisionMeshPart {
   meshObject: THREE.Mesh
   geometry: THREE.BufferGeometry
+}
+
+type CollisionBufferGeometry = THREE.BufferGeometry & {
+  boundsTree?: MeshBVH
+}
+
+export interface ExactCollisionMeasurement {
+  intersects: boolean
+  distanceMeters: number
+}
+
+export interface ExactCollisionWorkBudget {
+  remainingMeasurements: number
+}
+
+export type ExactCollisionProbe =
+  | { status: 'pending' }
+  | { status: 'resolved'; measurement: ExactCollisionMeasurement }
+
+interface ExactCollisionCacheEntry {
+  signature: string
+  measurement: ExactCollisionMeasurement
 }
 
 // FR5 instances load separate BufferGeometry objects with identical STL data. Sharing the BVH
@@ -91,21 +115,85 @@ export class RobotCollisionGeometryCache {
   private readonly meshPartsByLinkObject = new WeakMap<THREE.Object3D, CollisionMeshPart[]>()
   private readonly meshPartsByObject = new WeakMap<THREE.Object3D, CollisionMeshPart[]>()
   private readonly bvhByGeometry = new WeakMap<THREE.BufferGeometry, MeshBVH>()
+  private readonly fingerprintByGeometry = new WeakMap<THREE.BufferGeometry, string>()
+  private readonly exactMeasurements = new Map<string, ExactCollisionCacheEntry>()
   private geometryRevision = 0
 
   updateBounds(robot: CollisionRobotSnapshot): THREE.Box3 {
+    return this.updateBoundsWithStatus(robot).bounds
+  }
+
+  updateBoundsWithStatus(robot: CollisionRobotSnapshot): {
+    bounds: THREE.Box3
+    changed: boolean
+  } {
     const entry = this.getOrCreateEntry(robot)
+    const poseSignature = captureRobotPoseSignature(entry)
+    if (entry.poseSignature && poseSignaturesEqual(entry.poseSignature, poseSignature)) {
+      return { bounds: entry.bounds, changed: false }
+    }
+
     entry.bounds.setFromObject(robot.object)
     entry.boundsRevision += 1
-    return entry.bounds
+    entry.poseSignature = poseSignature
+    entry.linkSnapshot = null
+    return { bounds: entry.bounds, changed: true }
   }
 
   getBounds(robotId: string): THREE.Box3 | null {
     return this.entries.get(robotId)?.bounds ?? null
   }
 
+  prewarmExactGeometry(
+    robot: CollisionRobotSnapshot,
+    maxNewTrees = 1
+  ): { complete: boolean; preparedTreeCount: number } {
+    const entry = this.getOrCreateEntry(robot)
+    let preparedTreeCount = 0
+
+    for (const link of entry.links.values()) {
+      for (const part of this.getLinkMeshParts(link, robot)) {
+        if (this.bvhByGeometry.has(part.geometry)) continue
+        this.prepareBvh(part.geometry)
+        preparedTreeCount += 1
+        if (preparedTreeCount >= Math.max(1, maxNewTrees)) {
+          return {
+            complete: [...entry.links.values()].every((candidateLink) =>
+              this.areMeshPartsPrepared(this.getLinkMeshParts(candidateLink, robot))
+            ),
+            preparedTreeCount
+          }
+        }
+      }
+    }
+
+    return { complete: true, preparedTreeCount }
+  }
+
+  prewarmObjectExactGeometry(
+    object: THREE.Object3D,
+    maxNewTrees = 1
+  ): { complete: boolean; preparedTreeCount: number } {
+    return this.prewarmMeshParts(this.getObjectMeshParts(object), maxNewTrees)
+  }
+
+  isExactGeometryReady(robot: CollisionRobotSnapshot): boolean {
+    const entry = this.getOrCreateEntry(robot)
+    for (const link of entry.links.values()) {
+      if (!this.areMeshPartsPrepared(this.getLinkMeshParts(link, robot))) return false
+    }
+    return entry.links.size > 0
+  }
+
+  isObjectExactGeometryReady(object: THREE.Object3D): boolean {
+    const parts = this.getObjectMeshParts(object)
+    return parts.length > 0 && this.areMeshPartsPrepared(parts)
+  }
+
   buildLinkObbSnapshot(robot: CollisionRobotSnapshot): RobotLinkObbSnapshot {
     const entry = this.getOrCreateEntry(robot)
+    if (entry.linkSnapshot) return entry.linkSnapshot
+
     const linkObbs = new Map<string, OBB>()
     const linkWorldPoints = new Map<string, THREE.Vector3>()
 
@@ -134,13 +222,14 @@ export class RobotCollisionGeometryCache {
       )
     }
 
-    return {
+    entry.linkSnapshot = {
       robotId: robot.robotId,
       robotObject: robot.object,
       robotBounds: entry.bounds,
       linkObbs,
       linkWorldPoints
     }
+    return entry.linkSnapshot
   }
 
   getExactMinimumWorldY(robot: CollisionRobotSnapshot, linkName: string): number | null {
@@ -183,6 +272,50 @@ export class RobotCollisionGeometryCache {
     return this.intersectsMeshPartsExact(leftParts, rightParts)
   }
 
+  measureLinkPairExact(
+    leftRobot: CollisionRobotSnapshot,
+    leftLinkName: string,
+    rightRobot: CollisionRobotSnapshot,
+    rightLinkName: string,
+    maxDistanceMeters: number
+  ): ExactCollisionMeasurement | null {
+    const leftLink = this.findLinkGeometry(leftRobot, leftLinkName)
+    const rightLink = this.findLinkGeometry(rightRobot, rightLinkName)
+    if (!leftLink || !rightLink) return null
+
+    const leftParts = this.getLinkMeshParts(leftLink, leftRobot)
+    const rightParts = this.getLinkMeshParts(rightLink, rightRobot)
+    return this.measureMeshPartsExact(leftParts, rightParts, maxDistanceMeters)
+  }
+
+  probeLinkPairExact(
+    leftRobot: CollisionRobotSnapshot,
+    leftLinkName: string,
+    rightRobot: CollisionRobotSnapshot,
+    rightLinkName: string,
+    maxDistanceMeters: number,
+    budget: ExactCollisionWorkBudget
+  ): ExactCollisionProbe | null {
+    const leftLink = this.findLinkGeometry(leftRobot, leftLinkName)
+    const rightLink = this.findLinkGeometry(rightRobot, rightLinkName)
+    if (!leftLink || !rightLink) return null
+
+    const leftParts = this.getLinkMeshParts(leftLink, leftRobot)
+    const rightParts = this.getLinkMeshParts(rightLink, rightRobot)
+    if (!this.areMeshPartsPrepared(leftParts) || !this.areMeshPartsPrepared(rightParts)) {
+      return { status: 'pending' }
+    }
+
+    const cacheKey =
+      `pair:${leftRobot.robotId}:${leftLink.linkName}:` +
+      `${rightRobot.robotId}:${rightLink.linkName}:${maxDistanceMeters}`
+    const signature = `${createMatrixSignature(leftLink.linkObject.matrixWorld)}|${createMatrixSignature(rightLink.linkObject.matrixWorld)}`
+
+    return this.probeExactMeasurement(cacheKey, signature, budget, () =>
+      this.measureMeshPartsExact(leftParts, rightParts, maxDistanceMeters)
+    )
+  }
+
   intersectsLinkObjectExact(
     robot: CollisionRobotSnapshot,
     linkName: string,
@@ -196,11 +329,50 @@ export class RobotCollisionGeometryCache {
     return this.intersectsMeshPartsExact(linkParts, objectParts)
   }
 
+  measureLinkObjectExact(
+    robot: CollisionRobotSnapshot,
+    linkName: string,
+    object: THREE.Object3D,
+    maxDistanceMeters: number
+  ): ExactCollisionMeasurement | null {
+    const link = this.findLinkGeometry(robot, linkName)
+    if (!link) return null
+
+    const linkParts = this.getLinkMeshParts(link, robot)
+    const objectParts = this.getObjectMeshParts(object)
+    return this.measureMeshPartsExact(linkParts, objectParts, maxDistanceMeters)
+  }
+
+  probeLinkObjectExact(
+    robot: CollisionRobotSnapshot,
+    linkName: string,
+    object: THREE.Object3D,
+    maxDistanceMeters: number,
+    budget: ExactCollisionWorkBudget
+  ): ExactCollisionProbe | null {
+    const link = this.findLinkGeometry(robot, linkName)
+    if (!link) return null
+
+    const linkParts = this.getLinkMeshParts(link, robot)
+    const objectParts = this.getObjectMeshParts(object)
+    if (!this.areMeshPartsPrepared(linkParts) || !this.areMeshPartsPrepared(objectParts)) {
+      return { status: 'pending' }
+    }
+
+    const cacheKey = `object:${robot.robotId}:${link.linkName}:${object.uuid}:${maxDistanceMeters}`
+    const signature = `${createMatrixSignature(link.linkObject.matrixWorld)}|${createMatrixSignature(object.matrixWorld)}`
+
+    return this.probeExactMeasurement(cacheKey, signature, budget, () =>
+      this.measureMeshPartsExact(linkParts, objectParts, maxDistanceMeters)
+    )
+  }
+
   removeMissing(robotIds: ReadonlySet<string>): string[] {
     const removed: string[] = []
     for (const robotId of this.entries.keys()) {
       if (!robotIds.has(robotId)) {
         this.entries.delete(robotId)
+        this.removeExactMeasurementsForRobot(robotId)
         removed.push(robotId)
       }
     }
@@ -209,10 +381,52 @@ export class RobotCollisionGeometryCache {
 
   remove(robotId: string): void {
     this.entries.delete(robotId)
+    this.removeExactMeasurementsForRobot(robotId)
   }
 
   clear(): void {
     this.entries.clear()
+    this.exactMeasurements.clear()
+  }
+
+  private probeExactMeasurement(
+    cacheKey: string,
+    signature: string,
+    budget: ExactCollisionWorkBudget,
+    measure: () => ExactCollisionMeasurement | null
+  ): ExactCollisionProbe {
+    const cached = this.exactMeasurements.get(cacheKey)
+    if (cached?.signature === signature) {
+      return { status: 'resolved', measurement: cached.measurement }
+    }
+
+    if (budget.remainingMeasurements <= 0) return { status: 'pending' }
+    budget.remainingMeasurements -= 1
+
+    const measurement = measure()
+    if (!measurement) return { status: 'pending' }
+
+    this.storeExactMeasurement(cacheKey, signature, measurement)
+    return { status: 'resolved', measurement }
+  }
+
+  private storeExactMeasurement(
+    cacheKey: string,
+    signature: string,
+    measurement: ExactCollisionMeasurement
+  ): void {
+    this.exactMeasurements.set(cacheKey, { signature, measurement })
+    if (this.exactMeasurements.size > 512) {
+      const oldestKey = this.exactMeasurements.keys().next().value
+      if (oldestKey) this.exactMeasurements.delete(oldestKey)
+    }
+  }
+
+  private removeExactMeasurementsForRobot(robotId: string): void {
+    const marker = `:${robotId}:`
+    for (const key of this.exactMeasurements.keys()) {
+      if (key.includes(marker)) this.exactMeasurements.delete(key)
+    }
   }
 
   private getOrCreateEntry(robot: CollisionRobotSnapshot): RobotGeometryCacheEntry {
@@ -220,7 +434,8 @@ export class RobotCollisionGeometryCache {
     if (
       cached &&
       cached.sourceObject === robot.object &&
-      shallowObjectMapEqual(cached.linkObjects, robot.links)
+      shallowObjectMapEqual(cached.linkObjects, robot.links) &&
+      cached.links.size > 0
     ) {
       return cached
     }
@@ -244,7 +459,9 @@ export class RobotCollisionGeometryCache {
       linkObjects: { ...robot.links },
       links,
       bounds: new THREE.Box3().setFromObject(robot.object),
-      boundsRevision: this.geometryRevision
+      boundsRevision: this.geometryRevision,
+      poseSignature: null,
+      linkSnapshot: null
     }
     this.entries.set(robot.robotId, entry)
     return entry
@@ -286,6 +503,29 @@ export class RobotCollisionGeometryCache {
     return parts
   }
 
+  private prewarmMeshParts(
+    parts: readonly CollisionMeshPart[],
+    maxNewTrees: number
+  ): { complete: boolean; preparedTreeCount: number } {
+    let preparedTreeCount = 0
+    for (const part of parts) {
+      if (this.bvhByGeometry.has(part.geometry)) continue
+      this.prepareBvh(part.geometry)
+      preparedTreeCount += 1
+      if (preparedTreeCount >= Math.max(1, maxNewTrees)) {
+        return {
+          complete: parts.every((candidate) => this.bvhByGeometry.has(candidate.geometry)),
+          preparedTreeCount
+        }
+      }
+    }
+    return { complete: true, preparedTreeCount }
+  }
+
+  private areMeshPartsPrepared(parts: readonly CollisionMeshPart[]): boolean {
+    return parts.length > 0 && parts.every((part) => this.bvhByGeometry.has(part.geometry))
+  }
+
   private intersectsMeshPartsExact(
     leftParts: readonly CollisionMeshPart[],
     rightParts: readonly CollisionMeshPart[]
@@ -301,13 +541,8 @@ export class RobotCollisionGeometryCache {
 
       for (const right of rightParts) {
         rightToLeft.multiplyMatrices(inverseLeft, right.meshObject.matrixWorld)
-        const rightBvh = this.getOrCreateBvh(right.geometry)
-        if (
-          bvh.bvhcast(rightBvh, rightToLeft, {
-            intersectsTriangles: (leftTriangle, rightTriangle) =>
-              leftTriangle.intersectsTriangle(rightTriangle)
-          })
-        ) {
+        this.getOrCreateBvh(right.geometry)
+        if (bvh.intersectsGeometry(right.geometry, rightToLeft)) {
           return true
         }
       }
@@ -316,15 +551,92 @@ export class RobotCollisionGeometryCache {
     return false
   }
 
-  private getOrCreateBvh(geometry: THREE.BufferGeometry): MeshBVH {
-    const cached = this.bvhByGeometry.get(geometry)
-    if (cached) return cached
+  private measureMeshPartsExact(
+    leftParts: readonly CollisionMeshPart[],
+    rightParts: readonly CollisionMeshPart[],
+    maxDistanceMeters: number
+  ): ExactCollisionMeasurement | null {
+    if (leftParts.length === 0 || rightParts.length === 0) return null
 
-    const fingerprint = createGeometryFingerprint(geometry)
+    const boundedMaxDistance = Math.max(0, maxDistanceMeters)
+    const rightToLeft = new THREE.Matrix4()
+    const inverseLeft = new THREE.Matrix4()
+    const leftWorldPoint = new THREE.Vector3()
+    const rightWorldPoint = new THREE.Vector3()
+    const leftWorldScale = new THREE.Vector3()
+    let minimumDistanceMeters = Number.POSITIVE_INFINITY
+
+    for (const left of leftParts) {
+      const bvh = this.getOrCreateBvh(left.geometry)
+      inverseLeft.copy(left.meshObject.matrixWorld).invert()
+      left.meshObject.getWorldScale(leftWorldScale)
+      const minimumWorldScale = Math.max(
+        1e-9,
+        Math.min(Math.abs(leftWorldScale.x), Math.abs(leftWorldScale.y), Math.abs(leftWorldScale.z))
+      )
+      const maxDistanceInLeftSpace = boundedMaxDistance / minimumWorldScale
+
+      for (const right of rightParts) {
+        rightToLeft.multiplyMatrices(inverseLeft, right.meshObject.matrixWorld)
+        this.getOrCreateBvh(right.geometry)
+
+        if (bvh.intersectsGeometry(right.geometry, rightToLeft)) {
+          return { intersects: true, distanceMeters: 0 }
+        }
+
+        const leftTarget = {} as HitPointInfo
+        const rightTarget = {} as HitPointInfo
+        const result = bvh.closestPointToGeometry(
+          right.geometry,
+          rightToLeft,
+          leftTarget,
+          rightTarget,
+          0,
+          maxDistanceInLeftSpace
+        )
+        if (!result?.point || !rightTarget.point) continue
+
+        leftWorldPoint.copy(result.point).applyMatrix4(left.meshObject.matrixWorld)
+        rightWorldPoint.copy(rightTarget.point).applyMatrix4(right.meshObject.matrixWorld)
+        const distanceMeters = leftWorldPoint.distanceTo(rightWorldPoint)
+        minimumDistanceMeters = Math.min(minimumDistanceMeters, distanceMeters)
+
+        if (minimumDistanceMeters <= 1e-6) {
+          return { intersects: true, distanceMeters: 0 }
+        }
+      }
+    }
+
+    return {
+      intersects: false,
+      distanceMeters: minimumDistanceMeters
+    }
+  }
+
+  private getOrCreateBvh(geometry: THREE.BufferGeometry): MeshBVH {
+    return this.prepareBvh(geometry).bvh
+  }
+
+  private prepareBvh(geometry: THREE.BufferGeometry): {
+    bvh: MeshBVH
+    builtNewTree: boolean
+  } {
+    const cached = this.bvhByGeometry.get(geometry)
+    if (cached) {
+      ;(geometry as CollisionBufferGeometry).boundsTree = cached
+      return { bvh: cached, builtNewTree: false }
+    }
+
+    let fingerprint = this.fingerprintByGeometry.get(geometry)
+    if (!fingerprint) {
+      fingerprint = createGeometryFingerprint(geometry)
+      this.fingerprintByGeometry.set(geometry, fingerprint)
+    }
     const shared = SHARED_BVH_BY_FINGERPRINT.get(fingerprint)
     if (shared) {
       this.bvhByGeometry.set(geometry, shared)
-      return shared
+      ;(geometry as CollisionBufferGeometry).boundsTree = shared
+      return { bvh: shared, builtNewTree: false }
     }
 
     const bvh = new MeshBVH(geometry, {
@@ -333,12 +645,13 @@ export class RobotCollisionGeometryCache {
       verbose: false
     })
     this.bvhByGeometry.set(geometry, bvh)
+    ;(geometry as CollisionBufferGeometry).boundsTree = bvh
     if (SHARED_BVH_BY_FINGERPRINT.size >= 64) {
       const oldestFingerprint = SHARED_BVH_BY_FINGERPRINT.keys().next().value
       if (oldestFingerprint) SHARED_BVH_BY_FINGERPRINT.delete(oldestFingerprint)
     }
     SHARED_BVH_BY_FINGERPRINT.set(fingerprint, bvh)
-    return bvh
+    return { bvh, builtNewTree: true }
   }
 }
 
@@ -449,6 +762,31 @@ function shallowObjectMapEqual(
   const rightKeys = Object.keys(right)
   if (leftKeys.length !== rightKeys.length) return false
   return leftKeys.every((key) => left[key] === right[key])
+}
+
+function captureRobotPoseSignature(entry: RobotGeometryCacheEntry): number[] {
+  const signature: number[] = []
+  appendMatrixSignature(signature, entry.sourceObject.matrixWorld)
+  for (const geometry of entry.links.values()) {
+    appendMatrixSignature(signature, geometry.linkObject.matrixWorld)
+  }
+  return signature
+}
+
+function appendMatrixSignature(target: number[], matrix: THREE.Matrix4): void {
+  for (const value of matrix.elements) target.push(Math.round(value * 100_000))
+}
+
+function poseSignaturesEqual(left: readonly number[], right: readonly number[]): boolean {
+  if (left.length !== right.length) return false
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false
+  }
+  return true
+}
+
+function createMatrixSignature(matrix: THREE.Matrix4): string {
+  return matrix.elements.map((value) => Math.round(value * 100_000)).join(',')
 }
 
 function createGeometryFingerprint(geometry: THREE.BufferGeometry): string {

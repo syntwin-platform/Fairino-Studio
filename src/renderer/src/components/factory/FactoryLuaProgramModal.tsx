@@ -20,6 +20,7 @@ import type {
   FactoryFailurePolicy
 } from '../../types/factoryProgram.types'
 import {
+  getFactoryRunMonotonicTimeMs,
   getFactoryRunDiagnosticSnapshot,
   recordFactoryRunDiagnostic,
   subscribeFactoryRunDiagnostics
@@ -171,7 +172,15 @@ export default function FactoryLuaProgramModal({
       return
     }
 
-    const runtimePolicyStartedAtMonotonicMs = performance.now()
+    const factoryStore = useFactoryProgramStore.getState()
+
+    if (factoryStore.isBusy) {
+      return
+    }
+
+    factoryStore.setBusy(true)
+
+    const runtimePolicyStartedAtMonotonicMs = getFactoryRunMonotonicTimeMs()
 
     recordFactoryRunDiagnostic('runtime-policy.started', {
       details: {
@@ -188,14 +197,14 @@ export default function FactoryLuaProgramModal({
         setRobotRuntimeConfig(runtimeConfig)
       }
       recordFactoryRunDiagnostic('runtime-policy.completed', {
-        durationMs: performance.now() - runtimePolicyStartedAtMonotonicMs,
+        durationMs: getFactoryRunMonotonicTimeMs() - runtimePolicyStartedAtMonotonicMs,
         details: {
           targetCount: runtimeConfigs.length
         }
       })
     } catch (error) {
       recordFactoryRunDiagnostic('runtime-policy.failed', {
-        durationMs: performance.now() - runtimePolicyStartedAtMonotonicMs,
+        durationMs: getFactoryRunMonotonicTimeMs() - runtimePolicyStartedAtMonotonicMs,
         details: {
           reasonCode: 'runtime_policy_refresh_failed'
         }
@@ -207,6 +216,7 @@ export default function FactoryLuaProgramModal({
             ? `Runtime policy refresh failed: ${error.message}`
             : 'Runtime policy refresh failed.'
       })
+      useFactoryProgramStore.getState().setBusy(false)
       return
     }
 

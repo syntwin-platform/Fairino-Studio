@@ -89,6 +89,10 @@ interface RecordFactoryRunDiagnosticOptions {
 const MAX_DIAGNOSTIC_EVENTS = 500
 const DIAGNOSTIC_UI_PUBLISH_INTERVAL_MS = 50
 
+export function getFactoryRunMonotonicTimeMs(): number {
+  return performance.now()
+}
+
 const EMPTY_SUMMARY: FactoryRunDiagnosticSummary = {
   eventCount: 0,
   currentStage: null,
@@ -215,7 +219,7 @@ export function beginFactoryRunDiagnosticSession(fileName: string): string {
     id: createSessionId(),
     fileName,
     factoryRunId: null,
-    startedAtMonotonicMs: performance.now(),
+    startedAtMonotonicMs: getFactoryRunMonotonicTimeMs(),
     active: true
   }
 
@@ -256,7 +260,7 @@ export function recordFactoryRunDiagnostic(
     factoryRunId: options.factoryRunId ?? activeSession.factoryRunId ?? null,
     name,
     atUtc: new Date().toISOString(),
-    atMonotonicMs: performance.now(),
+    atMonotonicMs: getFactoryRunMonotonicTimeMs(),
     ...(options.robotId ? { robotId: options.robotId } : {}),
     ...(options.targetId ? { targetId: options.targetId } : {}),
     ...(typeof options.stepIndex === 'number' ? { stepIndex: options.stepIndex } : {}),

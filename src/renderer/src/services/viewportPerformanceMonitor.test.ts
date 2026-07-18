@@ -91,4 +91,30 @@ describe('ViewportPerformanceMonitor', () => {
     expect(monitor.getSnapshot().sampleCount).toBe(0)
     expect(reporter).not.toHaveBeenCalled()
   })
+
+  it('reports a six-robot acceptance window above 50 FPS with collision p95 below 10 ms', () => {
+    let nowMs = 0
+    const monitor = new ViewportPerformanceMonitor({
+      enabled: true,
+      maxSamples: 600,
+      now: () => nowMs
+    })
+
+    for (let frame = 0; frame <= 600; frame += 1) {
+      const frameTimestamp = frame * 16.67
+      nowMs = frameTimestamp
+      monitor.beginFrame(frameTimestamp)
+      const collisionStartedAt = monitor.beginStage()
+      nowMs += 4
+      monitor.endStage('collision', collisionStartedAt)
+      nowMs += 2
+      monitor.endFrame()
+    }
+
+    const snapshot = monitor.getSnapshot()
+    expect(snapshot.sampleCount).toBe(600)
+    expect(snapshot.medianFps).toBeGreaterThanOrEqual(50)
+    expect(snapshot.p95FrameIntervalMs).toBeLessThanOrEqual(20)
+    expect(snapshot.p95CollisionMs).toBeLessThanOrEqual(10)
+  })
 })

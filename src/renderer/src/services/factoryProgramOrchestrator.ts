@@ -46,6 +46,12 @@ export async function executeFactoryProgramV1(
     throw new Error('No robot was selected.')
   }
 
+  if (program.raw.executionReady !== true) {
+    throw new Error(
+      `LUA program ${program.fileName} is not execution-ready. Import and validate it again before running it.`
+    )
+  }
+
   const store = useFactoryProgramStore.getState()
   const factoryRunId = createRunId()
 
@@ -73,7 +79,8 @@ export async function executeFactoryProgramV1(
         const imported = await importLuaProgramForRobot(
           luaContext,
           program.fileName,
-          program.luaContent
+          program.luaContent,
+          signal
         )
 
         store.patchRobotState(target.robotId, {

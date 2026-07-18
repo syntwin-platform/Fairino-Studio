@@ -18,6 +18,7 @@ interface SceneState {
   setSelectedObjectId: (id: string | null) => void
   setRobotFault: (robotId: string, fault: RobotFaultState | null) => void
   setRobotContact: (robotId: string, contact: RobotSafetyContactState | null) => void
+  resolveRobotCollision: (robotId: string) => void
   clearRobotSafetyState: (robotId: string) => void
   setDebugHitbox: (debug: boolean) => void
   clearScene: () => void
@@ -141,6 +142,27 @@ export const useSceneStore = create<SceneState>((set) => ({
       }
 
       return { robotContactsById }
+    }),
+
+  resolveRobotCollision: (robotId) =>
+    set((state) => {
+      const normalizedRobotId = robotId.trim()
+      if (!normalizedRobotId) return state
+
+      const fault = state.robotFaultsById[normalizedRobotId]
+      const shouldClearCollisionFault =
+        fault?.active === true && fault.kind === 'collision' && fault.code.startsWith('COLLISION_')
+      const hasContact = Boolean(state.robotContactsById[normalizedRobotId])
+      if (!hasContact && !shouldClearCollisionFault) return state
+
+      const robotContactsById = { ...state.robotContactsById }
+      delete robotContactsById[normalizedRobotId]
+
+      if (!shouldClearCollisionFault) return { robotContactsById }
+
+      const robotFaultsById = { ...state.robotFaultsById }
+      delete robotFaultsById[normalizedRobotId]
+      return { robotContactsById, robotFaultsById }
     }),
 
   clearRobotSafetyState: (robotId) =>

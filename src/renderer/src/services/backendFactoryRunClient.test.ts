@@ -115,4 +115,43 @@ describe('backendFactoryRunClient', () => {
     expect(body).not.toHaveProperty('luaContent')
     expect(body).not.toHaveProperty('robotIds')
   })
+
+  it('keeps the same client request id when a transient network failure is retried', async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError('network reset')).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      statusText: 'Created',
+      json: vi.fn().mockResolvedValue({
+        id: 'factory-run-1',
+        clientRequestId: '11111111-1111-4111-8111-111111111111'
+      })
+    } as unknown as Response)
+
+    await createFactoryRun(
+      {
+        backendUrl: 'http://localhost:5000',
+        token: 'test-token'
+      },
+      {
+        clientRequestId: '11111111-1111-4111-8111-111111111111',
+        companyId: 'company-1',
+        coordinationMode: 'Synchronized',
+        failurePolicy: 'IsolateTarget',
+        programName: 'retry-safe',
+        luaFileName: 'retry-safe.lua',
+        luaContent: "print('retry')",
+        robotIds: ['robot-1']
+      }
+    )
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    const firstBody = (fetchMock.mock.calls[0] as [string, RequestInit])[1].body
+    const secondBody = (fetchMock.mock.calls[1] as [string, RequestInit])[1].body
+
+    expect(secondBody).toBe(firstBody)
+    expect(JSON.parse(String(secondBody)).clientRequestId).toBe(
+      '11111111-1111-4111-8111-111111111111'
+    )
+  })
 })

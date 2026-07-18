@@ -249,11 +249,24 @@ function triggerCollisionSafetyAction(contact: RobotSafetyContactState): void {
   })
 }
 
-export function clearRobotSafetyContact(robotId: string): void {
+interface ClearRobotSafetyContactOptions {
+  resetResolvedCollisionFault?: boolean
+}
+
+export function clearRobotSafetyContact(
+  robotId: string,
+  options: ClearRobotSafetyContactOptions = {}
+): void {
   const normalizedRobotId = normalizeRobotId(robotId)
   if (!normalizedRobotId) return
 
-  useSceneStore.getState().setRobotContact(normalizedRobotId, null)
+  const store = useSceneStore.getState()
+  if (options.resetResolvedCollisionFault) {
+    store.resolveRobotCollision(normalizedRobotId)
+    return
+  }
+
+  store.setRobotContact(normalizedRobotId, null)
 }
 
 export function resetRobotFault(robotId: string, options: ResetRobotFaultOptions): boolean {

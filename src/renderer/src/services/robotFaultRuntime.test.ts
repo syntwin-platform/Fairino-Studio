@@ -82,6 +82,26 @@ describe('robotFaultRuntime', () => {
     expect(useSceneStore.getState().robotFaultsById['robot-b']).toBeUndefined()
   })
 
+  it.each(['ground', 'self', 'obstacle'] as const)(
+    'keeps a %s collision stop-set isolated to the affected robot',
+    (kind) => {
+      const robotASignal = beginCommandExecutionForRobot('robot-a', 'command-a')
+      const robotBSignal = beginCommandExecutionForRobot('robot-b', 'command-b')
+
+      reportRobotSafetyContact('robot-a', {
+        level: 'collision',
+        kind,
+        objectIds: kind === 'obstacle' ? ['fixture-1'] : [],
+        message: `Robot A reported a ${kind} collision.`
+      })
+
+      expect(robotASignal.aborted).toBe(true)
+      expect(robotBSignal.aborted).toBe(false)
+      expect(useSceneStore.getState().robotFaultsById['robot-a']?.kind).toBe('collision')
+      expect(useSceneStore.getState().robotFaultsById['robot-b']).toBeUndefined()
+    }
+  )
+
   it('keeps a collision fault latched after physical contact clears', () => {
     reportRobotSafetyContact('robot-a', {
       level: 'collision',
@@ -96,6 +116,21 @@ describe('robotFaultRuntime', () => {
     expect(selectCollisionWarning(useSceneStore.getState())).toBe(false)
     expect(selectSafetyAlert(useSceneStore.getState())).toBe(true)
     expect(() => throwIfRobotMotionBlocked('robot-a')).toThrow(RobotMotionBlockedError)
+  })
+
+  it('atomically restores motion eligibility after the collision engine validates a clear', () => {
+    reportRobotSafetyContact('robot-a', {
+      level: 'collision',
+      kind: 'robot',
+      counterpartRobotIds: ['robot-b'],
+      message: 'Robot A collided with robot B.'
+    })
+
+    clearRobotSafetyContact('robot-a', { resetResolvedCollisionFault: true })
+
+    expect(useSceneStore.getState().robotContactsById['robot-a']).toBeUndefined()
+    expect(useSceneStore.getState().robotFaultsById['robot-a']).toBeUndefined()
+    expect(() => throwIfRobotMotionBlocked('robot-a')).not.toThrow()
   })
 
   it('requires safety validation and a cleared collision before reset', () => {

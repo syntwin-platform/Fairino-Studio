@@ -24,11 +24,7 @@ describe('Fairino FR5 collision regression', () => {
     engine.tick()
     engine.tick()
 
-    expect(
-      transitions
-        .map((transition) => transition.observation)
-        .filter((observation) => observation?.level === 'collision')
-    ).toEqual([])
+    expect(transitions).toEqual([])
   })
 
   it('detects the reported near-ground pose while Training is offline', () => {
@@ -40,6 +36,24 @@ describe('Fairino FR5 collision regression', () => {
     engine.tick()
     engine.tick()
 
+    expect(transitions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          monitoringMode: 'training-preview',
+          observation: expect.objectContaining({ level: 'collision', kind: 'ground' })
+        })
+      ])
+    )
+  })
+
+  it('detects the ground penetration pose reported from the ready preview viewport', () => {
+    const robot = loadFairinoRobot([0, -13.8, 93.6, -149.6, -90.2, 0])
+    const transitions = []
+    const engine = createEngine([createSnapshot('fr5', robot, 'training-preview')], transitions)
+
+    const result = engine.tick()
+
+    expect(result.evaluatedRobotCount).toBe(1)
     expect(transitions).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -120,7 +134,7 @@ describe('Fairino FR5 collision regression', () => {
     )
   })
 
-  it('does not report collisions for six separated Factory robots', () => {
+  it('does not report warnings for six separated Factory robots while their poses change', () => {
     const robots = Array.from({ length: 6 }, (_, index) => {
       const robot = loadFairinoRobot([0, -58.5, 93.6, -149.6, -90.2, 0])
       robot.position.x = index * 2
@@ -130,22 +144,28 @@ describe('Fairino FR5 collision regression', () => {
     const transitions = []
     const engine = createEngine(robots, transitions)
 
-    engine.tick()
-    engine.tick()
-    engine.tick()
+    for (let tick = 0; tick < 12; tick += 1) {
+      for (const snapshot of robots) {
+        snapshot.object.joints.j1.setJointValue(THREE.MathUtils.degToRad(tick * 0.25))
+        snapshot.object.updateMatrixWorld(true)
+      }
+      engine.tick()
+    }
 
-    expect(
-      transitions.filter((transition) => transition.observation?.level === 'collision')
-    ).toEqual([])
+    expect(transitions).toEqual([])
   })
 })
 
 function createEngine(robots, transitions, policy = FAIRINO_FR5_COLLISION_POLICY) {
-  return new CollisionEngine({
+  const engine = new CollisionEngine({
     getSnapshot: () => ({ robots, obstacles: [] }),
     getRobotPolicy: () => policy,
     onContactTransition: (transition) => transitions.push(transition)
   })
+  while (!engine.prewarmExactGeometry(100)) {
+    // The browser performs this work in idle chunks; regression tests prepare synchronously.
+  }
+  return engine
 }
 
 function createSnapshot(robotId, robot, monitoringMode) {
