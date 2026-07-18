@@ -293,6 +293,18 @@ export default function Header(): React.JSX.Element {
             return
           }
 
+          if (!preview.executionReady) {
+            const unsupported = preview.unsupportedSteps?.[0]
+            const message = unsupported
+              ? `Step ${unsupported.orderIndex} "${unsupported.label}" (${unsupported.stepType}): ${unsupported.reason}`
+              : language === 'vi'
+                ? 'File LUA parse thành công nhưng chưa sẵn sàng để thực thi. Hãy khởi động lại Backend mới nhất rồi import lại.'
+                : 'The LUA file parsed successfully but is not execution-ready. Restart the updated Backend and import it again.'
+
+            alert(`${t('luaImportError')} ${message}`)
+            return
+          }
+
           const parsedSteps = preview.parsedSteps
             .map(toWorkflowStep)
             .filter((step): step is WorkflowStep => step !== null)

@@ -25,7 +25,10 @@ export class CollisionEngine {
   private readonly obstacleCache = new ObstacleBoundsCache()
   private readonly geometryCache = new RobotCollisionGeometryCache()
   private readonly contactStates = new Map<string, RobotContactState>()
+  private readonly settleTicksByRobotId = new Map<string, number>()
   private readonly now: () => number
+  private exactCheckOffset = 0
+  private forceFullEvaluation = true
   private disposed = false
 
   constructor(private readonly options: CollisionEngineOptions) {
@@ -39,31 +42,39 @@ export class CollisionEngine {
     const snapshot = this.options.getSnapshot()
     const monitoredRobots = snapshot.robots.filter((robot) => robot.visible)
     const robotsById = new Map(monitoredRobots.map((robot) => [robot.robotId, robot]))
-    // Every visible robot participates in monitoring, including an offline/static Factory robot.
-    // Monitoring only publishes observations; the Viewport callback still limits stop actions to
-    // factory-active robots, so this does not turn an offline preview into an execution command.
-    const primaryEvaluateRobotIds = new Set(monitoredRobots.map((robot) => robot.robotId))
     const transitions: CollisionContactTransition[] = []
 
     const obstacleSync = this.obstacleCache.sync(snapshot.obstacles)
     const evaluateRobotIds = new Set<string>()
     for (const robot of monitoredRobots) {
-      // Monitoring is continuous in both Training and Factory. Immutable geometry is cached;
-      // only world transforms and broad-phase bounds are refreshed on each scheduler tick.
       robot.object.updateWorldMatrix(true, true)
-      this.geometryCache.updateBounds(robot)
-      evaluateRobotIds.add(robot.robotId)
+      const boundsUpdate = this.geometryCache.updateBoundsWithStatus(robot)
+      const contactState = this.contactStates.get(robot.robotId)
+      const monitoringModeChanged =
+        Boolean(contactState) && contactState?.monitoringMode !== robot.monitoringMode
+      if (boundsUpdate.changed || obstacleSync.changed || this.forceFullEvaluation) {
+        // Keep a short follow-up window for confirmation ticks and work-budget spillover. Static
+        // robots leave the hot path after the window instead of being rescanned forever.
+        this.settleTicksByRobotId.set(robot.robotId, 8)
+      }
+
+      const settleTicks = this.settleTicksByRobotId.get(robot.robotId) ?? 0
+      if (
+        settleTicks > 0 ||
+        monitoringModeChanged ||
+        Boolean(contactState?.emitted) ||
+        Boolean(contactState && contactState.pendingTicksByKey.size > 0)
+      ) {
+        evaluateRobotIds.add(robot.robotId)
+      }
     }
+    this.forceFullEvaluation = false
+    const primaryEvaluateRobotIds = new Set(evaluateRobotIds)
 
     if (evaluateRobotIds.size === 0) {
-      for (const robot of monitoredRobots) {
-        const transition = this.advanceContactState(robot, [])
-        if (transition) transitions.push(transition)
-      }
-      this.emitTransitions(transitions)
       return {
         ...emptyTickResult(this.now() - startedAt),
-        transitionCount: transitions.length
+        narrowPhaseRobotCount: monitoredRobots.length
       }
     }
 
@@ -78,9 +89,27 @@ export class CollisionEngine {
     const linkSnapshotsByRobotId = new Map()
     for (const robotId of broadPhase.evaluateRobotIds) {
       const robot = robotsById.get(robotId)
-      if (robot) linkSnapshotsByRobotId.set(robotId, this.geometryCache.buildLinkObbSnapshot(robot))
+      if (robot) {
+        const linkSnapshot = this.geometryCache.buildLinkObbSnapshot(robot)
+        if (linkSnapshot.linkObbs.size > 0) linkSnapshotsByRobotId.set(robotId, linkSnapshot)
+      }
     }
 
+    const exactWorkBudgetByRobotId = new Map(
+      monitoredRobots.map((robot) => [
+        robot.robotId,
+        {
+          remainingMeasurements: Math.max(
+            1,
+            this.options.getRobotPolicy(robot.robotId).thresholds.maxExactMeasurementsPerTick ?? 2
+          )
+        }
+      ])
+    )
+    const totalRobotBudget = [...exactWorkBudgetByRobotId.values()].reduce(
+      (total, budget) => total + budget.remainingMeasurements,
+      0
+    )
     const observations = runCollisionNarrowPhase({
       robotsById,
       primaryEvaluateRobotIds,
@@ -89,13 +118,26 @@ export class CollisionEngine {
       obstacleCandidatesByRobotId: broadPhase.obstacleCandidatesByRobotId,
       robotPairCandidates: broadPhase.robotPairCandidates,
       geometryCache: this.geometryCache,
+      robotPairExactWorkBudget: {
+        remainingMeasurements: Math.max(2, Math.min(8, totalRobotBudget))
+      },
+      exactWorkBudgetByRobotId,
+      exactCheckOffset: this.exactCheckOffset,
       getRobotPolicy: this.options.getRobotPolicy
     })
+    this.exactCheckOffset += 1
 
-    for (const robot of monitoredRobots) {
-      const robotId = robot.robotId
+    for (const robotId of broadPhase.evaluateRobotIds) {
+      const robot = robotsById.get(robotId)
+      if (!robot) continue
       const transition = this.advanceContactState(robot, observations.get(robotId) ?? [])
       if (transition) transitions.push(transition)
+    }
+
+    for (const robotId of primaryEvaluateRobotIds) {
+      const remainingTicks = (this.settleTicksByRobotId.get(robotId) ?? 0) - 1
+      if (remainingTicks > 0) this.settleTicksByRobotId.set(robotId, remainingTicks)
+      else this.settleTicksByRobotId.delete(robotId)
     }
 
     this.emitTransitions(transitions)
@@ -114,6 +156,7 @@ export class CollisionEngine {
 
   removeRobot(robotId: string): void {
     this.geometryCache.remove(robotId)
+    this.settleTicksByRobotId.delete(robotId)
     const state = this.contactStates.get(robotId)
     this.contactStates.delete(robotId)
     if (state?.emitted) {
@@ -123,6 +166,68 @@ export class CollisionEngine {
         observation: null
       })
     }
+  }
+
+  getActiveContacts(): Array<{
+    robotId: string
+    monitoringMode: CollisionMonitoringMode
+    observation: CollisionObservation
+  }> {
+    const contacts: Array<{
+      robotId: string
+      monitoringMode: CollisionMonitoringMode
+      observation: CollisionObservation
+    }> = []
+    for (const [robotId, state] of this.contactStates) {
+      if (!state.emitted) continue
+      contacts.push({
+        robotId,
+        monitoringMode: state.monitoringMode,
+        observation: state.emitted
+      })
+    }
+    return contacts
+  }
+
+  prewarmExactGeometry(maxNewTrees = 1): boolean {
+    if (this.disposed) return true
+    const snapshot = this.options.getSnapshot()
+    const robots = snapshot.robots.filter((robot) => robot.visible)
+    let remainingTreeBudget = Math.max(1, maxNewTrees)
+
+    for (const robot of robots) {
+      if (remainingTreeBudget <= 0) return false
+      robot.object.updateWorldMatrix(true, true)
+      const result = this.geometryCache.prewarmExactGeometry(robot, remainingTreeBudget)
+      remainingTreeBudget -= result.preparedTreeCount
+      if (!result.complete) return false
+    }
+
+    for (const obstacle of snapshot.obstacles.filter((item) => item.visible)) {
+      if (remainingTreeBudget <= 0) return false
+      obstacle.object.updateWorldMatrix(true, true)
+      const result = this.geometryCache.prewarmObjectExactGeometry(
+        obstacle.object,
+        remainingTreeBudget
+      )
+      remainingTreeBudget -= result.preparedTreeCount
+      if (!result.complete) return false
+    }
+
+    this.forceFullEvaluation = true
+    return true
+  }
+
+  isExactGeometryReady(): boolean {
+    if (this.disposed) return false
+    const snapshot = this.options.getSnapshot()
+    const robots = snapshot.robots.filter((robot) => robot.visible)
+    if (robots.length === 0) return false
+    if (!robots.every((robot) => this.geometryCache.isExactGeometryReady(robot))) return false
+
+    return snapshot.obstacles
+      .filter((obstacle) => obstacle.visible)
+      .every((obstacle) => this.geometryCache.isObjectExactGeometryReady(obstacle.object))
   }
 
   dispose(options: CollisionEngineDisposeOptions = {}): void {
@@ -141,6 +246,7 @@ export class CollisionEngine {
     this.obstacleCache.clear()
     this.geometryCache.clear()
     this.contactStates.clear()
+    this.settleTicksByRobotId.clear()
   }
 
   private advanceContactState(
@@ -171,15 +277,16 @@ export class CollisionEngine {
       )
     }
 
-    const requiredConfirmTicks = Math.max(1, policy.confirmTicks)
     const confirmedCollisions = collisionObservations.filter(
       (observation) =>
-        (state.pendingTicksByKey.get(observation.confirmationKey) ?? 0) >= requiredConfirmTicks
+        (state.pendingTicksByKey.get(observation.confirmationKey) ?? 0) >=
+        requiredConfirmTicksForObservation(observation, policy.confirmTicks)
     )
     const pendingCollisionWarnings = collisionObservations
       .filter(
         (observation) =>
-          (state.pendingTicksByKey.get(observation.confirmationKey) ?? 0) < requiredConfirmTicks
+          (state.pendingTicksByKey.get(observation.confirmationKey) ?? 0) <
+          requiredConfirmTicksForObservation(observation, policy.confirmTicks)
       )
       .map(toPendingCollisionWarning)
     const proximityObservations = observations.filter(
@@ -243,7 +350,11 @@ function sameContactIdentity(
   left: CollisionObservation | null,
   right: CollisionObservation
 ): boolean {
-  return left?.level === right.level && left.confirmationKey === right.confirmationKey
+  return (
+    left?.level === right.level &&
+    left.confirmationKey === right.confirmationKey &&
+    left.source === right.source
+  )
 }
 
 function toPendingCollisionWarning(observation: CollisionObservation): CollisionObservation {
@@ -252,6 +363,16 @@ function toPendingCollisionWarning(observation: CollisionObservation): Collision
     level: 'proximity',
     message: `Possible ${observation.kind} collision is being confirmed. ${observation.message}`
   }
+}
+
+function requiredConfirmTicksForObservation(
+  observation: CollisionObservation,
+  configuredConfirmTicks: number
+): number {
+  // Ground penetration is calculated directly from the link's mesh vertices. It is deterministic
+  // and does not need the temporal confirmation used by BVH pair contacts.
+  if (observation.kind === 'ground') return 1
+  return Math.max(1, configuredConfirmTicks)
 }
 
 function chooseStableObservation(
@@ -273,10 +394,10 @@ function compareObservationPriority(
   right: CollisionObservation
 ): number {
   const kindPriority: Record<CollisionObservation['kind'], number> = {
-    robot: 4,
-    obstacle: 3,
+    ground: 4,
+    robot: 3,
     self: 2,
-    ground: 1
+    obstacle: 1
   }
   return (
     kindPriority[right.kind] - kindPriority[left.kind] ||

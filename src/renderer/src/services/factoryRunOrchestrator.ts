@@ -171,7 +171,8 @@ async function waitForFactoryRunStatus(
   context: BackendFactoryRunContext,
   factoryRunId: string,
   stopStatuses: Set<string>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  redrive?: () => Promise<FactoryRunResponse>
 ): Promise<FactoryRunResponse> {
   let latest: FactoryRunResponse | null = null
 
@@ -181,6 +182,17 @@ async function waitForFactoryRunStatus(
 
     if (stopStatuses.has(latest.status)) {
       return latest
+    }
+
+    const redriveInterval = stopStatuses === READY_FACTORY_RUN_STATUSES ? 40 : 10
+
+    if (redrive && attempt > 0 && attempt % redriveInterval === 0) {
+      latest = await redrive()
+      applyFactoryRunResponse(latest)
+
+      if (stopStatuses.has(latest.status)) {
+        return latest
+      }
     }
 
     await wait(stopStatuses === READY_FACTORY_RUN_STATUSES ? 250 : 1000, signal)
@@ -213,6 +225,16 @@ export async function executeFactoryProgramV2(
     throw new Error('No LUA program was assigned to the selected robots.')
   }
 
+  const nonExecutableProgram = sourcePrograms.find(
+    ({ program }) => program.raw.executionReady !== true
+  )
+
+  if (nonExecutableProgram) {
+    throw new Error(
+      `LUA program ${nonExecutableProgram.program.fileName} is not execution-ready. Import and validate it again before creating a FactoryRun.`
+    )
+  }
+
   const sourceProgramsByKey = new Map(
     sourcePrograms.map((sourceProgram) => [sourceProgram.key, sourceProgram])
   )
@@ -230,6 +252,7 @@ export async function executeFactoryProgramV2(
   const coordinationMode = store.run.coordinationMode
   const failurePolicy = store.run.failurePolicy
   const companyId = getSingleCompanyId(targets)
+  const clientRequestId = crypto.randomUUID()
   let declaredExecutionGroupId: string | null = null
 
   store.setBusy(true)
@@ -271,6 +294,7 @@ export async function executeFactoryProgramV2(
     const created = await createFactoryRun(
       context,
       {
+        clientRequestId,
         companyId,
         coordinationMode,
         failurePolicy,
@@ -322,7 +346,9 @@ export async function executeFactoryProgramV2(
 
     const ready = READY_FACTORY_RUN_STATUSES.has(prepared.status)
       ? prepared
-      : await waitForFactoryRunStatus(context, created.id, READY_FACTORY_RUN_STATUSES, signal)
+      : await waitForFactoryRunStatus(context, created.id, READY_FACTORY_RUN_STATUSES, signal, () =>
+          prepareFactoryRun(context, created.id, signal)
+        )
 
     recordFactoryRunDiagnostic('factory.prepare.completed', {
       factoryRunId: created.id,
@@ -364,7 +390,13 @@ export async function executeFactoryProgramV2(
 
     const finalRun = TERMINAL_FACTORY_RUN_STATUSES.has(started.status)
       ? started
-      : await waitForFactoryRunStatus(context, created.id, TERMINAL_FACTORY_RUN_STATUSES, signal)
+      : await waitForFactoryRunStatus(
+          context,
+          created.id,
+          TERMINAL_FACTORY_RUN_STATUSES,
+          signal,
+          () => startFactoryRun(context, created.id, signal)
+        )
 
     applyFactoryRunResponse(finalRun)
 
@@ -412,6 +444,22 @@ export async function cancelFactoryProgramV2(
   context: BackendFactoryRunContext,
   factoryRunId: string
 ): Promise<void> {
-  const response = await cancelFactoryRun(context, factoryRunId)
-  applyFactoryRunResponse(response)
+  for (let attempt = 0; attempt < 120; attempt++) {
+    const response = await cancelFactoryRun(context, factoryRunId)
+    applyFactoryRunResponse(response)
+
+    if (
+      response.status === 'Cancelling' ||
+      response.status === 'Cancelled' ||
+      response.status === 'Completed' ||
+      response.status === 'PartiallyCompleted' ||
+      response.status === 'Failed'
+    ) {
+      return
+    }
+
+    await wait(500)
+  }
+
+  throw new Error(`Factory run ${factoryRunId} cancel request timed out.`)
 }

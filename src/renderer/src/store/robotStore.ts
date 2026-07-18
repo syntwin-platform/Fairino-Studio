@@ -85,9 +85,7 @@ function persistTrainingViewState(patch: Partial<PersistedTrainingViewState>): v
   persistedTrainingViewState = {
     ...persistedTrainingViewState,
     ...patch,
-    jointAngles: patch.jointAngles
-      ? [...patch.jointAngles]
-      : persistedTrainingViewState.jointAngles
+    jointAngles: patch.jointAngles ? [...patch.jointAngles] : persistedTrainingViewState.jointAngles
   }
 
   if (typeof window === 'undefined') return

@@ -98,6 +98,21 @@ describe('robotFaultRuntime', () => {
     expect(() => throwIfRobotMotionBlocked('robot-a')).toThrow(RobotMotionBlockedError)
   })
 
+  it('atomically restores motion eligibility after the collision engine validates a clear', () => {
+    reportRobotSafetyContact('robot-a', {
+      level: 'collision',
+      kind: 'robot',
+      counterpartRobotIds: ['robot-b'],
+      message: 'Robot A collided with robot B.'
+    })
+
+    clearRobotSafetyContact('robot-a', { resetResolvedCollisionFault: true })
+
+    expect(useSceneStore.getState().robotContactsById['robot-a']).toBeUndefined()
+    expect(useSceneStore.getState().robotFaultsById['robot-a']).toBeUndefined()
+    expect(() => throwIfRobotMotionBlocked('robot-a')).not.toThrow()
+  })
+
   it('requires safety validation and a cleared collision before reset', () => {
     reportRobotSafetyContact('robot-a', {
       level: 'collision',

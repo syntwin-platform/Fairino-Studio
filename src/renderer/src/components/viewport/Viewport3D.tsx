@@ -5,7 +5,6 @@ import { TransformControls } from 'three/examples/jsm/controls/TransformControls
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js'
 import { OBB } from 'three/examples/jsm/math/OBB.js'
-import URDFLoader from 'urdf-loader'
 import { useRobotStore } from '../../store/robotStore'
 import { useSceneStore } from '../../store/sceneStore'
 import { solveIK } from '../../engine/robot/ikSolver'
@@ -25,6 +24,7 @@ import { FAIRINO_FR5_COLLISION_POLICY } from '../../services/collision/collision
 import type { MoveLRunOptions, PreparedMoveLTrajectory } from '../../services/robotMotionRuntime'
 import { throwIfCommandCancelled } from '../../services/commandExecutionRuntime'
 import { runScheduledJointTrajectory } from '../../services/factoryMotionScheduler'
+import { loadUrdfRobotWhenAssetsReady } from '../../services/urdfRobotLoader'
 import {
   clearRobotSafetyContact,
   removeRobotSafetyState,
@@ -67,8 +67,7 @@ const COLLISION_SCHEDULER_INTERVAL_MS = 1000 / 15
 const MEASUREMENT_SCHEDULER_INTERVAL_MS = 100
 const ROBOT_FAULT_COLOR = 0x7f1d1d
 const ROBOT_FAULT_EMISSIVE = 0xff1f1f
-const ROBOT_PROXIMITY_COLOR = 0x78350f
-const ROBOT_PROXIMITY_EMISSIVE = 0xf59e0b
+const LINK_LOCAL_BOX_CACHE = new WeakMap<THREE.Object3D, THREE.Box3 | null>()
 
 function toJointAngles(values: number[]): JointAngles {
   return values.slice(0, 6) as JointAngles
@@ -104,6 +103,12 @@ interface RobotMaterialSnapshot {
 }
 
 type RobotSafetyVisualState = 'normal' | 'proximity' | 'fault'
+type CollisionReadinessStatus = 'loading' | 'ready' | 'error'
+
+interface CollisionReadinessState {
+  status: CollisionReadinessStatus
+  robotCount: number
+}
 
 function isHighlightableMaterial(material: THREE.Material): material is HighlightableMaterial {
   return (
@@ -118,7 +123,8 @@ function isColorMaterial(material: THREE.Material): material is ColorMaterial {
 }
 
 function createWarningCircle(color: number): THREE.Mesh {
-  const geometry = new THREE.RingGeometry(0.32, 0.38, 64)
+  const outerRadius = FAIRINO_FR5_COLLISION_POLICY.thresholds.robotApproachZoneRadiusMeters
+  const geometry = new THREE.RingGeometry(Math.max(0.01, outerRadius - 0.06), outerRadius, 64)
   const material = new THREE.MeshBasicMaterial({
     color: color,
     side: THREE.DoubleSide,
@@ -271,6 +277,8 @@ export default function Viewport3D(): React.JSX.Element {
   const robotRefs = useRef<Map<string, FairinoRobotObject>>(new Map())
   const collisionEngineRef = useRef<CollisionEngine | null>(null)
   const collisionSchedulerRef = useRef<CollisionScheduler | null>(null)
+  const requestCollisionPrewarmRef = useRef<() => void>(() => undefined)
+  const isTransformDraggingRef = useRef(false)
   const sceneGenerationRef = useRef(0)
   const robotLoadGenerationByIdRef = useRef<Map<string, number>>(new Map())
   const objectLoadGenerationByIdRef = useRef<Map<string, number>>(new Map())
@@ -283,6 +291,7 @@ export default function Viewport3D(): React.JSX.Element {
   const previewRobotLoadGenerationRef = useRef(0)
   const loadingRobotIdsRef = useRef<Set<string>>(new Set())
   const loadingObjectIdsRef = useRef<Set<string>>(new Set())
+  const collisionLoadErrorRef = useRef(false)
   const robotsRef = useRef<RobotInstance[]>([])
   const sceneRef = useRef<THREE.Scene | null>(null)
   const controlsRef = useRef<OrbitControls | null>(null)
@@ -295,6 +304,18 @@ export default function Viewport3D(): React.JSX.Element {
   const keysPressedRef = useRef<Set<string>>(new Set())
   const [isRobotLoaded, setIsRobotLoaded] = useState(false)
   const [isTechnicalDetailsExpanded, setIsTechnicalDetailsExpanded] = useState(false)
+  const [collisionReadiness, setCollisionReadiness] = useState<CollisionReadinessState>({
+    status: 'loading',
+    robotCount: 0
+  })
+
+  const updateCollisionReadiness = (status: CollisionReadinessStatus, robotCount = 0): void => {
+    setCollisionReadiness((current) =>
+      current.status === status && current.robotCount === robotCount
+        ? current
+        : { status, robotCount }
+    )
+  }
 
   // Helper to dispose robot 3D geometries and materials
   function disposeRobotObject(robotObj: THREE.Object3D): void {
@@ -426,14 +447,6 @@ export default function Viewport3D(): React.JSX.Element {
         if (isHighlightableMaterial(snapshot.material)) {
           snapshot.material.emissive.setHex(ROBOT_FAULT_EMISSIVE)
           snapshot.material.emissiveIntensity = 1.35
-        }
-      } else if (nextState === 'proximity') {
-        if (isColorMaterial(snapshot.material)) {
-          snapshot.material.color.setHex(ROBOT_PROXIMITY_COLOR)
-        }
-        if (isHighlightableMaterial(snapshot.material)) {
-          snapshot.material.emissive.setHex(ROBOT_PROXIMITY_EMISSIVE)
-          snapshot.material.emissiveIntensity = 0.85
         }
       }
 
@@ -612,6 +625,7 @@ export default function Viewport3D(): React.JSX.Element {
     }
 
     applyRobotSceneBinding(robot, selectedRobotSceneBinding)
+    collisionSchedulerRef.current?.requestImmediateTick()
   }, [
     isRobotLoaded,
     selectedRobotId,
@@ -1267,35 +1281,37 @@ export default function Viewport3D(): React.JSX.Element {
     linkObj: THREE.Object3D,
     allLinkObjs: Set<THREE.Object3D>
   ): OBB | null => {
-    const invMatrix = new THREE.Matrix4().copy(linkObj.matrixWorld).invert()
-    const localBox = new THREE.Box3()
-    let hasMesh = false
+    let localBox = LINK_LOCAL_BOX_CACHE.get(linkObj)
+    if (localBox === undefined) {
+      const invMatrix = new THREE.Matrix4().copy(linkObj.matrixWorld).invert()
+      const computedLocalBox = new THREE.Box3()
+      let hasMesh = false
 
-    // Custom DFS that stops when it enters a different link's subtree
-    const collectMeshes = (node: THREE.Object3D): void => {
-      // Stop traversal if we've entered a child link (but allow the root linkObj itself)
-      if (node !== linkObj && allLinkObjs.has(node)) return
+      // Link geometry is rigid in its own frame. Cache this DFS result; joint/base motion only
+      // changes matrixWorld and must not traverse meshes or recompute geometry bounds again.
+      const collectMeshes = (node: THREE.Object3D): void => {
+        if (node !== linkObj && allLinkObjs.has(node)) return
 
-      if (node instanceof THREE.Mesh && node.geometry) {
-        const mesh = node
-        mesh.geometry.computeBoundingBox()
-        if (mesh.geometry.boundingBox) {
-          // Transform mesh-local bounds into the link's local coordinate frame
-          const childRelMat = new THREE.Matrix4().multiplyMatrices(invMatrix, mesh.matrixWorld)
-          const meshLocalBox = mesh.geometry.boundingBox.clone().applyMatrix4(childRelMat)
-          localBox.union(meshLocalBox)
-          hasMesh = true
+        if (node instanceof THREE.Mesh && node.geometry) {
+          const mesh = node
+          if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
+          if (mesh.geometry.boundingBox) {
+            const childRelMat = new THREE.Matrix4().multiplyMatrices(invMatrix, mesh.matrixWorld)
+            const meshLocalBox = mesh.geometry.boundingBox.clone().applyMatrix4(childRelMat)
+            computedLocalBox.union(meshLocalBox)
+            hasMesh = true
+          }
         }
+
+        for (const child of node.children) collectMeshes(child)
       }
 
-      for (const child of node.children) {
-        collectMeshes(child)
-      }
+      collectMeshes(linkObj)
+      localBox = hasMesh && !computedLocalBox.isEmpty() ? computedLocalBox : null
+      LINK_LOCAL_BOX_CACHE.set(linkObj, localBox)
     }
 
-    collectMeshes(linkObj)
-
-    if (!hasMesh || localBox.isEmpty()) return null
+    if (!localBox) return null
 
     // Center: local centroid projected into world space
     const localCenter = new THREE.Vector3()
@@ -1689,10 +1705,16 @@ export default function Viewport3D(): React.JSX.Element {
 
     // Disable OrbitControls when dragging gizmo
     transformControls.addEventListener('dragging-changed', (event) => {
-      controls.enabled = !event.value
+      const isDragging = Boolean(event.value)
+      isTransformDraggingRef.current = isDragging
+      controls.enabled = !isDragging
 
-      if (!event.value) {
+      if (isDragging) {
+        collisionSchedulerRef.current?.requestImmediateTick()
+      } else {
         syncPlacementRobotSceneBinding()
+        collisionSchedulerRef.current?.requestImmediateTick()
+        requestCollisionPrewarmRef.current()
       }
     })
 
@@ -1705,14 +1727,18 @@ export default function Viewport3D(): React.JSX.Element {
         : robotState.isPlaying
 
       if (playing) return
-      if (syncPlacementRobotSceneBinding()) {
+      const activeObject = transformControls.object
+      const placementRobot = activeRobotId ? robotRefs.current.get(activeRobotId) : null
+      if (robotState.isRobotPlacementMode && placementRobot && activeObject === placementRobot) {
+        // Keep placement transient in Three.js while dragging. Committing Zustand here used to
+        // rerender the entire Factory UI and restart collision scheduling for every pointer event.
+        placementRobot.updateMatrixWorld(true)
         return
       }
 
       const robot = robotRef.current
       if (!robot) return
 
-      const activeObject = transformControls.object
       if (!activeObject) return
       // A. Check if currently manipulating an imported auxiliary 3D object
       const selectedObjId = useSceneStore.getState().selectedObjectId
@@ -2016,7 +2042,68 @@ export default function Viewport3D(): React.JSX.Element {
 
     renderer.domElement.addEventListener('pointerdown', onPointerDown)
 
-    // Measurement and Hitbox update function in animation loop
+    let lastMeasurementGeometrySignature: string | null = null
+
+    const projectMeasurementLabel = (line: THREE.Line, label: HTMLElement | null): void => {
+      if (!label || !containerRef.current || !line.visible) {
+        if (label) label.style.display = 'none'
+        return
+      }
+
+      const positions = line.geometry.getAttribute('position')
+      if (!positions || positions.count < 2) {
+        label.style.display = 'none'
+        return
+      }
+
+      const midpoint = new THREE.Vector3(
+        (positions.getX(0) + positions.getX(1)) * 0.5,
+        (positions.getY(0) + positions.getY(1)) * 0.5,
+        (positions.getZ(0) + positions.getZ(1)) * 0.5
+      ).project(camera)
+      label.style.left = `${(midpoint.x * 0.5 + 0.5) * containerRef.current.clientWidth}px`
+      label.style.top = `${(-midpoint.y * 0.5 + 0.5) * containerRef.current.clientHeight}px`
+      label.style.display = 'flex'
+    }
+
+    const createMeasurementGeometrySignature = (
+      robot: FairinoRobotObject,
+      sceneState: ReturnType<typeof useSceneStore.getState>,
+      isDebug: boolean,
+      unit: string,
+      currentLanguage: string
+    ): string => {
+      const signature: Array<string | number> = [
+        robot.uuid,
+        isDebug ? 1 : 0,
+        unit,
+        currentLanguage,
+        sceneState.selectedObjectId ?? ''
+      ]
+
+      for (const [linkName, link] of Object.entries(
+        robot.links as Record<string, THREE.Object3D>
+      ).sort(([leftName], [rightName]) => leftName.localeCompare(rightName))) {
+        signature.push(linkName)
+        for (const value of link.matrixWorld.elements) {
+          signature.push(Math.round(value * 100_000))
+        }
+      }
+
+      for (const objectId of [...loadedObjectsRef.current.keys()].sort()) {
+        const sceneObject = sceneState.objects.find((object) => object.id === objectId)
+        signature.push(
+          objectId,
+          sceneObject?.visible ? 1 : 0,
+          sceneState.objectTransformRevisionById[objectId] ?? 0
+        )
+      }
+
+      return signature.join('|')
+    }
+
+    // Measurement and hitbox geometry is cached by pose. Camera-only movement merely projects
+    // the existing line endpoints again; it must not rebuild every link OBB and object Box3.
     const updateMeasurementAndHitboxes = (): void => {
       const robot = robotRef.current
       const scene = sceneRef.current
@@ -2029,14 +2116,29 @@ export default function Viewport3D(): React.JSX.Element {
       const selfLabelEl = document.getElementById('self-measure-label')
       const selfTextEl = document.getElementById('self-measure-text')
 
+      const sceneState = useSceneStore.getState()
       const unit = useRobotStore.getState().lengthUnit
-      const isDebug = useSceneStore.getState().isDebugHitbox
+      const isDebug = sceneState.isDebugHitbox
       const currentLanguage = useRobotStore.getState().language
+      const geometrySignature = createMeasurementGeometrySignature(
+        robot,
+        sceneState,
+        isDebug,
+        unit,
+        currentLanguage
+      )
+
+      if (lastMeasurementGeometrySignature === geometrySignature) {
+        projectMeasurementLabel(measureLine, labelEl)
+        projectMeasurementLabel(selfMeasureLine, selfLabelEl)
+        return
+      }
+      lastMeasurementGeometrySignature = geometrySignature
 
       // 1. Gather active visible auxiliary objects (AABB is fine for non-articulated objects)
       const activeObjects: { id: string; name: string; box: THREE.Box3 }[] = []
       for (const [id, threeObj] of loadedObjectsRef.current.entries()) {
-        const storeObj = useSceneStore.getState().objects.find((o) => o.id === id)
+        const storeObj = sceneState.objects.find((o) => o.id === id)
         if (storeObj && storeObj.visible) {
           const box = new THREE.Box3().setFromObject(threeObj)
           activeObjects.push({ id, name: storeObj.name, box })
@@ -2151,7 +2253,7 @@ export default function Viewport3D(): React.JSX.Element {
 
       // 5. Find target auxiliary object for arm-to-object distance measurement
       let targetObj: { id: string; name: string; box: THREE.Box3 } | null = null
-      const selectedId = useSceneStore.getState().selectedObjectId
+      const selectedId = sceneState.selectedObjectId
       if (selectedId) {
         targetObj = activeObjects.find((o) => o.id === selectedId) || null
       }
@@ -2407,7 +2509,10 @@ export default function Viewport3D(): React.JSX.Element {
           currentContact &&
           ['ground', 'self', 'obstacle', 'robot'].includes(currentContact.kind)
         ) {
-          clearRobotSafetyContact(robotId)
+          // The engine emits this transition only after its clear hysteresis has confirmed that
+          // the robot is safe again. Clear the direct collision latch atomically with the contact
+          // so placement recovery never leaves an unreachable "waiting for reset" state.
+          clearRobotSafetyContact(robotId, { resetResolvedCollisionFault: true })
         }
       }
     })
@@ -2417,10 +2522,39 @@ export default function Viewport3D(): React.JSX.Element {
       intervalMs: COLLISION_SCHEDULER_INTERVAL_MS,
       tick: () => {
         const stageStartedAtMs = viewportPerformance.beginStage()
-        collisionEngine.tick()
+        const result = collisionEngine.tick()
+        const storedContacts = useSceneStore.getState().robotContactsById
+        for (const activeContact of collisionEngine.getActiveContacts()) {
+          if (storedContacts[activeContact.robotId]) continue
+          reportRobotSafetyContact(
+            activeContact.robotId,
+            {
+              level: activeContact.observation.level,
+              kind: activeContact.observation.kind,
+              counterpartRobotIds: activeContact.observation.counterpartRobotIds,
+              objectIds: activeContact.observation.objectIds,
+              message: activeContact.observation.message
+            },
+            {
+              // Reconciliation repairs presentation state only. The original transition remains
+              // solely responsible for Factory stop actions, so program behavior is unchanged.
+              triggerSafetyAction: false,
+              forceSafetyAction: false
+            }
+          )
+        }
+        if (result.narrowPhaseRobotCount > 0 && collisionEngine.isExactGeometryReady()) {
+          collisionLoadErrorRef.current = false
+          updateCollisionReadiness('ready', result.narrowPhaseRobotCount)
+        } else {
+          updateCollisionReadiness(collisionLoadErrorRef.current ? 'error' : 'loading')
+        }
         viewportPerformance.endStage('collision', stageStartedAtMs)
       },
-      onError: (error) => console.error('[Viewport3D] Collision scheduler failed.', error)
+      onError: (error) => {
+        updateCollisionReadiness('error')
+        console.error('[Viewport3D] Collision scheduler failed.', error)
+      }
     })
     collisionSchedulerRef.current = collisionScheduler
     const measurementScheduler = new CollisionScheduler({
@@ -2434,6 +2568,38 @@ export default function Viewport3D(): React.JSX.Element {
     })
     collisionScheduler.start()
     measurementScheduler.start()
+
+    let collisionPrewarmIdleHandle: number | null = null
+    let collisionPrewarmFallbackHandle: number | null = null
+    const runCollisionPrewarm = (): void => {
+      collisionPrewarmIdleHandle = null
+      collisionPrewarmFallbackHandle = null
+      // BVH construction is background work. Never let it compete with a user gesture; the
+      // dragging-changed(false) handler schedules it again after interaction completes.
+      if (isTransformDraggingRef.current) return
+      if (!collisionEngine.prewarmExactGeometry(1)) {
+        requestCollisionPrewarm()
+        return
+      }
+
+      // The first exact scan must run as soon as all BVHs are ready; otherwise a static unsafe
+      // startup pose would wait for an unrelated user action before producing a warning.
+      collisionScheduler.requestImmediateTick()
+    }
+    const requestCollisionPrewarm = (): void => {
+      if (collisionPrewarmIdleHandle !== null || collisionPrewarmFallbackHandle !== null) return
+      if (typeof window.requestIdleCallback === 'function') {
+        // A timeout prevents Chromium from starving collision preparation during a busy startup.
+        collisionPrewarmIdleHandle = window.requestIdleCallback(runCollisionPrewarm, {
+          timeout: 16
+        })
+      } else {
+        collisionPrewarmFallbackHandle = window.setTimeout(runCollisionPrewarm, 16)
+      }
+    }
+    requestCollisionPrewarmRef.current = requestCollisionPrewarm
+    requestCollisionPrewarm()
+
     const unsubscribeRobotRuntime = useRobotStore.subscribe((state, previousState) => {
       const activeRobotAdded = Object.entries(state.robotRuntimeById).some(([robotId, runtime]) => {
         const wasActive = Boolean(
@@ -2566,6 +2732,17 @@ export default function Viewport3D(): React.JSX.Element {
         collisionSchedulerRef.current = null
       }
       measurementScheduler.stop()
+      if (collisionPrewarmIdleHandle !== null) {
+        window.cancelIdleCallback(collisionPrewarmIdleHandle)
+        collisionPrewarmIdleHandle = null
+      }
+      if (collisionPrewarmFallbackHandle !== null) {
+        window.clearTimeout(collisionPrewarmFallbackHandle)
+        collisionPrewarmFallbackHandle = null
+      }
+      if (requestCollisionPrewarmRef.current === requestCollisionPrewarm) {
+        requestCollisionPrewarmRef.current = () => undefined
+      }
       unsubscribeRobotRuntime()
       // StrictMode performs an internal setup -> cleanup -> setup cycle before async models load.
       // Avoid publishing a fake clear for that empty scene, but clear real contacts if a populated
@@ -3008,6 +3185,7 @@ export default function Viewport3D(): React.JSX.Element {
   useEffect(() => {
     if (robotRef.current) {
       updateRobotJoints(jointAngles, robotRef.current)
+      collisionSchedulerRef.current?.requestImmediateTick()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jointAngles])
@@ -3088,16 +3266,15 @@ export default function Viewport3D(): React.JSX.Element {
 
     previewRobotLoadGenerationRef.current = loadGeneration
     previewRobotLoadingRef.current = true
+    collisionLoadErrorRef.current = false
+    updateCollisionReadiness('loading')
 
-    const loader = new URDFLoader()
-
-    loader.packages = {
-      fairino_description: './fairino_description'
-    }
-
-    loader.load(
-      './fairino_description/urdf/fairino5_v6.urdf',
-      (loadedRobot) => {
+    loadUrdfRobotWhenAssetsReady({
+      url: './fairino_description/urdf/fairino5_v6.urdf',
+      packages: {
+        fairino_description: './fairino_description'
+      },
+      onLoad: (loadedRobot) => {
         const loadIsCurrent =
           previewRobotLoadGenerationRef.current === loadGeneration &&
           sceneRef.current === scene &&
@@ -3139,15 +3316,17 @@ export default function Viewport3D(): React.JSX.Element {
         updateRobotJoints(useRobotStore.getState().jointAngles, loadedRobot)
         applyRobotSafetyVisual(PREVIEW_COLLISION_ROBOT_ID, true)
         collisionSchedulerRef.current?.requestImmediateTick()
+        requestCollisionPrewarmRef.current()
       },
-      undefined,
-      (error) => {
+      onError: (error) => {
         if (previewRobotLoadGenerationRef.current === loadGeneration) {
           previewRobotLoadingRef.current = false
+          collisionLoadErrorRef.current = true
+          updateCollisionReadiness('error')
           console.error('An error occurred loading preview URDF:', error)
         }
       }
-    )
+    })
 
     return () => {
       if (previewRobotLoadGenerationRef.current === loadGeneration) {
@@ -3199,6 +3378,7 @@ export default function Viewport3D(): React.JSX.Element {
           (robotLoadGenerationByIdRef.current.get(loadingId) ?? 0) + 1
         )
         loadingRobotIdsRef.current.delete(loadingId)
+        unregisterLoadedRobotMoveLRunner(loadingId)
       }
     }
 
@@ -3212,15 +3392,27 @@ export default function Viewport3D(): React.JSX.Element {
         const robotLoadGeneration = (robotLoadGenerationByIdRef.current.get(robot.id) ?? 0) + 1
         robotLoadGenerationByIdRef.current.set(robot.id, robotLoadGeneration)
         loadingRobotIdsRef.current.add(robot.id)
+        collisionLoadErrorRef.current = false
+        updateCollisionReadiness('loading', robotRefs.current.size)
 
-        const loader = new URDFLoader()
-        loader.packages = {
-          fairino_description: './fairino_description'
-        }
+        loadUrdfRobotWhenAssetsReady({
+          url: './fairino_description/urdf/fairino5_v6.urdf',
+          packages: {
+            fairino_description: './fairino_description'
+          },
+          onParsed: (loadedRobot) => {
+            const currentRobot = robotsRef.current.find((item) => item.id === robot.id)
+            const loadIsCurrent =
+              sceneRef.current === scene &&
+              sceneGenerationRef.current === sceneGeneration &&
+              robotLoadGenerationByIdRef.current.get(robot.id) === robotLoadGeneration &&
+              Boolean(currentRobot)
 
-        loader.load(
-          './fairino_description/urdf/fairino5_v6.urdf',
-          (loadedRobot) => {
+            if (loadIsCurrent && !robotRefs.current.has(robot.id)) {
+              registerLoadedRobotMoveLRunner(robot.id, loadedRobot)
+            }
+          },
+          onLoad: (loadedRobot) => {
             const currentRobot = robotsRef.current.find((item) => item.id === robot.id)
             const loadIsCurrent =
               sceneRef.current === scene &&
@@ -3262,7 +3454,6 @@ export default function Viewport3D(): React.JSX.Element {
 
             scene.add(loadedRobot)
             robotRefs.current.set(robot.id, loadedRobot)
-            registerLoadedRobotMoveLRunner(robot.id, loadedRobot)
             applyRobotSafetyVisual(robot.id, true)
             loadingRobotIdsRef.current.delete(robot.id)
             // Initial joints position sync
@@ -3279,9 +3470,9 @@ export default function Viewport3D(): React.JSX.Element {
             updateRobotJoints(robotAngles, loadedRobot)
             loadedRobot.updateMatrixWorld(true)
             collisionSchedulerRef.current?.requestImmediateTick()
+            requestCollisionPrewarmRef.current()
           },
-          undefined,
-          (error) => {
+          onError: (error) => {
             const loadIsCurrent =
               sceneRef.current === scene &&
               sceneGenerationRef.current === sceneGeneration &&
@@ -3289,9 +3480,11 @@ export default function Viewport3D(): React.JSX.Element {
             if (loadIsCurrent) {
               console.error('An error occurred loading URDF:', error)
               loadingRobotIdsRef.current.delete(robot.id)
+              collisionLoadErrorRef.current = true
+              if (robotRefs.current.size === 0) updateCollisionReadiness('error')
             }
           }
-        )
+        })
       }
     })
     collisionSchedulerRef.current?.requestImmediateTick()
@@ -3384,6 +3577,42 @@ export default function Viewport3D(): React.JSX.Element {
   }
   return (
     <div ref={containerRef} className="relative h-full w-full min-h-0 min-w-0 overflow-hidden">
+      <div
+        role="status"
+        aria-live="polite"
+        data-testid="collision-readiness"
+        className={`pointer-events-none absolute bottom-4 right-4 z-30 flex items-center gap-2 rounded-lg border px-3 py-2 text-[10px] font-semibold shadow-lg backdrop-blur-sm ${
+          collisionReadiness.status === 'ready'
+            ? 'border-emerald-500/40 bg-emerald-950/90 text-emerald-200'
+            : collisionReadiness.status === 'error'
+              ? 'border-rose-500/50 bg-rose-950/90 text-rose-200'
+              : 'border-amber-500/40 bg-amber-950/90 text-amber-200'
+        }`}
+      >
+        <span
+          className={`h-2 w-2 rounded-full ${
+            collisionReadiness.status === 'ready'
+              ? 'bg-emerald-400'
+              : collisionReadiness.status === 'error'
+                ? 'bg-rose-400'
+                : 'animate-pulse bg-amber-400'
+          }`}
+        />
+        <span>
+          {collisionReadiness.status === 'ready'
+            ? language === 'vi'
+              ? `Collision sẵn sàng (${collisionReadiness.robotCount} robot)`
+              : `Collision ready (${collisionReadiness.robotCount} robot)`
+            : collisionReadiness.status === 'error'
+              ? language === 'vi'
+                ? 'Collision chưa sẵn sàng — lỗi tải geometry'
+                : 'Collision unavailable — geometry load error'
+              : language === 'vi'
+                ? 'Đang khởi tạo collision...'
+                : 'Initializing collision...'}
+        </span>
+      </div>
+
       {/* Dynamic measurement label */}
       <div
         id="measure-label"

@@ -117,13 +117,43 @@ async function api<T>(
   token: string,
   init?: RequestInit
 ): Promise<T> {
-  const response = await fetch(apiUrl(backendUrl, path), {
-    ...init,
-    headers: {
-      ...authHeaders(token),
-      ...(init?.headers ?? {})
+  const externalSignal = init?.signal
+  const controller = new AbortController()
+  let timedOut = false
+  const handleExternalAbort = (): void => controller.abort(externalSignal?.reason)
+  const timeoutId = globalThis.setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, 8000)
+
+  externalSignal?.addEventListener('abort', handleExternalAbort, { once: true })
+
+  let response: Response
+
+  try {
+    response = await fetch(apiUrl(backendUrl, path), {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        ...authHeaders(token),
+        ...(init?.headers ?? {})
+      }
+    })
+  } catch (error) {
+    if (externalSignal?.aborted) throw error
+
+    if (timedOut) {
+      throw new BackendRobotClientError(0, 'Backend không phản hồi sau 8 giây.')
     }
-  })
+
+    throw new BackendRobotClientError(
+      0,
+      `Không kết nối được Backend tại ${backendUrl.trim()}. Hãy kiểm tra API đang chạy.`
+    )
+  } finally {
+    globalThis.clearTimeout(timeoutId)
+    externalSignal?.removeEventListener('abort', handleExternalAbort)
+  }
 
   if (!response.ok) {
     throw new BackendRobotClientError(response.status, await readErrorMessage(response))

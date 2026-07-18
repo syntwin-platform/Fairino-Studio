@@ -27,8 +27,8 @@ import SafetyDiagnosticsPanel from './SafetyDiagnosticsPanel'
 import RobotSafetyPolicyPanel from './RobotSafetyPolicyPanel'
 import TelemetryHistoryPanel from './TelemetryHistoryPanel'
 import { getCachedDeviceRuntimeSessionId } from '../services/backendDeviceSession'
+import { useBackendAuthStore } from '../store/backendAuthStore'
 const CONFIG_KEY = 'syntwin.backendSimulator.config'
-const TOKEN_KEY = 'syntwin.backendProgram.accessToken'
 const EMAIL_KEY = 'syntwin.backendProgram.email'
 
 interface ProgramResponse {
@@ -277,6 +277,13 @@ function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, milliseconds)
   })
+}
+
+function isBackendNetworkError(error: unknown): boolean {
+  return (
+    error instanceof TypeError ||
+    (error instanceof Error && /failed to fetch|networkerror|network request/i.test(error.message))
+  )
 }
 
 function formatCommandTime(value: string): string {
@@ -539,7 +546,11 @@ export default function BackendProgramControls(): React.ReactElement {
 
   const [password, setPassword] = useState('')
 
-  const [token, setToken] = useState(() => sessionStorage.getItem(TOKEN_KEY) || '')
+  const token = useBackendAuthStore((state) => state.accessToken)
+  const backendConnectivity = useBackendAuthStore((state) => state.connectivity)
+  const setBackendAccessToken = useBackendAuthStore((state) => state.setAccessToken)
+  const clearBackendAccessToken = useBackendAuthStore((state) => state.clearAccessToken)
+  const setBackendConnectivity = useBackendAuthStore((state) => state.setConnectivity)
 
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
@@ -613,15 +624,22 @@ export default function BackendProgramControls(): React.ReactElement {
 
         setCommandHistory(commands.slice(0, 10))
         setHistoryError('')
+        setBackendConnectivity('online')
       } catch (error) {
-        setHistoryError(error instanceof Error ? error.message : 'Failed to load command history.')
+        const errorMessage =
+          error instanceof Error ? error.message : 'Failed to load command history.'
+        setHistoryError(errorMessage)
+
+        if (isBackendNetworkError(error)) {
+          setBackendConnectivity('offline', errorMessage)
+        }
       } finally {
         if (showLoading) {
           setHistoryLoading(false)
         }
       }
     },
-    [token, selectedRobotId]
+    [token, setBackendConnectivity]
   )
 
   useEffect(() => {
@@ -657,6 +675,7 @@ export default function BackendProgramControls(): React.ReactElement {
     setBusy(true)
     setFailed(false)
     setMessage('Đang đăng nhập...')
+    setBackendConnectivity('checking')
 
     try {
       const config = getConfig()
@@ -673,14 +692,23 @@ export default function BackendProgramControls(): React.ReactElement {
       })
 
       localStorage.setItem(EMAIL_KEY, email.trim())
-      sessionStorage.setItem(TOKEN_KEY, result.accessToken)
 
-      setToken(result.accessToken)
+      setBackendAccessToken(result.accessToken)
+      setBackendConnectivity('online')
       setPassword('')
       setMessage('Đăng nhập thành công')
     } catch (error) {
       setFailed(true)
       setMessage(error instanceof Error ? error.message : 'Đăng nhập thất bại')
+
+      if (isBackendNetworkError(error)) {
+        setBackendConnectivity(
+          'offline',
+          error instanceof Error ? error.message : 'Không kết nối được Backend.'
+        )
+      } else {
+        setBackendConnectivity('online')
+      }
     } finally {
       setBusy(false)
     }
@@ -894,8 +922,7 @@ export default function BackendProgramControls(): React.ReactElement {
   }
 
   const handleLogout = (): void => {
-    sessionStorage.removeItem(TOKEN_KEY)
-    setToken('')
+    clearBackendAccessToken()
     setPassword('')
     setMessage('')
     setFailed(false)
@@ -912,8 +939,24 @@ export default function BackendProgramControls(): React.ReactElement {
       <div className="mb-2 flex items-center justify-between">
         <span className="text-[10px] font-bold uppercase text-slate-400">Backend Program</span>
 
-        <span className={token ? 'text-[10px] text-emerald-400' : 'text-[10px] text-slate-500'}>
-          {token ? 'Đã đăng nhập' : 'Chưa đăng nhập'}
+        <span
+          className={
+            token && backendConnectivity === 'online'
+              ? 'text-[10px] text-emerald-400'
+              : token && backendConnectivity === 'offline'
+                ? 'text-[10px] text-amber-300'
+                : token
+                  ? 'text-[10px] text-blue-300'
+                  : 'text-[10px] text-slate-500'
+          }
+        >
+          {!token
+            ? 'Chưa đăng nhập'
+            : backendConnectivity === 'offline'
+              ? 'Backend offline'
+              : backendConnectivity === 'checking'
+                ? 'Đang kiểm tra...'
+                : 'Đã đăng nhập'}
         </span>
       </div>
 

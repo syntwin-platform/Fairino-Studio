@@ -70,7 +70,12 @@ export function runCollisionBroadPhase(
         rightThresholds.robotWarningDistanceMeters,
         rightThresholds.broadPhaseMarginMeters
       )
-      if (boxGapDistance(leftBounds, rightBounds) <= broadDistance) {
+      const approachDistance =
+        leftThresholds.robotApproachZoneRadiusMeters + rightThresholds.robotApproachZoneRadiusMeters
+      const approachZonesTouch =
+        approachDistance > 0 && horizontalRobotOriginDistance(left, right) <= approachDistance
+
+      if (approachZonesTouch || boxGapDistance(leftBounds, rightBounds) <= broadDistance) {
         robotPairCandidates.push([left.robotId, right.robotId])
         evaluateRobotIds.add(left.robotId)
         evaluateRobotIds.add(right.robotId)
@@ -84,6 +89,17 @@ export function runCollisionBroadPhase(
     obstacleCandidatesByRobotId,
     robotPairCandidates
   }
+}
+
+function horizontalRobotOriginDistance(
+  left: CollisionRobotSnapshot,
+  right: CollisionRobotSnapshot
+): number {
+  // CollisionEngine updates matrixWorld before broad phase. Reading the translation directly
+  // avoids allocating Vector3 instances in this hot path.
+  const leftElements = left.object.matrixWorld.elements
+  const rightElements = right.object.matrixWorld.elements
+  return Math.hypot(leftElements[12] - rightElements[12], leftElements[14] - rightElements[14])
 }
 
 export function boxGapDistance(left: THREE.Box3, right: THREE.Box3): number {

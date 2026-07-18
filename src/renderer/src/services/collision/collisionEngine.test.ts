@@ -16,6 +16,7 @@ const TEST_POLICY: RobotCollisionPolicy = {
     groundWarningDistanceMeters: 0.08,
     selfWarningDistanceMeters: 0.08,
     robotWarningDistanceMeters: 0.08,
+    robotApproachZoneRadiusMeters: 0.38,
     obstacleWarningDistanceMeters: 0.08,
     confirmTicks: 1,
     clearTicks: 2,
@@ -120,12 +121,19 @@ describe('CollisionEngine', () => {
     )
   })
 
-  it('requires consecutive confirmation ticks before emitting a collision', () => {
+  it('requires consecutive confirmation ticks for an exact mesh collision', () => {
     const policy: RobotCollisionPolicy = {
       ...TEST_POLICY,
-      thresholds: { ...TEST_POLICY.thresholds, confirmTicks: 3 }
+      thresholds: { ...TEST_POLICY.thresholds, confirmTicks: 3 },
+      geometry: {
+        ...TEST_POLICY.geometry,
+        selfCollisionPairs: [{ a: 'left_link', b: 'right_link' }]
+      }
     }
-    const robot = createRobot('robot-a', [['tool_link', [0, -0.04, 0]]])
+    const robot = createRobot('robot-a', [
+      ['left_link', [0, 0.3, 0]],
+      ['right_link', [0, 0.3, 0]]
+    ])
     const transitions: CollisionContactTransition[] = []
     const engine = createEngine(createWorld([robot]), transitions, policy)
 
@@ -135,6 +143,47 @@ describe('CollisionEngine', () => {
     expect(transitions[0].observation?.level).toBe('proximity')
     engine.tick()
     expect(transitions.at(-1)?.observation?.level).toBe('collision')
+  })
+
+  it('publishes deterministic ground penetration on the first tick', () => {
+    const policy: RobotCollisionPolicy = {
+      ...TEST_POLICY,
+      thresholds: { ...TEST_POLICY.thresholds, confirmTicks: 5 }
+    }
+    const robot = createRobot('robot-a', [['tool_link', [0, -0.04, 0]]])
+    const transitions: CollisionContactTransition[] = []
+    const engine = createEngine(createWorld([robot]), transitions, policy)
+
+    engine.tick()
+
+    expect(transitions).toHaveLength(1)
+    expect(transitions[0].observation).toEqual(
+      expect.objectContaining({ level: 'collision', kind: 'ground', source: 'ground-distance' })
+    )
+  })
+
+  it('falls back to a populated link bound when runtime vertex data is unavailable', () => {
+    const robot = createRobot('robot-a', [['tool_link', [0, -0.04, 0]]])
+    const mesh = robot.links.tool_link.children[0] as THREE.Mesh
+    const boundsOnlyGeometry = new THREE.BufferGeometry()
+    boundsOnlyGeometry.boundingBox = new THREE.Box3(
+      new THREE.Vector3(-0.05, -0.05, -0.05),
+      new THREE.Vector3(0.05, 0.05, 0.05)
+    )
+    mesh.geometry = boundsOnlyGeometry
+    robot.object.updateMatrixWorld(true)
+    const transitions: CollisionContactTransition[] = []
+    const engine = createEngine(createWorld([robot]), transitions)
+
+    engine.tick()
+
+    expect(transitions[0].observation).toEqual(
+      expect.objectContaining({
+        level: 'collision',
+        kind: 'ground',
+        source: 'ground-bounds-fallback'
+      })
+    )
   })
 
   it('confirms a robot-pair collision even when the intersecting link pair changes', () => {
@@ -232,6 +281,51 @@ describe('CollisionEngine', () => {
     )
   })
 
+  it('warns immediately when two robot approach circles first touch', () => {
+    const left = createRobot('robot-a', [['tool_link', [0, 0.3, 0]]])
+    const right = createRobot('robot-b', [['tool_link', [0, 0.3, 0]]])
+    right.object.position.x = 0.76
+    right.object.updateMatrixWorld(true)
+    const transitions: CollisionContactTransition[] = []
+    const engine = createEngine(createWorld([left, right]), transitions)
+
+    engine.tick()
+
+    expect(transitions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          robotId: 'robot-a',
+          observation: expect.objectContaining({
+            level: 'proximity',
+            kind: 'robot',
+            source: 'robot-approach-zone'
+          })
+        }),
+        expect.objectContaining({
+          robotId: 'robot-b',
+          observation: expect.objectContaining({
+            level: 'proximity',
+            kind: 'robot',
+            source: 'robot-approach-zone'
+          })
+        })
+      ])
+    )
+  })
+
+  it('does not warn from the base approach zone before the circles touch', () => {
+    const left = createRobot('robot-a', [['tool_link', [0, 0.3, 0]]])
+    const right = createRobot('robot-b', [['tool_link', [0, 0.3, 0]]])
+    right.object.position.x = 0.761
+    right.object.updateMatrixWorld(true)
+    const transitions: CollisionContactTransition[] = []
+    const engine = createEngine(createWorld([left, right]), transitions)
+
+    engine.tick()
+
+    expect(transitions).toEqual([])
+  })
+
   it('does not promote overlapping link bounding boxes to a mesh collision', () => {
     const left = createSparseRobot('robot-a')
     const right = createRobot('robot-b', [['tool_link', [0, 0.3, 0]]])
@@ -301,6 +395,21 @@ describe('CollisionEngine', () => {
     expect(transitions.at(-1)?.observation).toBeNull()
   })
 
+  it('exposes active contacts so presentation state can recover after an external clear', () => {
+    const robot = createRobot('robot-a', [['tool_link', [0, -0.04, 0]]])
+    const engine = createEngine(createWorld([robot]), [])
+
+    engine.tick()
+
+    expect(engine.getActiveContacts()).toEqual([
+      expect.objectContaining({
+        robotId: 'robot-a',
+        monitoringMode: 'factory-active',
+        observation: expect.objectContaining({ kind: 'ground', level: 'collision' })
+      })
+    ])
+  })
+
   it('clears emitted contacts when the engine is disposed', () => {
     const robot = createRobot('robot-a', [['tool_link', [0, -0.04, 0]]])
     const transitions: CollisionContactTransition[] = []
@@ -352,12 +461,16 @@ function createEngine(
   transitions: CollisionContactTransition[],
   policy = TEST_POLICY
 ): CollisionEngine {
-  return new CollisionEngine({
+  const engine = new CollisionEngine({
     getSnapshot: () => world,
     getRobotPolicy: () => policy,
     onContactTransition: (transition) => transitions.push(transition),
     now: vi.fn(() => 0)
   })
+  while (!engine.prewarmExactGeometry(100)) {
+    // Tests build tiny geometries synchronously; production prewarms them in bounded idle chunks.
+  }
+  return engine
 }
 
 function createWorld(robots: CollisionRobotSnapshot[]): CollisionWorldSnapshot {

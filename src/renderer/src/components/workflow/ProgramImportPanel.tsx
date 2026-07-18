@@ -37,6 +37,22 @@ interface LuaPreviewResult {
   raw: BackendLuaPreviewResponse
 }
 
+function getExecutionReadinessError(result: LuaPreviewResult | null): string {
+  if (!result || result.raw.executionReady === true) return ''
+
+  const unsupported = result.raw.unsupportedSteps?.[0]
+
+  if (unsupported) {
+    return `Step ${unsupported.orderIndex} "${unsupported.label}" (${unsupported.stepType}) cannot run: ${unsupported.reason}`
+  }
+
+  return 'This LUA preview is not execution-ready. Restart the updated backend, then import the file again.'
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError'
+}
+
 // ─── Import Status Popover ──────────────────────────────────────────────────
 
 interface ImportStatusPopoverProps {
@@ -167,6 +183,18 @@ function ImportStatusPopover({
             <StatusRow label="Project Name" value={parseResult.projectName} />
             <StatusRow label="Steps Parsed" value={parseResult.steps.length} />
             <StatusRow
+              label="Execution Ready"
+              value={parseResult.raw.executionReady === true ? 'Yes' : 'No'}
+              danger={parseResult.raw.executionReady !== true}
+              success={parseResult.raw.executionReady === true}
+            />
+            {parseResult.raw.compiledProgramHash && (
+              <StatusRow
+                label="Compiled Hash"
+                value={parseResult.raw.compiledProgramHash.slice(0, 12)}
+              />
+            )}
+            <StatusRow
               label="Errors"
               value={
                 errorDiagnostics.length > 0 ? `${errorDiagnostics.length} error(s)` : 'Không có lỗi'
@@ -282,6 +310,8 @@ export default function ProgramImportPanel({
   const setProjectName = useRobotStore((state) => state.setProjectName)
   const setProgramSource = useRobotStore((state) => state.setProgramSource)
   const inputRef = useRef<HTMLInputElement>(null)
+  const parseRequestSequenceRef = useRef(0)
+  const parseAbortControllerRef = useRef<AbortController | null>(null)
   const [importMode, setImportMode] = useState<'lua' | 'json'>('lua')
   const [fileName, setFileName] = useState('')
   const [fileContent, setFileContent] = useState('')
@@ -291,12 +321,28 @@ export default function ProgramImportPanel({
   const [isDragging, setIsDragging] = useState(false)
   const [isLoaded, setIsLoaded] = useState(false)
 
+  useEffect(() => {
+    return () => parseAbortControllerRef.current?.abort()
+  }, [])
+
   // ── Import status popover ─────────────────────────────────────────────
   const [showImportDetail, setShowImportDetail] = useState(false)
   const importDetailBtnRef = useRef<HTMLButtonElement>(null)
 
+  const invalidateActiveParse = (): void => {
+    parseRequestSequenceRef.current += 1
+    parseAbortControllerRef.current?.abort()
+    parseAbortControllerRef.current = null
+    setIsParsing(false)
+  }
+
   const parseFileContent = async (name: string, content: string): Promise<void> => {
     const parseStartedAtMonotonicMs = performance.now()
+    const requestSequence = parseRequestSequenceRef.current + 1
+    parseRequestSequenceRef.current = requestSequence
+    parseAbortControllerRef.current?.abort()
+    const abortController = new AbortController()
+    parseAbortControllerRef.current = abortController
 
     if (factoryDiagnostics) {
       beginFactoryRunDiagnosticSession(name)
@@ -311,6 +357,7 @@ export default function ProgramImportPanel({
 
     setFileError('')
     setIsLoaded(false)
+    setIsParsing(false)
 
     // Trường hợp user chọn file không phải .lua
     if (!name.toLowerCase().endsWith('.lua')) {
@@ -318,6 +365,7 @@ export default function ProgramImportPanel({
       setParseResult(null)
       setFileContent('')
       setFileError('Only .lua files are supported.')
+      parseAbortControllerRef.current = null
 
       if (factoryDiagnostics) {
         recordFactoryRunDiagnostic('lua.parse.failed', {
@@ -337,6 +385,7 @@ export default function ProgramImportPanel({
       setParseResult(null)
       setFileContent('')
       setFileError('The LUA file is empty.')
+      parseAbortControllerRef.current = null
 
       if (factoryDiagnostics) {
         recordFactoryRunDiagnostic('lua.parse.failed', {
@@ -354,8 +403,12 @@ export default function ProgramImportPanel({
 
     try {
       const result = requestContext
-        ? await previewLuaProgramForRobot(requestContext, name, content)
-        : await previewLuaProgram(name, content)
+        ? await previewLuaProgramForRobot(requestContext, name, content, abortController.signal)
+        : await previewLuaProgram(name, content, abortController.signal)
+
+      if (abortController.signal.aborted || requestSequence !== parseRequestSequenceRef.current) {
+        return
+      }
 
       const steps = result.parsedSteps
         .map(toWorkflowStep)
@@ -381,6 +434,14 @@ export default function ProgramImportPanel({
         })
       }
     } catch (error) {
+      if (
+        isAbortError(error) ||
+        abortController.signal.aborted ||
+        requestSequence !== parseRequestSequenceRef.current
+      ) {
+        return
+      }
+
       setFileName(name)
       setParseResult(null)
       setFileContent('')
@@ -396,11 +457,16 @@ export default function ProgramImportPanel({
         })
       }
     } finally {
-      setIsParsing(false)
+      if (requestSequence === parseRequestSequenceRef.current) {
+        parseAbortControllerRef.current = null
+        setIsParsing(false)
+      }
     }
   }
 
   const readBrowserFile = async (file: File): Promise<void> => {
+    invalidateActiveParse()
+
     if (file.size > MAX_LUA_FILE_SIZE) {
       setFileName(file.name)
       setParseResult(null)
@@ -440,6 +506,7 @@ export default function ProgramImportPanel({
     }
 
     const filePath = result.filePaths[0]
+    invalidateActiveParse()
     const readResult = await electronService.readFile(filePath)
 
     if (!readResult.success || readResult.content === undefined) {
@@ -480,7 +547,7 @@ export default function ProgramImportPanel({
 
     const hasErrors = parseResult.diagnostics.some((diagnostic) => diagnostic.severity === 'error')
 
-    if (hasErrors || parseResult.steps.length === 0) {
+    if (hasErrors || !parseResult.raw.executionReady || parseResult.steps.length === 0) {
       return
     }
 
@@ -512,13 +579,22 @@ export default function ProgramImportPanel({
   }
   const errorDiagnostics =
     parseResult?.diagnostics.filter((diagnostic) => diagnostic.severity === 'error') || []
+  const executionReadinessError = getExecutionReadinessError(parseResult)
 
   const canLoad =
-    parseResult !== null && parseResult.steps.length > 0 && errorDiagnostics.length === 0
+    parseResult !== null &&
+    parseResult.raw.executionReady === true &&
+    parseResult.steps.length > 0 &&
+    errorDiagnostics.length === 0
 
   // Determine indicator state for the detail button
-  const hasImportError = Boolean(fileError) || errorDiagnostics.length > 0
-  const hasImportSuccess = isLoaded || (parseResult !== null && errorDiagnostics.length === 0)
+  const hasImportError =
+    Boolean(fileError) || Boolean(executionReadinessError) || errorDiagnostics.length > 0
+  const hasImportSuccess =
+    isLoaded ||
+    (parseResult !== null &&
+      parseResult.raw.executionReady === true &&
+      errorDiagnostics.length === 0)
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">
@@ -649,12 +725,12 @@ export default function ProgramImportPanel({
             <div className="mt-3 space-y-3">
               <div
                 className={`flex items-center gap-2 rounded border p-3 ${
-                  errorDiagnostics.length > 0
+                  errorDiagnostics.length > 0 || executionReadinessError
                     ? 'border-red-500/40 bg-red-950/30'
                     : 'border-emerald-500/40 bg-emerald-950/20'
                 }`}
               >
-                {errorDiagnostics.length > 0 ? (
+                {errorDiagnostics.length > 0 || executionReadinessError ? (
                   <AlertTriangle size={14} className="text-red-300" />
                 ) : (
                   <CheckCircle2 size={14} className="text-emerald-300" />
@@ -663,9 +739,20 @@ export default function ProgramImportPanel({
                 <p className="text-[10px] text-slate-200">
                   {isParsing
                     ? 'Parsing with backend...'
-                    : `${parseResult.steps.length} step(s), ${errorDiagnostics.length} error(s)`}
+                    : parseResult.raw.executionReady
+                      ? `${parseResult.steps.length} executable step(s), ${errorDiagnostics.length} error(s)`
+                      : 'LUA parsed successfully, but it is not executable.'}
                 </p>
               </div>
+
+              {executionReadinessError && (
+                <div className="flex min-w-0 gap-2 rounded border border-red-500/40 bg-red-950/30 p-3 text-red-200">
+                  <AlertTriangle size={14} className="shrink-0" />
+                  <p className="min-w-0 flex-1 break-words text-[10px] leading-relaxed">
+                    {executionReadinessError}
+                  </p>
+                </div>
+              )}
 
               {errorDiagnostics.length > 0 && (
                 <div className="max-h-40 space-y-2 overflow-y-auto">

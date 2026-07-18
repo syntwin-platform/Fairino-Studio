@@ -2,6 +2,7 @@ import type { BackendSimulatorConfig } from '../types/backendDevice'
 
 const CONFIG_KEY = 'syntwin.backendSimulator.config'
 const TOKEN_KEY = 'syntwin.backendProgram.accessToken'
+const LUA_REQUEST_TIMEOUT_MS = 15_000
 
 export interface BackendLuaDiagnostic {
   line: number
@@ -19,6 +20,13 @@ export interface BackendLuaPreviewStep {
   pointRef?: string
 }
 
+export interface BackendLuaUnsupportedStep {
+  orderIndex: number
+  stepType: string
+  label: string
+  reason: string
+}
+
 export interface BackendLuaPreviewResponse {
   metadata: {
     projectName: string
@@ -32,6 +40,9 @@ export interface BackendLuaPreviewResponse {
   points: Record<string, unknown>
   parsedSteps: BackendLuaPreviewStep[]
   diagnostics: BackendLuaDiagnostic[]
+  executionReady: boolean
+  compiledProgramHash?: string | null
+  unsupportedSteps: BackendLuaUnsupportedStep[]
   createProgramRequest?: {
     name: string
     status?: string
@@ -43,6 +54,42 @@ export interface BackendLuaPreviewResponse {
       payload: Record<string, unknown>
     }>
   } | null
+}
+
+async function fetchLua(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  externalSignal?: AbortSignal
+): Promise<Response> {
+  const controller = new AbortController()
+  let timedOut = false
+  const abortFromCaller = (): void => controller.abort(externalSignal?.reason)
+
+  if (externalSignal?.aborted) {
+    abortFromCaller()
+  } else {
+    externalSignal?.addEventListener('abort', abortFromCaller, { once: true })
+  }
+
+  const timeoutId = globalThis.setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, LUA_REQUEST_TIMEOUT_MS)
+
+  try {
+    return await fetch(input, { ...init, signal: controller.signal })
+  } catch (error) {
+    if (timedOut) {
+      throw new Error(
+        `Backend LUA request timed out after ${LUA_REQUEST_TIMEOUT_MS / 1000} seconds.`
+      )
+    }
+
+    throw error
+  } finally {
+    globalThis.clearTimeout(timeoutId)
+    externalSignal?.removeEventListener('abort', abortFromCaller)
+  }
 }
 
 export interface BackendLuaRequestContext {
@@ -134,11 +181,12 @@ export interface ImportedLuaProgramResponse {
 export async function previewLuaProgramForRobot(
   context: BackendLuaRequestContext,
   fileName: string,
-  luaContent: string
+  luaContent: string,
+  signal?: AbortSignal
 ): Promise<BackendLuaPreviewResponse> {
   const normalized = normalizeLuaRequestContext(context)
 
-  const response = await fetch(
+  const response = await fetchLua(
     `${normalized.backendUrl}/api/robots/${encodeURIComponent(
       normalized.robotId
     )}/programs/import/lua/preview`,
@@ -152,7 +200,8 @@ export async function previewLuaProgramForRobot(
         fileName,
         luaContent
       })
-    }
+    },
+    signal
   )
 
   if (!response.ok) {
@@ -165,7 +214,8 @@ export async function previewLuaProgramForRobot(
 
 export async function previewLuaProgram(
   fileName: string,
-  luaContent: string
+  luaContent: string,
+  signal?: AbortSignal
 ): Promise<BackendLuaPreviewResponse> {
   const { config, token } = getBackendLuaConfig()
 
@@ -176,17 +226,19 @@ export async function previewLuaProgram(
       token
     },
     fileName,
-    luaContent
+    luaContent,
+    signal
   )
 }
 export async function importLuaProgramForRobot(
   context: BackendLuaRequestContext,
   fileName: string,
-  luaContent: string
+  luaContent: string,
+  signal?: AbortSignal
 ): Promise<ImportedLuaProgramResponse> {
   const normalized = normalizeLuaRequestContext(context)
 
-  const response = await fetch(
+  const response = await fetchLua(
     `${normalized.backendUrl}/api/robots/${encodeURIComponent(
       normalized.robotId
     )}/programs/import/lua`,
@@ -200,7 +252,8 @@ export async function importLuaProgramForRobot(
         fileName,
         luaContent
       })
-    }
+    },
+    signal
   )
 
   if (!response.ok) {

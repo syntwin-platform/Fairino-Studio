@@ -15,7 +15,7 @@ import {
   ChevronsLeft,
   ChevronsRight
 } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactElement } from 'react'
 import {
   waitForRobotCommand,
@@ -45,11 +45,14 @@ import ScenePanel from '../scene/ScenePanel'
 import BackendSimulatorPanel from '../BackendSimulatorPanel'
 import AddRobotWizard from './AddRobotWizard'
 import {
+  BackendRobotClientError,
   deleteRobot,
   listRobots,
   updateRobotSceneBinding as updateBackendRobotSceneBinding,
   type BackendRobot
 } from '../../services/backendRobotClient'
+import { checkBackendHealth } from '../../services/backendHealthClient'
+import { useBackendAuthStore } from '../../store/backendAuthStore'
 import {
   BackendSimulatorConfig,
   BackendSimulatorConfigByRobotId,
@@ -138,7 +141,6 @@ const JOINT_BOUNDS = [
   { min: -175, max: 175 }
 ]
 
-const TOKEN_KEY = 'syntwin.backendProgram.accessToken'
 const ADD_ROBOT_COMPANY_KEY = 'syntwin.addRobot.companyId'
 
 function clamp(value: number, min: number, max: number): number {
@@ -242,6 +244,7 @@ export default function RobotSidebar({
   const [robotListError, setRobotListError] = useState('')
   const [deletingRobotId, setDeletingRobotId] = useState('')
   const [factoryActionBusy, setFactoryActionBusy] = useState(false)
+  const [robotListReloadRevision, setRobotListReloadRevision] = useState(0)
   const openSingleFactoryProgram = useFactoryProgramStore((state) => state.openSingle)
   const openBatchFactoryProgram = useFactoryProgramStore((state) => state.openBatch)
   const [sceneBindingSaveFeedback, setSceneBindingSaveFeedback] = useState<
@@ -249,6 +252,8 @@ export default function RobotSidebar({
   >({})
   const homeRunIdRef = useRef(0)
   const robotListAutoLoadKeyRef = useRef('')
+  const robotListAbortControllerRef = useRef<AbortController | null>(null)
+  const robotListRetryTimeoutRef = useRef<number | null>(null)
   const robotCardRefs = useRef<Record<string, HTMLDivElement | null>>({})
   const jointAngles = useRobotStore((state) => state.jointAngles)
   const setJointAngles = useRobotStore((state) => state.setJointAngles)
@@ -284,7 +289,10 @@ export default function RobotSidebar({
 
   const language = useRobotStore((state) => state.language)
   const t = (key: keyof typeof translations.vi): string => translations[language][key]
-  const backendToken = window.sessionStorage.getItem(TOKEN_KEY) || ''
+  const backendToken = useBackendAuthStore((state) => state.accessToken)
+  const backendConnectivity = useBackendAuthStore((state) => state.connectivity)
+  const setBackendConnectivity = useBackendAuthStore((state) => state.setConnectivity)
+  const clearBackendAccessToken = useBackendAuthStore((state) => state.clearAccessToken)
   const selectedRobotId = useRobotStore((state) => state.selectedRobotId)
   const workspaceMode = useRobotStore((state) => state.workspaceMode)
   const robotRuntimeById = useRobotStore((state) => state.robotRuntimeById)
@@ -311,7 +319,9 @@ export default function RobotSidebar({
     return saved === 'true'
   })
 
-  const [homingStatuses, setHomingStatuses] = useState<Record<string, 'idle' | 'homing' | 'success' | 'failed'>>({})
+  const [homingStatuses, setHomingStatuses] = useState<
+    Record<string, 'idle' | 'homing' | 'success' | 'failed'>
+  >({})
 
   const latestWidthRef = useRef(width)
   useEffect(() => {
@@ -374,20 +384,23 @@ export default function RobotSidebar({
     jointAngles: number[],
     speed = 30
   ): Promise<BackendCommandResponse> => {
-    const response = await fetch(`${context.backendUrl.trim().replace(/\/+$/, '')}/api/robots/${encodeURIComponent(robotId)}/commands`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${context.token.trim()}`
-      },
-      body: JSON.stringify({
-        commandType: 'MoveJ',
-        payload: {
-          jointAngles,
-          speed
-        }
-      })
-    })
+    const response = await fetch(
+      `${context.backendUrl.trim().replace(/\/+$/, '')}/api/robots/${encodeURIComponent(robotId)}/commands`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${context.token.trim()}`
+        },
+        body: JSON.stringify({
+          commandType: 'MoveJ',
+          payload: {
+            jointAngles,
+            speed
+          }
+        })
+      }
+    )
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${await response.text()}`)
     }
@@ -420,9 +433,10 @@ export default function RobotSidebar({
 
   const handleReturnAllHome = async (): Promise<void> => {
     if (isFactoryRunning) return
-    const msg = language === 'vi'
-      ? 'Đưa toàn bộ robot trong Factory về tư thế Home?'
-      : 'Return all robots in the Factory to the Home pose?'
+    const msg =
+      language === 'vi'
+        ? 'Đưa toàn bộ robot trong Factory về tư thế Home?'
+        : 'Return all robots in the Factory to the Home pose?'
     if (!window.confirm(msg)) {
       return
     }
@@ -552,7 +566,19 @@ export default function RobotSidebar({
     window.localStorage.setItem(ADD_ROBOT_COMPANY_KEY, value)
   }
 
-  const loadBackendRobots = async (): Promise<void> => {
+  const scheduleRobotListRetry = useCallback((): void => {
+    if (robotListRetryTimeoutRef.current !== null) {
+      window.clearTimeout(robotListRetryTimeoutRef.current)
+    }
+
+    robotListRetryTimeoutRef.current = window.setTimeout(() => {
+      robotListRetryTimeoutRef.current = null
+      robotListAutoLoadKeyRef.current = ''
+      setRobotListReloadRevision((current) => current + 1)
+    }, 3000)
+  }, [])
+
+  const loadBackendRobots = useCallback(async (): Promise<void> => {
     if (!backendToken) {
       setRobotListError('Hãy đăng nhập Backend trước.')
       return
@@ -568,18 +594,32 @@ export default function RobotSidebar({
       return
     }
 
+    robotListAbortControllerRef.current?.abort()
+    const controller = new AbortController()
+    robotListAbortControllerRef.current = controller
+
     setRobotListLoading(true)
     setRobotListError('')
+    setBackendConnectivity('checking')
 
     try {
       const robots = await listRobots(
         simulatorConfig.backendUrl,
         backendToken,
-        addRobotCompanyId.trim()
+        addRobotCompanyId.trim(),
+        controller.signal
       )
+
+      if (robotListAbortControllerRef.current !== controller) return
 
       setBackendRobots(robots)
       setRobots(robots.map(toRobotInstance))
+      setBackendConnectivity('online')
+
+      if (robotListRetryTimeoutRef.current !== null) {
+        window.clearTimeout(robotListRetryTimeoutRef.current)
+        robotListRetryTimeoutRef.current = null
+      }
 
       if (simulatorConfig.robotId && robots.some((robot) => robot.id === simulatorConfig.robotId)) {
         selectRobot(simulatorConfig.robotId)
@@ -587,18 +627,53 @@ export default function RobotSidebar({
         selectRobot(robots[0].id)
       }
     } catch (error) {
-      setRobotListError(error instanceof Error ? error.message : 'Không tải được danh sách robot.')
+      if (controller.signal.aborted) return
+
+      robotListAutoLoadKeyRef.current = ''
+
+      if (error instanceof BackendRobotClientError && error.status === 401) {
+        clearBackendAccessToken()
+        setBackendRobots([])
+        setRobotListError('Phiên đăng nhập Backend đã hết hạn. Hãy đăng nhập lại.')
+        return
+      }
+
+      const message = error instanceof Error ? error.message : 'Không tải được danh sách robot.'
+      setRobotListError(message)
+
+      if (
+        error instanceof BackendRobotClientError &&
+        (error.status === 0 || error.status === 429 || error.status >= 500)
+      ) {
+        setBackendConnectivity('offline', message)
+        scheduleRobotListRetry()
+      } else {
+        setBackendConnectivity('online', message)
+      }
     } finally {
-      setRobotListLoading(false)
+      if (robotListAbortControllerRef.current === controller) {
+        robotListAbortControllerRef.current = null
+        setRobotListLoading(false)
+      }
     }
-  }
+  }, [
+    addRobotCompanyId,
+    backendToken,
+    clearBackendAccessToken,
+    scheduleRobotListRetry,
+    selectRobot,
+    setBackendConnectivity,
+    setRobots,
+    simulatorConfig.backendUrl,
+    simulatorConfig.robotId
+  ])
 
   useEffect(() => {
     if (!backendToken || !simulatorConfig.backendUrl.trim() || !addRobotCompanyId.trim()) {
       return
     }
 
-    const autoLoadKey = `${simulatorConfig.backendUrl}|${addRobotCompanyId.trim()}|${backendToken.slice(0, 12)}`
+    const autoLoadKey = `${simulatorConfig.backendUrl}|${addRobotCompanyId.trim()}|${backendToken}`
 
     if (robotListAutoLoadKeyRef.current === autoLoadKey) {
       return
@@ -606,7 +681,80 @@ export default function RobotSidebar({
 
     robotListAutoLoadKeyRef.current = autoLoadKey
     void loadBackendRobots()
-  }, [backendToken, simulatorConfig.backendUrl, addRobotCompanyId])
+  }, [
+    addRobotCompanyId,
+    backendToken,
+    loadBackendRobots,
+    robotListReloadRevision,
+    simulatorConfig.backendUrl
+  ])
+
+  useEffect(() => {
+    const backendUrl = simulatorConfig.backendUrl.trim()
+
+    if (!backendToken || !backendUrl) {
+      setBackendConnectivity('unknown')
+      return
+    }
+
+    const controller = new AbortController()
+
+    const refreshHealth = async (): Promise<void> => {
+      const previousConnectivity = useBackendAuthStore.getState().connectivity
+
+      try {
+        await checkBackendHealth(backendUrl, controller.signal)
+
+        if (controller.signal.aborted) return
+
+        setBackendConnectivity('online')
+
+        if (previousConnectivity === 'offline') {
+          robotListAutoLoadKeyRef.current = ''
+          setRobotListReloadRevision((current) => current + 1)
+        }
+      } catch (error) {
+        if (controller.signal.aborted) return
+
+        const message = error instanceof Error ? error.message : 'Backend hiện không phản hồi.'
+        setBackendConnectivity('offline', message)
+      }
+    }
+
+    void refreshHealth()
+    const intervalId = window.setInterval(() => void refreshHealth(), 5000)
+
+    return () => {
+      controller.abort()
+      window.clearInterval(intervalId)
+    }
+  }, [backendToken, setBackendConnectivity, simulatorConfig.backendUrl])
+
+  useEffect(
+    () => () => {
+      robotListAbortControllerRef.current?.abort()
+
+      if (robotListRetryTimeoutRef.current !== null) {
+        window.clearTimeout(robotListRetryTimeoutRef.current)
+      }
+    },
+    []
+  )
+
+  useEffect(() => {
+    if (backendToken) return
+
+    robotListAbortControllerRef.current?.abort()
+    robotListAbortControllerRef.current = null
+    robotListAutoLoadKeyRef.current = ''
+    setRobotListLoading(false)
+    setBackendRobots([])
+
+    if (robotListRetryTimeoutRef.current !== null) {
+      window.clearTimeout(robotListRetryTimeoutRef.current)
+      robotListRetryTimeoutRef.current = null
+    }
+  }, [backendToken])
 
   const handleJointChange = (idx: number, val: number): void => {
     const updated = [...jointAngles] as JointAngles
@@ -943,7 +1091,11 @@ export default function RobotSidebar({
             const robotBadge = getRobotRuntimeBadge(robotRuntime)
 
             const contact = robotContactsById[robot.id]
-            const isCollision = contact?.level === 'collision' || (robotFaultsById[robot.id]?.active && (robotFaultsById[robot.id]?.kind === 'collision' || robotFaultsById[robot.id]?.code.startsWith('COLLISION_')))
+            const isCollision =
+              contact?.level === 'collision' ||
+              (robotFaultsById[robot.id]?.active &&
+                (robotFaultsById[robot.id]?.kind === 'collision' ||
+                  robotFaultsById[robot.id]?.code.startsWith('COLLISION_')))
             const isProximity = contact?.level === 'proximity'
 
             const statusColor = isCollision
@@ -980,7 +1132,11 @@ export default function RobotSidebar({
         onPointerUp={handlePointerUp}
         onDoubleClick={handleDoubleClick}
         className="absolute top-0 right-0 z-50 h-full w-1.5 cursor-col-resize bg-transparent hover:bg-blue-500/50 active:bg-blue-500 transition-colors"
-        title={language === 'vi' ? 'Kéo để đổi kích thước, nhấn đúp để khôi phục' : 'Drag to resize, double click to reset'}
+        title={
+          language === 'vi'
+            ? 'Kéo để đổi kích thước, nhấn đúp để khôi phục'
+            : 'Drag to resize, double click to reset'
+        }
       />
 
       <div className="border-b border-[#2d2d34] p-4 bg-[#141417]/20">
@@ -1411,7 +1567,11 @@ export default function RobotSidebar({
                   onClick={handleReturnAllHome}
                   disabled={isFactoryRunning}
                   className="flex items-center justify-center gap-1.5 rounded-lg border border-blue-500/45 bg-blue-950/15 px-2 py-1.5 text-xs font-bold text-blue-300 transition hover:bg-blue-950/35 disabled:cursor-not-allowed disabled:opacity-40"
-                  title={isFactoryRunning ? "Hãy dừng Factory Run trước khi đưa toàn bộ robot về Home." : "Đưa toàn bộ robot trong Factory về tư thế Home"}
+                  title={
+                    isFactoryRunning
+                      ? 'Hãy dừng Factory Run trước khi đưa toàn bộ robot về Home.'
+                      : 'Đưa toàn bộ robot trong Factory về tư thế Home'
+                  }
                 >
                   <Home size={12} />
                   Return All Home
@@ -1502,6 +1662,24 @@ export default function RobotSidebar({
               </div>
             )}
 
+            {backendToken && backendConnectivity !== 'unknown' && (
+              <p
+                className={`mb-2 rounded border px-3 py-2 text-[11px] ${
+                  backendConnectivity === 'online'
+                    ? 'border-emerald-500/30 bg-emerald-950/20 text-emerald-300'
+                    : backendConnectivity === 'checking'
+                      ? 'border-blue-500/30 bg-blue-950/20 text-blue-300'
+                      : 'border-amber-500/40 bg-amber-950/25 text-amber-200'
+                }`}
+              >
+                {backendConnectivity === 'online'
+                  ? 'Backend đang kết nối.'
+                  : backendConnectivity === 'checking'
+                    ? 'Đang kiểm tra kết nối Backend...'
+                    : 'Backend đang offline. Hệ thống sẽ tự thử tải lại danh sách robot.'}
+              </p>
+            )}
+
             {robotListError && (
               <p className="mb-2 rounded border border-red-500/40 bg-red-950/30 px-3 py-2 text-[11px] text-red-200">
                 {robotListError}
@@ -1547,7 +1725,10 @@ export default function RobotSidebar({
                     const contact = robotContactsById[robot.id]
                     const isCollision = contact?.level === 'collision'
                     const isProximity = contact?.level === 'proximity'
-                    const isFaultActive = robotFaultsById[robot.id]?.active && (robotFaultsById[robot.id]?.kind === 'collision' || robotFaultsById[robot.id]?.code.startsWith('COLLISION_'))
+                    const isFaultActive =
+                      robotFaultsById[robot.id]?.active &&
+                      (robotFaultsById[robot.id]?.kind === 'collision' ||
+                        robotFaultsById[robot.id]?.code.startsWith('COLLISION_'))
                     const isLatchedFaultWaitingReset = isFaultActive && !contact
 
                     const cardBorderClass = isCollision
@@ -1681,8 +1862,12 @@ export default function RobotSidebar({
                         <div className="mt-2.5 grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] text-slate-400">
                           <span>BE: {robot.status}</span>
                           <span>Mode: {robot.connectionType}</span>
-                          <span className="truncate">Heartbeat: {formatRuntimeTime(robotRuntime?.lastHeartbeatAt)}</span>
-                          <span className="truncate">Telemetry: {formatRuntimeTime(robotRuntime?.lastTelemetryAt)}</span>
+                          <span className="truncate">
+                            Heartbeat: {formatRuntimeTime(robotRuntime?.lastHeartbeatAt)}
+                          </span>
+                          <span className="truncate">
+                            Telemetry: {formatRuntimeTime(robotRuntime?.lastTelemetryAt)}
+                          </span>
                           <span
                             className={
                               robotExecution?.isPlaying
@@ -1701,8 +1886,12 @@ export default function RobotSidebar({
                           <div className="mt-2 flex gap-1.5 rounded border border-red-500/40 bg-red-950/25 px-2 py-1.5 text-[9px] text-red-200">
                             <AlertTriangle className="mt-0.5 shrink-0 text-red-400" size={12} />
                             <div className="min-w-0 flex-1">
-                              <p className="font-bold truncate">{robotCollisionPresentation.title}</p>
-                              <p className="text-[8px] text-red-200/80 mt-0.5 leading-relaxed">{robotCollisionPresentation.detail}</p>
+                              <p className="font-bold truncate">
+                                {robotCollisionPresentation.title}
+                              </p>
+                              <p className="text-[8px] text-red-200/80 mt-0.5 leading-relaxed">
+                                {robotCollisionPresentation.detail}
+                              </p>
                             </div>
                           </div>
                         )}
@@ -1791,9 +1980,7 @@ export default function RobotSidebar({
                             disabled={deletingRobotId === robot.id || isRobotRuntimeActive}
                             className="flex items-center justify-center gap-1 rounded bg-red-600/10 border border-red-500/30 py-1 text-[9px] font-bold text-red-300 transition hover:bg-red-600/25 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed"
                             title={
-                              isRobotRuntimeActive
-                                ? 'Disconnect robot trước khi xóa'
-                                : 'Xóa robot'
+                              isRobotRuntimeActive ? 'Disconnect robot trước khi xóa' : 'Xóa robot'
                             }
                           >
                             <Trash2 size={10} />

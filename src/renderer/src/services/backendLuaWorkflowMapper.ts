@@ -66,16 +66,6 @@ export function toWorkflowStep(step: BackendLuaPreviewStep): WorkflowStep | null
       return { id, type: step.stepType, label: step.label, speed: 50, acc: 50 }
 
     default:
-      return {
-        id,
-        type: 'Comment',
-        label: step.label || step.stepType,
-        comment:
-          typeof payload.raw === 'string'
-            ? `Unsupported LUA command: ${payload.raw}`
-            : `Unsupported LUA step: ${step.stepType}`,
-        speed: 50,
-        acc: 50
-      }
+      return null
   }
 }
