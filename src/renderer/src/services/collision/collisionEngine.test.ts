@@ -377,6 +377,98 @@ describe('CollisionEngine', () => {
     expect(transitions.at(-1)?.observation?.level).toBe('collision')
   })
 
+  it('detects an offline Factory robot pair on the first cold-start tick', () => {
+    const left = createRobot('robot-a', [['tool_link', [0, 0.3, 0]]])
+    const right = createRobot('robot-b', [['tool_link', [0, 0.3, 0]]])
+    left.monitoringMode = 'factory-static'
+    right.monitoringMode = 'factory-static'
+    right.object.position.x = 0.76
+    right.object.updateMatrixWorld(true)
+    const transitions: CollisionContactTransition[] = []
+    const engine = createEngine(createWorld([left, right]), transitions)
+
+    engine.tick()
+
+    expect(transitions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          robotId: 'robot-a',
+          monitoringMode: 'factory-static',
+          observation: expect.objectContaining({ level: 'proximity', kind: 'robot' })
+        }),
+        expect.objectContaining({
+          robotId: 'robot-b',
+          monitoringMode: 'factory-static',
+          observation: expect.objectContaining({ level: 'proximity', kind: 'robot' })
+        })
+      ])
+    )
+  })
+
+  it('treats an imported GLB object hierarchy as an obstacle and clears after it moves away', () => {
+    const robot = createRobot('robot-a', [['tool_link', [0, 0.3, 0]]])
+    const importedGlbRoot = new THREE.Group()
+    importedGlbRoot.name = 'uploaded-machine-guard.glb'
+    importedGlbRoot.add(new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.1, 0.1)))
+    importedGlbRoot.position.set(0, 0.3, 0)
+    importedGlbRoot.updateMatrixWorld(true)
+    const world: CollisionWorldSnapshot = {
+      robots: [robot],
+      obstacles: [
+        {
+          objectId: 'uploaded-glb-obstacle',
+          object: importedGlbRoot,
+          visible: true,
+          transformRevision: 1
+        }
+      ]
+    }
+    const transitions: CollisionContactTransition[] = []
+    const engine = createEngine(world, transitions)
+
+    engine.tick()
+    expect(transitions.at(-1)?.observation).toEqual(
+      expect.objectContaining({ kind: 'obstacle', objectIds: ['uploaded-glb-obstacle'] })
+    )
+
+    importedGlbRoot.position.x = 2
+    importedGlbRoot.updateMatrixWorld(true)
+    world.obstacles[0].transformRevision += 1
+    engine.tick()
+    engine.tick()
+    expect(transitions.at(-1)?.observation).toBeNull()
+  })
+
+  it('keeps six moving robots within the 10 ms collision-tick p95 budget', () => {
+    const robots = Array.from({ length: 6 }, (_, index) => {
+      const robot = createRobot(`robot-${index}`, [['tool_link', [0, 0.3, 0]]])
+      robot.object.position.x = index * 1.25
+      robot.object.updateMatrixWorld(true)
+      return robot
+    })
+    const world = createWorld(robots)
+    const engine = new CollisionEngine({
+      getSnapshot: () => world,
+      getRobotPolicy: () => TEST_POLICY,
+      onContactTransition: () => undefined
+    })
+    while (!engine.prewarmExactGeometry(100)) {
+      // Keep setup outside the measured ticks, matching production idle prewarm.
+    }
+    const durations: number[] = []
+
+    for (let tick = 0; tick < 300; tick += 1) {
+      const robot = robots[tick % robots.length]
+      robot.object.position.z = (tick % 2) * 0.001
+      robot.object.updateMatrixWorld(true)
+      durations.push(engine.tick().durationMs)
+    }
+
+    durations.sort((left, right) => left - right)
+    const p95 = durations[Math.ceil(durations.length * 0.95) - 1]
+    expect(p95).toBeLessThanOrEqual(10)
+  })
+
   it('keeps contact state when a robot is temporarily absent from one snapshot', () => {
     const robot = createRobot('robot-a', [['tool_link', [0, -0.04, 0]]])
     const transitions: CollisionContactTransition[] = []
