@@ -107,6 +107,31 @@ describe('MoveL planner registry', () => {
       )
     ).rejects.toThrow(/not ready for MoveL planning/i)
   })
+
+  it('uses recorded trace joints without invoking the generic IK planner', async () => {
+    const targetAngles: JointAngles = [1, -2, 3, -4, 5, -6]
+
+    const trajectory = await prepareMoveLForRobot(
+      'recorded-trace-robot',
+      targetPose,
+      30,
+      startAngles,
+      new AbortController().signal,
+      {
+        recordedTargetAngles: targetAngles,
+        segmentDurationMs: 42,
+        trace: { groupId: 'trace-a', sampleIndex: 1, sampleCount: 2 }
+      }
+    )
+
+    expect(trajectory).toMatchObject({
+      keyframes: [startAngles, targetAngles],
+      waypointCount: 1,
+      durationMs: 42,
+      source: 'recorded-trace',
+      trace: { groupId: 'trace-a', sampleIndex: 1, sampleCount: 2 }
+    })
+  })
 })
 
 describe('robot runtime config registry', () => {

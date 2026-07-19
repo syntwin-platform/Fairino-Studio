@@ -10,6 +10,7 @@ import {
   WorkflowStep
 } from '../types/robot.types'
 import type { BackendSimulatorStatus } from '../types/backendDevice'
+import type { CartesianInteractionMode } from '../types/cartesianTrace.types'
 export type WorkspaceMode = 'factory' | 'train'
 export type RobotPlacementTransformMode = 'translate' | 'rotate'
 
@@ -134,6 +135,7 @@ interface RobotState {
   tcpPoseByRobotId: Record<string, TCPPose>
   tcpPose: TCPPose
   isIKMode: boolean
+  cartesianInteractionMode: CartesianInteractionMode
   isRobotPlacementMode: boolean
   robotPlacementTransformMode: RobotPlacementTransformMode
   // Project properties
@@ -179,6 +181,7 @@ interface RobotState {
   setTCPPose: (pose: TCPPose) => void
   setTCPPoseForRobot: (robotId: string, pose: TCPPose) => void
   setIKMode: (enabled: boolean) => void
+  setCartesianInteractionMode: (mode: CartesianInteractionMode) => void
   setRobotPlacementMode: (enabled: boolean) => void
   setRobotPlacementTransformMode: (mode: RobotPlacementTransformMode) => void
   setProjectName: (name: string) => void
@@ -193,7 +196,9 @@ interface RobotState {
   setGripperState: (state: 'open' | 'closed') => void
   // Workflow actions
   addStep: (step: Omit<WorkflowStep, 'id'>) => void
+  addSteps: (steps: Omit<WorkflowStep, 'id'>[]) => void
   removeStep: (id: string) => void
+  clearSteps: () => void
   updateStep: (id: string, updated: Partial<WorkflowStep>) => void
   reorderSteps: (newSteps: WorkflowStep[]) => void
   setSelectedStepId: (id: string | null) => void
@@ -218,6 +223,7 @@ export const useRobotStore = create<RobotState>((set) => ({
   tcpPoseByRobotId: {},
   tcpPose: { ...DEFAULT_TCP_POSE },
   isIKMode: false,
+  cartesianInteractionMode: 'point',
   isRobotPlacementMode: false,
   robotPlacementTransformMode: 'translate',
 
@@ -558,6 +564,7 @@ export const useRobotStore = create<RobotState>((set) => ({
       }
     })),
   setIKMode: (enabled) => set({ isIKMode: enabled }),
+  setCartesianInteractionMode: (cartesianInteractionMode) => set({ cartesianInteractionMode }),
   setRobotPlacementMode: (enabled) =>
     set((state) => ({
       isRobotPlacementMode: enabled,
@@ -604,6 +611,19 @@ export const useRobotStore = create<RobotState>((set) => ({
         selectedStepId: newStep.id
       }
     }),
+  addSteps: (steps) =>
+    set((state) => {
+      if (steps.length === 0) return state
+
+      const newSteps = steps.map<WorkflowStep>((step) => ({
+        ...step,
+        id: createStepId()
+      }))
+      return {
+        steps: [...state.steps, ...newSteps],
+        selectedStepId: newSteps.at(-1)?.id ?? state.selectedStepId
+      }
+    }),
 
   removeStep: (id) =>
     set((state) => {
@@ -612,6 +632,14 @@ export const useRobotStore = create<RobotState>((set) => ({
         steps: filtered,
         selectedStepId: state.selectedStepId === id ? null : state.selectedStepId
       }
+    }),
+
+  clearSteps: () =>
+    set({
+      steps: [],
+      selectedStepId: null,
+      currentStepIndex: 0,
+      isPlaying: false
     }),
 
   updateStep: (id, updated) =>

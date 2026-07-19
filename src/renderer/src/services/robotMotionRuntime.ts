@@ -6,6 +6,23 @@ export interface PreparedMoveLTrajectory {
   keyframes: JointAngles[]
   waypointCount: number
   planningDurationMs: number
+  durationMs?: number
+  source?: 'ik' | 'recorded-trace'
+  trace?: {
+    groupId: string
+    sampleIndex: number
+    sampleCount: number
+  }
+}
+
+export interface MoveLPlanningOptions {
+  recordedTargetAngles?: JointAngles
+  segmentDurationMs?: number
+  trace?: {
+    groupId: string
+    sampleIndex: number
+    sampleCount: number
+  }
 }
 
 export interface MoveLRunOptions {
@@ -64,6 +81,13 @@ function clonePreparedTrajectory(trajectory: PreparedMoveLTrajectory): PreparedM
     throw new Error('Prepared MoveL planningDurationMs must be a non-negative finite number.')
   }
 
+  if (
+    trajectory.durationMs !== undefined &&
+    (!Number.isFinite(trajectory.durationMs) || trajectory.durationMs < 0)
+  ) {
+    throw new Error('Prepared MoveL durationMs must be a non-negative finite number.')
+  }
+
   const keyframes = trajectory.keyframes.map((keyframe, index) => {
     validateJointAngles(keyframe, `Prepared MoveL keyframe ${index + 1}`)
     return cloneJointAngles(keyframe)
@@ -72,7 +96,10 @@ function clonePreparedTrajectory(trajectory: PreparedMoveLTrajectory): PreparedM
   return {
     keyframes,
     waypointCount: trajectory.waypointCount,
-    planningDurationMs: trajectory.planningDurationMs
+    planningDurationMs: trajectory.planningDurationMs,
+    durationMs: trajectory.durationMs,
+    source: trajectory.source,
+    trace: trajectory.trace ? { ...trajectory.trace } : undefined
   }
 }
 
@@ -164,19 +191,65 @@ export async function prepareMoveLForRobot(
   tcpPose: TCPPose,
   speed: number,
   startAngles: JointAngles,
-  signal: AbortSignal
+  signal: AbortSignal,
+  options?: MoveLPlanningOptions
 ): Promise<PreparedMoveLTrajectory> {
   const normalizedRobotId = robotId.trim()
-  const planner = moveLPlannersByRobotId.get(normalizedRobotId)
-
-  if (!planner) {
-    throw new Error(`Robot 3D is not ready for MoveL planning: ${normalizedRobotId}`)
-  }
 
   validateJointAngles(startAngles, 'MoveL planning start angles')
 
   if (signal.aborted) {
     throw new Error(`MoveL planning was cancelled for robot ${normalizedRobotId}`)
+  }
+
+  if (options?.recordedTargetAngles) {
+    const targetAngles = cloneJointAngles(options.recordedTargetAngles)
+    const runtimeConfig = getRobotRuntimeConfig(normalizedRobotId)
+    const traceLabel = options.trace
+      ? `Trace point ${options.trace.sampleIndex}/${options.trace.sampleCount - 1}`
+      : 'Recorded MoveL target'
+
+    validateJointAngles(targetAngles, `${traceLabel} joint angles`)
+
+    for (let jointIndex = 0; jointIndex < targetAngles.length; jointIndex++) {
+      const limit = runtimeConfig.jointLimits.find((item) => item.joint === jointIndex + 1)
+
+      if (
+        limit &&
+        (targetAngles[jointIndex] < limit.minDeg || targetAngles[jointIndex] > limit.maxDeg)
+      ) {
+        throw new Error(
+          `${traceLabel} exceeds joint ${jointIndex + 1} limit ` +
+            `[${limit.minDeg}, ${limit.maxDeg}] degrees for robot ${normalizedRobotId}`
+        )
+      }
+    }
+
+    const largestJointChange = Math.max(
+      ...targetAngles.map((target, jointIndex) => Math.abs(target - startAngles[jointIndex]))
+    )
+
+    if (largestJointChange > runtimeConfig.motionPolicy.moveJ.maxJointDeltaDeg) {
+      throw new Error(
+        `${traceLabel} has an unsafe recorded joint jump of ` +
+          `${largestJointChange.toFixed(1)} degrees for robot ${normalizedRobotId}`
+      )
+    }
+
+    return clonePreparedTrajectory({
+      keyframes: [cloneJointAngles(startAngles), targetAngles],
+      waypointCount: 1,
+      planningDurationMs: 0,
+      durationMs: Math.max(16, options.segmentDurationMs ?? 16),
+      source: 'recorded-trace',
+      trace: options.trace ? { ...options.trace } : undefined
+    })
+  }
+
+  const planner = moveLPlannersByRobotId.get(normalizedRobotId)
+
+  if (!planner) {
+    throw new Error(`Robot 3D is not ready for MoveL planning: ${normalizedRobotId}`)
   }
 
   const trajectory = await planner(tcpPose, speed, cloneJointAngles(startAngles), signal)

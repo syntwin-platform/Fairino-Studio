@@ -7,6 +7,38 @@ function percent(value: unknown): number {
     : 50
 }
 
+function jointAngles(value: unknown): WorkflowStep['jointAngles'] | undefined {
+  return Array.isArray(value) &&
+    value.length === 6 &&
+    value.every((angle) => typeof angle === 'number' && Number.isFinite(angle))
+    ? (value as WorkflowStep['jointAngles'])
+    : undefined
+}
+
+function trace(value: unknown): WorkflowStep['trace'] | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+
+  const record = value as Record<string, unknown>
+
+  if (
+    typeof record.groupId !== 'string' ||
+    !record.groupId.trim() ||
+    !Number.isInteger(record.sampleIndex) ||
+    !Number.isInteger(record.sampleCount) ||
+    typeof record.segmentDurationMs !== 'number' ||
+    !Number.isFinite(record.segmentDurationMs)
+  ) {
+    return undefined
+  }
+
+  return {
+    groupId: record.groupId.trim(),
+    sampleIndex: record.sampleIndex as number,
+    sampleCount: record.sampleCount as number,
+    segmentDurationMs: record.segmentDurationMs
+  }
+}
+
 export function toWorkflowStep(step: BackendLuaPreviewStep): WorkflowStep | null {
   const payload = step.payload || {}
   const id = `step_imported_${step.orderIndex}`
@@ -19,6 +51,7 @@ export function toWorkflowStep(step: BackendLuaPreviewStep): WorkflowStep | null
         type: 'MoveJ',
         label: step.label,
         jointAngles: payload.jointAngles as WorkflowStep['jointAngles'],
+        trace: trace(payload.trace),
         speed: percent(payload.speed),
         acc: percent(payload.acc)
       }
@@ -35,6 +68,8 @@ export function toWorkflowStep(step: BackendLuaPreviewStep): WorkflowStep | null
         type: 'MoveL',
         label: step.label,
         tcpPose: payload.tcpPose as WorkflowStep['tcpPose'],
+        jointAngles: jointAngles(payload.recordedJointAngles),
+        trace: trace(payload.trace),
         speed: percent(payload.speed),
         acc: percent(payload.acc)
       }

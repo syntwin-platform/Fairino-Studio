@@ -3,7 +3,7 @@ import type { ReactElement } from 'react'
 
 import { useRobotStore } from '../../store/robotStore'
 import { selectCollisionWarning, useSceneStore } from '../../store/sceneStore'
-import type { WorkflowStep } from '../../types/robot.types'
+import type { JointAngles, WorkflowStep } from '../../types/robot.types'
 import {
   ArrowDown,
   ArrowUp,
@@ -60,9 +60,8 @@ export default function WorkflowPanel(): ReactElement {
   const steps = useRobotStore((state) => state.steps)
   const addStep = useRobotStore((state) => state.addStep)
   const removeStep = useRobotStore((state) => state.removeStep)
+  const clearSteps = useRobotStore((state) => state.clearSteps)
   const reorderSteps = useRobotStore((state) => state.reorderSteps)
-  const jointAngles = useRobotStore((state) => state.jointAngles)
-  const tcpPose = useRobotStore((state) => state.tcpPose)
   const selectedStepId = useRobotStore((state) => state.selectedStepId)
   const setSelectedStepId = useRobotStore((state) => state.setSelectedStepId)
   const setJointAngles = useRobotStore((state) => state.setJointAngles)
@@ -146,7 +145,7 @@ export default function WorkflowPanel(): ReactElement {
     }
   }
 
-  const getRunJointAngles = (): typeof jointAngles => {
+  const getRunJointAngles = (): JointAngles => {
     const state = useRobotStore.getState()
 
     if (!selectedRobotId) {
@@ -156,7 +155,7 @@ export default function WorkflowPanel(): ReactElement {
     return state.jointAnglesByRobotId[selectedRobotId] ?? state.jointAngles
   }
 
-  const setRunJointAngles = (angles: typeof jointAngles): void => {
+  const setRunJointAngles = (angles: JointAngles): void => {
     if (selectedRobotId) {
       setJointAnglesForRobot(selectedRobotId, angles)
       return
@@ -167,13 +166,14 @@ export default function WorkflowPanel(): ReactElement {
   const handleRecordWaypoint = (type: 'MoveJ' | 'MoveL'): void => {
     if (isRecordBlocked) return
 
+    const state = useRobotStore.getState()
     const pointNum = steps.filter((s) => s.type === 'MoveJ' || s.type === 'MoveL').length + 1
 
     addStep({
       type,
       label: `${type} - Waypoint ${pointNum}`,
-      jointAngles: [...jointAngles],
-      tcpPose: { ...tcpPose },
+      jointAngles: [...state.jointAngles],
+      tcpPose: { ...state.tcpPose },
       speed: DEFAULT_SPEED,
       acc: DEFAULT_ACC
     })
@@ -308,9 +308,79 @@ export default function WorkflowPanel(): ReactElement {
         return start + (target - start) * t
       })
 
-      setRunJointAngles(interpolated as typeof targetAngles)
+      setRunJointAngles(interpolated as JointAngles)
       await wait(intervalTime)
     }
+  }
+
+  const animateRecordedTraceGroup = async (
+    traceSteps: Array<WorkflowStep & { jointAngles: NonNullable<WorkflowStep['jointAngles']> }>,
+    firstWorkflowIndex: number
+  ): Promise<void> => {
+    if (traceSteps.length === 0) return
+
+    const startAngles = [...getRunJointAngles()]
+    const playbackSpeed = Math.max(0.1, useRobotStore.getState().playbackSpeed)
+    const segmentEndsMs: number[] = []
+    let totalRecordedMs = 0
+
+    for (const step of traceSteps) {
+      totalRecordedMs += Math.max(0, step.trace?.segmentDurationMs ?? 0)
+      segmentEndsMs.push(totalRecordedMs)
+    }
+
+    totalRecordedMs = Math.max(1, totalRecordedMs)
+
+    await new Promise<void>((resolve) => {
+      const startedAtMs = performance.now()
+      let lastAppliedAtMs = startedAtMs
+      setSelectedStepId(traceSteps[0].id)
+      setRunStepIndex(firstWorkflowIndex)
+
+      const renderFrame = (nowMs: number): void => {
+        if (!isRunActive()) {
+          resolve()
+          return
+        }
+
+        const recordedElapsedMs = Math.min(totalRecordedMs, (nowMs - startedAtMs) * playbackSpeed)
+        let segmentIndex = 0
+        while (
+          segmentIndex < segmentEndsMs.length - 1 &&
+          recordedElapsedMs >= segmentEndsMs[segmentIndex]
+        ) {
+          segmentIndex += 1
+        }
+
+        const step = traceSteps[segmentIndex]
+        const segmentStartMs = segmentIndex === 0 ? 0 : segmentEndsMs[segmentIndex - 1]
+        const segmentDurationMs = Math.max(1, segmentEndsMs[segmentIndex] - segmentStartMs)
+        const progress = Math.min(
+          1,
+          Math.max(0, (recordedElapsedMs - segmentStartMs) / segmentDurationMs)
+        )
+        const segmentStartAngles =
+          segmentIndex === 0 ? startAngles : traceSteps[segmentIndex - 1].jointAngles
+        const interpolated = segmentStartAngles.map(
+          (start, index) => start + (step.jointAngles[index] - start) * progress
+        ) as NonNullable<WorkflowStep['jointAngles']>
+
+        if (recordedElapsedMs >= totalRecordedMs) {
+          setRunJointAngles(traceSteps.at(-1)!.jointAngles)
+          resolve()
+          return
+        }
+
+        if (nowMs - lastAppliedAtMs >= 33) {
+          lastAppliedAtMs = nowMs
+          setRunJointAngles(interpolated)
+        }
+
+        window.requestAnimationFrame(renderFrame)
+      }
+
+      window.requestAnimationFrame(renderFrame)
+    })
   }
 
   const runMoveLStep = async (step: WorkflowStep): Promise<void> => {
@@ -420,7 +490,40 @@ export default function WorkflowPanel(): ReactElement {
       ) {
         await animateJointMotion(step.jointAngles, step.speed)
       } else if (step.type === 'MoveL') {
-        await runMoveLStep(step)
+        if (step.trace && step.jointAngles) {
+          const groupId = step.trace.groupId
+          const traceSteps: Array<
+            WorkflowStep & { jointAngles: NonNullable<WorkflowStep['jointAngles']> }
+          > = []
+          let traceIndex = currentIndex
+
+          while (traceIndex < steps.length) {
+            const candidate = steps[traceIndex]
+            if (
+              candidate.type !== 'MoveL' ||
+              candidate.trace?.groupId !== groupId ||
+              !candidate.jointAngles
+            ) {
+              break
+            }
+            traceSteps.push(
+              candidate as WorkflowStep & {
+                jointAngles: NonNullable<WorkflowStep['jointAngles']>
+              }
+            )
+            traceIndex += 1
+          }
+
+          // Replay one continuous time line. Planning each MoveL separately added a frame of
+          // overhead per sample and made long drawings visibly slower than the recorded gesture.
+          await animateRecordedTraceGroup(traceSteps, currentIndex)
+          if (!isRunActive()) break
+          currentIndex += traceSteps.length
+          setRunStepIndex(currentIndex)
+          continue
+        } else {
+          await runMoveLStep(step)
+        }
       } else if (step.type === 'WaitMs') {
         // Wait delay duration
         const waitTime = (step.delayMs ?? 0) / useRobotStore.getState().playbackSpeed
@@ -473,6 +576,16 @@ export default function WorkflowPanel(): ReactElement {
     setRunPlaying(false)
     setRunStepIndex(0)
     setSelectedStepId(null)
+  }
+
+  const handleClearAllSteps = (): void => {
+    if (steps.length === 0 || isPlaying) return
+
+    moveLPreviewAbortRef.current?.abort()
+    moveLPreviewAbortRef.current = null
+    setEditingStepId(null)
+    setWorkflowError(null)
+    clearSteps()
   }
 
   const moveStep = (index: number, direction: 'up' | 'down'): void => {
@@ -776,6 +889,15 @@ export default function WorkflowPanel(): ReactElement {
           {t('simulation')}
         </span>
         <div className="flex items-center gap-1">
+          <button
+            onClick={handleClearAllSteps}
+            disabled={steps.length === 0 || isPlaying}
+            className="mr-1 flex items-center gap-1.5 rounded border border-rose-500/50 px-2 py-1.5 text-[10px] font-semibold text-rose-300 transition hover:bg-rose-500/15 disabled:cursor-not-allowed disabled:border-slate-700 disabled:text-slate-600"
+            title={language === 'vi' ? 'Xóa toàn bộ command' : 'Delete all commands'}
+          >
+            <Trash2 size={13} />
+            <span>{language === 'vi' ? 'Xóa tất cả' : 'Clear all'}</span>
+          </button>
           <button
             onClick={handlePlay}
             className={`p-2 rounded transition cursor-pointer ${
