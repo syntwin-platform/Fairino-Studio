@@ -123,4 +123,38 @@ MoveJ({toDouble("-175.000"), toDouble("-88.500"), toDouble("-90.000"), toDouble(
       delayMs: 1000
     })
   })
+
+  it('round-trips recorded Cartesian trace joints and timing', () => {
+    const trace: WorkflowStep[] = [
+      {
+        id: 'trace-approach',
+        type: 'MoveJ',
+        label: 'Trace approach',
+        jointAngles: [0, -20, 30, -40, -90, 0],
+        speed: 30,
+        acc: 30,
+        trace: { groupId: 'trace-a', sampleIndex: 0, sampleCount: 2, segmentDurationMs: 0 }
+      },
+      {
+        id: 'trace-point',
+        type: 'MoveL',
+        label: 'Trace point 1',
+        tcpPose: { x: 100, y: 200, z: 300, rx: 0, ry: 90, rz: 0 },
+        jointAngles: [1, -19, 31, -39, -89, 1],
+        speed: 30,
+        acc: 30,
+        trace: { groupId: 'trace-a', sampleIndex: 1, sampleCount: 2, segmentDurationMs: 42 }
+      }
+    ]
+
+    const result = parseLua(generateLua(trace, 'trace_roundtrip'))
+
+    expect(result.diagnostics).toEqual([])
+    expect(result.steps[0].trace).toEqual(trace[0].trace)
+    expect(result.steps[1]).toMatchObject({
+      type: 'MoveL',
+      jointAngles: trace[1].jointAngles,
+      trace: trace[1].trace
+    })
+  })
 })

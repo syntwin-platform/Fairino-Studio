@@ -45,11 +45,32 @@ end
   // rather than treating the literal as an integer.
   const d = (n: number, decimals = 3): string => `toDouble("${n.toFixed(decimals)}")`
 
+  const traceMetadata = (step: WorkflowStep): string | null => {
+    if (!step.trace || !step.jointAngles) return null
+
+    return JSON.stringify({
+      version: 1,
+      groupId: step.trace.groupId,
+      sampleIndex: step.trace.sampleIndex,
+      sampleCount: step.trace.sampleCount,
+      segmentDurationMs: Number(step.trace.segmentDurationMs.toFixed(3)),
+      jointAngles: step.jointAngles.map((angle) => Number(angle.toFixed(6)))
+    })
+  }
+
   steps.forEach((step, idx) => {
     lua += `-- [Bước ${idx + 1}] ${step.label}\n`
 
     if (step.comment) {
       lua += `-- Ghi chú: ${step.comment}\n`
+    }
+
+    const encodedTrace = traceMetadata(step)
+
+    if (encodedTrace) {
+      // Optional Studio metadata. A Fairino controller treats this as a normal
+      // LUA comment, while Studio can replay the exact recorded joint path.
+      lua += `-- @FAIROBOT_TRACE ${encodedTrace}\n`
     }
 
     switch (step.type) {

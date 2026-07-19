@@ -51,12 +51,22 @@ interface MoveJPayload {
   jointAngles: number[]
   speed?: number
   acc?: number
+  trace?: TracePayload
 }
 
 interface MoveLPayload {
   tcpPose: TCPPose
   speed?: number
   acc?: number
+  recordedJointAngles?: JointAngles
+  trace?: TracePayload
+}
+
+interface TracePayload {
+  groupId: string
+  sampleIndex: number
+  sampleCount: number
+  segmentDurationMs: number
 }
 
 interface RotateJointPayload {
@@ -148,6 +158,35 @@ function isFiniteNumber(value: unknown): value is number {
 function validateMotionValue(value: unknown, fieldName: 'speed' | 'acc'): void {
   if (value !== undefined && (!isFiniteNumber(value) || value < 1 || value > 100)) {
     throw new Error(`${fieldName} must be between 1 and 100`)
+  }
+}
+
+function parseTracePayload(value: unknown): TracePayload | undefined {
+  if (value === undefined) return undefined
+
+  if (!isRecord(value)) {
+    throw new Error('Trace metadata must be an object')
+  }
+
+  if (
+    typeof value.groupId !== 'string' ||
+    !value.groupId.trim() ||
+    !Number.isInteger(value.sampleIndex) ||
+    !Number.isInteger(value.sampleCount) ||
+    (value.sampleIndex as number) < 0 ||
+    (value.sampleCount as number) < 1 ||
+    (value.sampleIndex as number) >= (value.sampleCount as number) ||
+    !isFiniteNumber(value.segmentDurationMs) ||
+    value.segmentDurationMs < 0
+  ) {
+    throw new Error('Trace metadata is malformed')
+  }
+
+  return {
+    groupId: value.groupId.trim(),
+    sampleIndex: value.sampleIndex as number,
+    sampleCount: value.sampleCount as number,
+    segmentDurationMs: value.segmentDurationMs
   }
 }
 
@@ -302,7 +341,8 @@ function parseMoveJPayload(payload: unknown): MoveJPayload {
   return {
     jointAngles,
     speed: payload.speed as number | undefined,
-    acc: payload.acc as number | undefined
+    acc: payload.acc as number | undefined,
+    trace: parseTracePayload(payload.trace)
   }
 }
 
@@ -327,6 +367,25 @@ function parseMoveLPayload(payload: unknown): MoveLPayload {
   validateMotionValue(payload.speed, 'speed')
   validateMotionValue(payload.acc, 'acc')
 
+  const trace = parseTracePayload(payload.trace)
+  let recordedJointAngles: JointAngles | undefined
+
+  if (payload.recordedJointAngles !== undefined) {
+    if (
+      !Array.isArray(payload.recordedJointAngles) ||
+      payload.recordedJointAngles.length !== 6 ||
+      !payload.recordedJointAngles.every(isFiniteNumber)
+    ) {
+      throw new Error('MoveL recordedJointAngles must contain exactly 6 finite values')
+    }
+
+    recordedJointAngles = [...payload.recordedJointAngles] as JointAngles
+  }
+
+  if ((trace && !recordedJointAngles) || (!trace && recordedJointAngles)) {
+    throw new Error('MoveL trace and recordedJointAngles must be provided together')
+  }
+
   return {
     tcpPose: {
       x: tcpPose.x as number,
@@ -337,7 +396,9 @@ function parseMoveLPayload(payload: unknown): MoveLPayload {
       rz: tcpPose.rz as number
     },
     speed: payload.speed as number | undefined,
-    acc: payload.acc as number | undefined
+    acc: payload.acc as number | undefined,
+    recordedJointAngles,
+    trace
   }
 }
 
@@ -626,6 +687,45 @@ async function prepareRunProgramExecution(
   // This state is advanced virtually while planning.
   // The real robot store is not changed during this phase.
   let plannedAngles = getJointAnglesForRobot(normalizedRobotId)
+  let hasPlannedMotion = false
+  const traceState: {
+    active: { groupId: string; sampleCount: number; previousSampleIndex: number } | null
+  } = { active: null }
+
+  const validateTraceOrder = (trace: TracePayload, allowLegacyStartAtOne = false): void => {
+    if (!traceState.active) {
+      const isLegacyContinuation = allowLegacyStartAtOne && trace.sampleIndex === 1
+
+      if (trace.sampleIndex !== 0 && !isLegacyContinuation) {
+        throw new Error(
+          `Trace ${trace.groupId} must start at sample 0, received ${trace.sampleIndex}`
+        )
+      }
+
+      traceState.active = {
+        groupId: trace.groupId,
+        sampleCount: trace.sampleCount,
+        previousSampleIndex: trace.sampleIndex
+      }
+    } else {
+      if (
+        trace.groupId !== traceState.active.groupId ||
+        trace.sampleCount !== traceState.active.sampleCount ||
+        trace.sampleIndex !== traceState.active.previousSampleIndex + 1
+      ) {
+        throw new Error(
+          `Trace ${trace.groupId} samples are incomplete or out of order at ` +
+            `${trace.sampleIndex}/${trace.sampleCount - 1}`
+        )
+      }
+
+      traceState.active.previousSampleIndex = trace.sampleIndex
+    }
+
+    if (trace.sampleIndex === trace.sampleCount - 1) {
+      traceState.active = null
+    }
+  }
 
   for (let index = 0; index < steps.length; index++) {
     assertMotionCanContinue(signal, normalizedRobotId)
@@ -637,6 +737,10 @@ async function prepareRunProgramExecution(
         case 'MoveJ': {
           const moveJ = parseMoveJPayload(step.payload)
           const targetAngles = [...moveJ.jointAngles] as JointAngles
+
+          if (moveJ.trace) {
+            validateTraceOrder(moveJ.trace, hasPlannedMotion)
+          }
 
           const maxDelta = Math.max(
             ...targetAngles.map((target, jointIndex) =>
@@ -651,6 +755,7 @@ async function prepareRunProgramExecution(
           )
 
           plannedAngles = [...targetAngles] as JointAngles
+          hasPlannedMotion = true
           break
         }
 
@@ -677,12 +782,27 @@ async function prepareRunProgramExecution(
           const moveL = parseMoveLPayload(step.payload)
           const speedPercent = clamp(moveL.speed ?? 30, 1, 100)
 
+          if (moveL.trace) {
+            validateTraceOrder(moveL.trace, hasPlannedMotion)
+          }
+
           const trajectory = await prepareMoveLForRobot(
             normalizedRobotId,
             moveL.tcpPose,
             speedPercent,
             plannedAngles,
-            signal
+            signal,
+            moveL.trace && moveL.recordedJointAngles
+              ? {
+                  recordedTargetAngles: moveL.recordedJointAngles,
+                  segmentDurationMs: moveL.trace.segmentDurationMs,
+                  trace: {
+                    groupId: moveL.trace.groupId,
+                    sampleIndex: moveL.trace.sampleIndex,
+                    sampleCount: moveL.trace.sampleCount
+                  }
+                }
+              : undefined
           )
 
           if (trajectory.keyframes.length < 2) {
@@ -694,8 +814,10 @@ async function prepareRunProgramExecution(
           moveLTrajectoriesByStepIndex.set(index, trajectory)
 
           plannedAngles = [...trajectory.keyframes[trajectory.keyframes.length - 1]] as JointAngles
+          hasPlannedMotion = true
 
-          const baseDurationMs = clamp(6000 * (30 / speedPercent), 3000, 12000)
+          const baseDurationMs =
+            trajectory.durationMs ?? clamp(6000 * (30 / speedPercent), 3000, 12000)
 
           // Give the scheduler enough time to sample dense IK trajectories.
           const trajectoryDurationFloorMs = trajectory.waypointCount * 16
@@ -755,6 +877,13 @@ async function prepareRunProgramExecution(
         technicalMessage
       })
     }
+  }
+
+  if (traceState.active) {
+    throw new Error(
+      `Trace ${traceState.active.groupId} ended at sample ` +
+        `${traceState.active.previousSampleIndex}/${traceState.active.sampleCount - 1}`
+    )
   }
 
   assertMotionCanContinue(signal, normalizedRobotId)
@@ -877,6 +1006,10 @@ async function executeRunProgram(
         })
       }
     } else {
+      // A direct/single-robot RunProgram must use the same preflight as a
+      // Factory target. This keeps recorded traces out of the fallback IK path
+      // and ensures a program cannot fail halfway through preparation.
+      preparedProgramExecution = await prepareRunProgramExecution(steps, robotId, signal)
       await waitUntilScheduledStart(payload, signal, robotId)
     }
 
@@ -989,7 +1122,7 @@ async function executeRunProgram(
           case 'MoveL': {
             const preparedTrajectory = preparedMoveLTrajectoriesByStepIndex.get(index)
 
-            if (armPayload && !preparedTrajectory) {
+            if (preparedProgramExecution && !preparedTrajectory) {
               throw new Error(
                 `FactoryRun MoveL step ${step.orderIndex} ` + `does not have a prepared trajectory.`
               )
@@ -1018,7 +1151,7 @@ async function executeRunProgram(
           case 'MoveTCP': {
             const preparedTrajectory = preparedMoveLTrajectoriesByStepIndex.get(index)
 
-            if (armPayload && !preparedTrajectory) {
+            if (preparedProgramExecution && !preparedTrajectory) {
               throw new Error(
                 `FactoryRun MoveTCP step ${step.orderIndex} ` +
                   `does not have a prepared trajectory.`

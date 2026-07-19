@@ -13,6 +13,8 @@ import {
   latchRobotFault,
   removeRobotSafetyState,
   reportRobotSafetyContact,
+  recoverAllRobotCommandFaults,
+  recoverRobotCommandFault,
   resetRobotFault,
   throwIfRobotMotionBlocked
 } from './robotFaultRuntime'
@@ -22,6 +24,7 @@ describe('robotFaultRuntime', () => {
     const store = useSceneStore.getState()
     store.clearRobotSafetyState('robot-a')
     store.clearRobotSafetyState('robot-b')
+    store.clearRobotSafetyState('robot-c')
     store.clearScene()
   }
 
@@ -34,6 +37,7 @@ describe('robotFaultRuntime', () => {
   afterEach(() => {
     finishCommandExecutionForRobot('robot-a', 'command-a')
     finishCommandExecutionForRobot('robot-b', 'command-b')
+    finishCommandExecutionForRobot('robot-c', 'command-c')
     safetyGroupRegistry.clear()
     executionGroupRegistry.clear()
     clearTestRobotSafetyState()
@@ -204,6 +208,80 @@ describe('robotFaultRuntime', () => {
 
     removeRobotSafetyState('robot-a')
     expect(useSceneStore.getState().robotFaultsById['robot-a']).toBeUndefined()
+  })
+
+  it('recovers a terminal command fault without clearing another robot or safety fault', async () => {
+    latchRobotFault('robot-a', {
+      kind: 'command',
+      code: 'COMMAND_EXECUTION_FAILED',
+      message: 'Trace must start at sample 0.',
+      cancelMotion: false
+    })
+    latchRobotFault('robot-b', {
+      kind: 'safety-policy',
+      code: 'GLOBAL_ESTOP',
+      message: 'Global emergency stop.',
+      cancelMotion: false
+    })
+
+    const result = await recoverRobotCommandFault('robot-a')
+
+    expect(result.recovered).toBe(true)
+    expect(useSceneStore.getState().robotFaultsById['robot-a']).toBeUndefined()
+    expect(useSceneStore.getState().robotFaultsById['robot-b']?.code).toBe('GLOBAL_ESTOP')
+  })
+
+  it('does not use command recovery to clear a live collision', async () => {
+    latchRobotFault('robot-a', {
+      kind: 'command',
+      code: 'COMMAND_EXECUTION_FAILED',
+      message: 'Command failed.',
+      cancelMotion: false
+    })
+    useSceneStore.getState().setRobotContact('robot-a', {
+      robotId: 'robot-a',
+      level: 'collision',
+      kind: 'ground',
+      counterpartRobotIds: [],
+      objectIds: [],
+      message: 'Ground collision.',
+      detectedAtUtc: new Date().toISOString(),
+      updatedAtUtc: new Date().toISOString()
+    })
+
+    const result = await recoverRobotCommandFault('robot-a')
+
+    expect(result.recovered).toBe(false)
+    expect(useSceneStore.getState().robotFaultsById['robot-a']?.active).toBe(true)
+  })
+
+  it('recovers all command faults while preserving safety faults', async () => {
+    latchRobotFault('robot-a', {
+      kind: 'command',
+      code: 'COMMAND_EXECUTION_FAILED',
+      message: 'Trace failed.',
+      cancelMotion: false
+    })
+    latchRobotFault('robot-b', {
+      kind: 'timeout',
+      code: 'COMMAND_TIMEOUT',
+      message: 'Command timed out.',
+      cancelMotion: false
+    })
+    latchRobotFault('robot-c', {
+      kind: 'safety-policy',
+      code: 'GLOBAL_ESTOP',
+      message: 'Global emergency stop.',
+      cancelMotion: false
+    })
+
+    const result = await recoverAllRobotCommandFaults()
+
+    expect(result.recoveredRobotIds.sort()).toEqual(['robot-a', 'robot-b'])
+    expect(result.failedByRobotId).toEqual({})
+    expect(useSceneStore.getState().robotFaultsById['robot-a']).toBeUndefined()
+    expect(useSceneStore.getState().robotFaultsById['robot-b']).toBeUndefined()
+    expect(useSceneStore.getState().robotFaultsById['robot-c']?.code).toBe('GLOBAL_ESTOP')
   })
 
   it('does not silently clear a latched fault when scene objects are cleared', () => {

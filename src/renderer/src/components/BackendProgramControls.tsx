@@ -116,7 +116,8 @@ function convertStep(step: WorkflowStep, index: number): ProgramStepRequest {
         payload: {
           jointAngles: step.jointAngles,
           speed: percent(step.speed),
-          acc: percent(step.acc)
+          acc: percent(step.acc),
+          ...(step.trace ? { trace: step.trace } : {})
         }
       }
 
@@ -157,7 +158,13 @@ function convertStep(step: WorkflowStep, index: number): ProgramStepRequest {
         payload: {
           tcpPose: step.tcpPose,
           speed: percent(step.speed),
-          acc: percent(step.acc)
+          acc: percent(step.acc),
+          ...(step.trace && step.jointAngles
+            ? {
+                trace: step.trace,
+                recordedJointAngles: step.jointAngles
+              }
+            : {})
         }
       }
 

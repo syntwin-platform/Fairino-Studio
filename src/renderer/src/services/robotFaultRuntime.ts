@@ -7,7 +7,11 @@ import type {
   RobotSafetyContactObservation,
   RobotSafetyContactState
 } from '../types/robotFault.types'
-import { cancelActiveCommandForRobot, getActiveCommandRobotIds } from './commandExecutionRuntime'
+import {
+  cancelActiveCommandForRobot,
+  getActiveCommandIdForRobot,
+  getActiveCommandRobotIds
+} from './commandExecutionRuntime'
 import { executeSafetyStop } from './safety/safetyStopResolver'
 import type { SafetyFaultEvent, SafetyStopCause, SafetyStopResolution } from './safety/safetyTypes'
 
@@ -280,6 +284,121 @@ export function resetRobotFault(robotId: string, options: ResetRobotFaultOptions
 
   store.setRobotFault(normalizedRobotId, null)
   return true
+}
+
+export interface RecoverRobotCommandFaultResult {
+  recovered: boolean
+  message: string
+}
+
+export interface RecoverAllRobotCommandFaultsResult {
+  recoveredRobotIds: string[]
+  failedByRobotId: Record<string, string>
+}
+
+function waitForCommandRegistry(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds)
+  })
+}
+
+/**
+ * Releases a terminal command/timeout fault without weakening collision or
+ * emergency-stop policy. Backend command history is intentionally preserved.
+ */
+export async function recoverRobotCommandFault(
+  robotId: string
+): Promise<RecoverRobotCommandFaultResult> {
+  const normalizedRobotId = normalizeRobotId(robotId)
+  if (!normalizedRobotId) {
+    return { recovered: false, message: 'Robot ID is required.' }
+  }
+
+  const fault = getRobotFault(normalizedRobotId)
+  if (!fault?.active || (fault.kind !== 'command' && fault.kind !== 'timeout')) {
+    return {
+      recovered: false,
+      message: 'Chỉ có lỗi command hoặc timeout mới được khôi phục tại đây.'
+    }
+  }
+
+  if (getRobotSafetyContact(normalizedRobotId)?.level === 'collision') {
+    return {
+      recovered: false,
+      message: 'Robot vẫn đang va chạm. Hãy đưa robot về vùng an toàn trước khi khôi phục.'
+    }
+  }
+
+  const activeCommandId = getActiveCommandIdForRobot(normalizedRobotId)
+  if (activeCommandId) {
+    cancelActiveCommandForRobot(
+      normalizedRobotId,
+      'Operator requested command recovery after a terminal execution error.'
+    )
+
+    const deadline = Date.now() + 2000
+    while (getActiveCommandIdForRobot(normalizedRobotId) && Date.now() < deadline) {
+      await waitForCommandRegistry(25)
+    }
+
+    if (getActiveCommandIdForRobot(normalizedRobotId)) {
+      return {
+        recovered: false,
+        message: 'Command cũ vẫn đang kết thúc. Vui lòng thử lại sau vài giây.'
+      }
+    }
+  }
+
+  if (!resetRobotFault(normalizedRobotId, { safetyValidated: true })) {
+    return {
+      recovered: false,
+      message: 'Không thể khôi phục vì điều kiện an toàn chưa được xác nhận.'
+    }
+  }
+
+  const robotStore = useRobotStore.getState()
+  robotStore.setRobotExecution(normalizedRobotId, {
+    isPlaying: false,
+    currentStepIndex: 0,
+    lastError: undefined
+  })
+  robotStore.setRobotRuntime(normalizedRobotId, { lastError: undefined })
+
+  return {
+    recovered: true,
+    message: 'Đã xóa trạng thái lỗi. Robot có thể nhận chương trình mới.'
+  }
+}
+
+/**
+ * Recovers every terminal command/timeout fault currently latched in the
+ * scene. Collision, safety-policy and emergency-stop faults are excluded by
+ * construction and remain latched.
+ */
+export async function recoverAllRobotCommandFaults(): Promise<RecoverAllRobotCommandFaultsResult> {
+  const recoverableRobotIds = Object.values(useSceneStore.getState().robotFaultsById)
+    .filter((fault) => fault.active && (fault.kind === 'command' || fault.kind === 'timeout'))
+    .map((fault) => fault.robotId)
+
+  const settled = await Promise.all(
+    recoverableRobotIds.map(async (robotId) => ({
+      robotId,
+      result: await recoverRobotCommandFault(robotId)
+    }))
+  )
+
+  const recoveredRobotIds: string[] = []
+  const failedByRobotId: Record<string, string> = {}
+
+  for (const { robotId, result } of settled) {
+    if (result.recovered) {
+      recoveredRobotIds.push(robotId)
+    } else {
+      failedByRobotId[robotId] = result.message
+    }
+  }
+
+  return { recoveredRobotIds, failedByRobotId }
 }
 
 export function removeRobotSafetyState(robotId: string): void {

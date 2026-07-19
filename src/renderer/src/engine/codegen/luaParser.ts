@@ -39,6 +39,53 @@ function isValidPercent(value: number): boolean {
   return value >= 1 && value <= 100
 }
 
+interface LuaTraceMetadata {
+  trace: NonNullable<WorkflowStep['trace']>
+  jointAngles: JointAngles
+}
+
+function parseTraceMetadata(value: string): LuaTraceMetadata | null {
+  try {
+    const metadata: unknown = JSON.parse(value)
+
+    if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) return null
+
+    const record = metadata as Record<string, unknown>
+    const jointAngles = record.jointAngles
+
+    if (
+      record.version !== 1 ||
+      typeof record.groupId !== 'string' ||
+      !record.groupId.trim() ||
+      !Number.isInteger(record.sampleIndex) ||
+      !Number.isInteger(record.sampleCount) ||
+      (record.sampleIndex as number) < 0 ||
+      (record.sampleCount as number) < 1 ||
+      (record.sampleIndex as number) >= (record.sampleCount as number) ||
+      typeof record.segmentDurationMs !== 'number' ||
+      !Number.isFinite(record.segmentDurationMs) ||
+      record.segmentDurationMs < 0 ||
+      !Array.isArray(jointAngles) ||
+      jointAngles.length !== 6 ||
+      !jointAngles.every((angle) => typeof angle === 'number' && Number.isFinite(angle))
+    ) {
+      return null
+    }
+
+    return {
+      trace: {
+        groupId: record.groupId.trim(),
+        sampleIndex: record.sampleIndex as number,
+        sampleCount: record.sampleCount as number,
+        segmentDurationMs: record.segmentDurationMs
+      },
+      jointAngles: jointAngles as JointAngles
+    }
+  } catch {
+    return null
+  }
+}
+
 export function parseLua(luaContent: string): LuaParseResult {
   const steps: WorkflowStep[] = []
   const diagnostics: LuaParseDiagnostic[] = []
@@ -49,6 +96,7 @@ export function parseLua(luaContent: string): LuaParseResult {
   let currentComment = ''
   let insideToDoubleHelper = false
   let gripperHint = false
+  let currentTraceMetadata: LuaTraceMetadata | null = null
 
   const addError = (lineIndex: number, message: string, source: string): void => {
     diagnostics.push({
@@ -68,6 +116,7 @@ export function parseLua(luaContent: string): LuaParseResult {
     currentLabel = ''
     currentComment = ''
     gripperHint = false
+    currentTraceMetadata = null
   }
 
   for (let index = 0; index < lines.length; index++) {
@@ -95,6 +144,18 @@ export function parseLua(luaContent: string): LuaParseResult {
 
     if (noteMatch) {
       currentComment = noteMatch[1].trim()
+      continue
+    }
+
+    const traceMetadataMatch = line.match(/^--\s*@FAIROBOT_TRACE\s+(.+)$/)
+
+    if (traceMetadataMatch) {
+      currentTraceMetadata = parseTraceMetadata(traceMetadataMatch[1])
+
+      if (!currentTraceMetadata) {
+        addError(index, 'Invalid @FAIROBOT_TRACE metadata.', source)
+      }
+
       continue
     }
 
@@ -166,6 +227,7 @@ export function parseLua(luaContent: string): LuaParseResult {
         label: currentLabel || 'MoveJ',
         comment: currentComment || undefined,
         jointAngles: joints as JointAngles,
+        trace: currentTraceMetadata?.trace,
         speed,
         acc
       })
@@ -206,6 +268,8 @@ export function parseLua(luaContent: string): LuaParseResult {
         label: currentLabel || 'MoveL',
         comment: currentComment || undefined,
         tcpPose,
+        jointAngles: currentTraceMetadata?.jointAngles,
+        trace: currentTraceMetadata?.trace,
         speed,
         acc
       })

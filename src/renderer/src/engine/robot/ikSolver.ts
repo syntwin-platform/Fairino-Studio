@@ -12,6 +12,14 @@ interface FairinoRobotObject extends THREE.Object3D {
   links: Record<string, THREE.Object3D>
 }
 
+export interface SolveIKOptions {
+  maxIterations?: number
+  tolerancePositionMeters?: number
+  toleranceRotationRadians?: number
+  damping?: number
+  maxStepDegrees?: number
+}
+
 const JOINT_LIMITS = [
   { minRad: (-175 * Math.PI) / 180, maxRad: (175 * Math.PI) / 180 }, // j1
   { minRad: (-265 * Math.PI) / 180, maxRad: (85 * Math.PI) / 180 }, // j2
@@ -79,7 +87,8 @@ export function solveIK(
   targetPos: THREE.Vector3, // Target position in meters (robot coordinate frame)
   targetQuat: THREE.Quaternion, // Target orientation (robot coordinate frame)
   currentAngles: JointAngles, // Current joint angles in degrees
-  robotObj: FairinoRobotObject | null | undefined // Three.js robot object loaded by urdf-loader
+  robotObj: FairinoRobotObject | null | undefined, // Three.js robot object loaded by urdf-loader
+  options: SolveIKOptions = {}
 ): JointAngles | null {
   if (!robotObj) return null
 
@@ -102,10 +111,10 @@ export function solveIK(
     return isNaN(val) ? 0 : val
   })
 
-  const maxIterations = 20
-  const tolerancePos = 0.0005 // 0.5 mm in meters
-  const toleranceRot = 0.001 // ~0.05 degrees in radians
-  const damping = 0.15 // Damping factor lambda (increased for singularity damping & smoothness)
+  const maxIterations = Math.max(1, Math.round(options.maxIterations ?? 20))
+  const tolerancePos = options.tolerancePositionMeters ?? 0.0005 // 0.5 mm in meters
+  const toleranceRot = options.toleranceRotationRadians ?? 0.001 // ~0.05 degrees in radians
+  const damping = options.damping ?? 0.15 // Damping factor lambda
   for (let iter = 0; iter < maxIterations; iter++) {
     // 1. Update robot joints with current iterate q
     jointNames.forEach((name, idx) => {
@@ -267,7 +276,7 @@ export function solveIK(
   robotObj.updateMatrixWorld(true)
 
   // Limit joint angle change per frame (velocity clamp) to prevent sudden jumps or twists
-  const maxStepPerFrame = 8 // degrees
+  const maxStepPerFrame = options.maxStepDegrees ?? 8
   const finalAngles = q.map((rad, idx) => {
     const deg = (rad * 180) / Math.PI
     const prevDeg = currentAngles[idx]

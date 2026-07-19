@@ -48,6 +48,12 @@ export interface WorkflowStep {
   distance?: number // mm
   // Metadata
   comment?: string
+  trace?: {
+    groupId: string
+    sampleIndex: number
+    sampleCount: number
+    segmentDurationMs: number
+  }
 }
 
 export interface RobotSceneBinding {

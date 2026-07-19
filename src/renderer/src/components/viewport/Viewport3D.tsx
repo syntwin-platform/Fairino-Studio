@@ -8,7 +8,7 @@ import { OBB } from 'three/examples/jsm/math/OBB.js'
 import { useRobotStore } from '../../store/robotStore'
 import { useSceneStore } from '../../store/sceneStore'
 import { solveIK } from '../../engine/robot/ikSolver'
-import { ShieldAlert, HelpCircle } from 'lucide-react'
+import { ShieldAlert, HelpCircle, CircleAlert } from 'lucide-react'
 
 import {
   getRobotRuntimeConfig,
@@ -25,6 +25,13 @@ import type { MoveLRunOptions, PreparedMoveLTrajectory } from '../../services/ro
 import { throwIfCommandCancelled } from '../../services/commandExecutionRuntime'
 import { runScheduledJointTrajectory } from '../../services/factoryMotionScheduler'
 import { loadUrdfRobotWhenAssetsReady } from '../../services/urdfRobotLoader'
+import { CartesianTraceRecorder } from '../../services/cartesianTraceRecorder'
+import {
+  hasCartesianTraceWristInput,
+  isCartesianTraceControlKey,
+  resolveCartesianTraceInput
+} from '../../services/cartesianTraceInput'
+import type { CartesianTraceSpeedMode } from '../../services/cartesianTraceInput'
 import {
   clearRobotSafetyContact,
   removeRobotSafetyState,
@@ -40,6 +47,7 @@ import type {
   WorkflowStep
 } from '../../types/robot.types'
 import type { Transform3D } from '../../types/scene.types'
+import type { CartesianTraceSample, CartesianTraceSnapshot } from '../../types/cartesianTrace.types'
 
 interface RobotJoint extends THREE.Object3D {
   setJointValue: (value: number) => void
@@ -65,8 +73,11 @@ const ROBOT_WORLD_UP = new THREE.Vector3(0, 1, 0)
 const PREVIEW_COLLISION_ROBOT_ID = '__viewport_preview_robot__'
 const COLLISION_SCHEDULER_INTERVAL_MS = 1000 / 15
 const MEASUREMENT_SCHEDULER_INTERVAL_MS = 100
-const ROBOT_FAULT_COLOR = 0x7f1d1d
-const ROBOT_FAULT_EMISSIVE = 0xff1f1f
+const TRACE_WRIST_JOINT_LIMITS_DEGREES = [
+  { min: -265, max: 85 },
+  { min: -175, max: 175 },
+  { min: -175, max: 175 }
+] as const
 const LINK_LOCAL_BOX_CACHE = new WeakMap<THREE.Object3D, THREE.Box3 | null>()
 
 function toJointAngles(values: number[]): JointAngles {
@@ -135,53 +146,6 @@ function createWarningCircle(color: number): THREE.Mesh {
   const mesh = new THREE.Mesh(geometry, material)
   mesh.rotation.x = -Math.PI / 2
   return mesh
-}
-
-function createWarningSprite(color: string, isCollision: boolean): THREE.Sprite {
-  const canvas = document.createElement('canvas')
-  canvas.width = 128
-  canvas.height = 128
-  const ctx = canvas.getContext('2d')
-  if (ctx) {
-    ctx.clearRect(0, 0, 128, 128)
-    if (isCollision) {
-      ctx.beginPath()
-      ctx.arc(64, 64, 55, 0, 2 * Math.PI)
-      ctx.fillStyle = color
-      ctx.fill()
-      ctx.lineWidth = 6
-      ctx.strokeStyle = '#ffffff'
-      ctx.stroke()
-
-      ctx.font = 'bold 75px sans-serif'
-      ctx.fillStyle = '#ffffff'
-      ctx.textAlign = 'center'
-      ctx.textBaseline = 'middle'
-      ctx.fillText('!', 64, 64)
-    } else {
-      ctx.beginPath()
-      ctx.moveTo(64, 10)
-      ctx.lineTo(118, 110)
-      ctx.lineTo(10, 110)
-      ctx.closePath()
-      ctx.fillStyle = color
-      ctx.fill()
-      ctx.lineWidth = 6
-      ctx.strokeStyle = '#ffffff'
-      ctx.stroke()
-
-      ctx.font = 'bold 60px sans-serif'
-      ctx.fillStyle = '#000000'
-      ctx.textAlign = 'center'
-      ctx.textBaseline = 'middle'
-      ctx.fillText('!', 64, 68)
-    }
-  }
-  const texture = new THREE.CanvasTexture(canvas)
-  const material = new THREE.SpriteMaterial({ map: texture, transparent: true })
-  const sprite = new THREE.Sprite(material)
-  sprite.scale.set(0.28, 0.28, 1)
-  return sprite
 }
 
 function waitForMoveLFrame(milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -268,7 +232,6 @@ const SELF_COLLISION_PAIRS = [
 
 export interface SafetyVisualHelper {
   warningCircle?: THREE.Mesh
-  warningSprite?: THREE.Sprite
 }
 
 export default function Viewport3D(): React.JSX.Element {
@@ -294,20 +257,45 @@ export default function Viewport3D(): React.JSX.Element {
   const collisionLoadErrorRef = useRef(false)
   const robotsRef = useRef<RobotInstance[]>([])
   const sceneRef = useRef<THREE.Scene | null>(null)
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null)
   const controlsRef = useRef<OrbitControls | null>(null)
   const transformControlsRef = useRef<TransformControls | null>(null)
   const dummyTargetRef = useRef<THREE.Object3D | null>(null)
+  const traceHandleRef = useRef<THREE.Group | null>(null)
   const boxHelperRef = useRef<THREE.BoxHelper | null>(null)
   const measureLineRef = useRef<THREE.Line | null>(null)
   const selfMeasureLineRef = useRef<THREE.Line | null>(null)
   const hitboxHelpersRef = useRef<THREE.LineSegments[]>([])
+  // Camera and Cartesian Trace must never share a key buffer. Otherwise a transient
+  // robot/runtime state can leak W/A/S/D into camera navigation while Trace owns them.
   const keysPressedRef = useRef<Set<string>>(new Set())
+  const traceKeysPressedRef = useRef<Set<string>>(new Set())
+  const cartesianTraceRecorderRef = useRef(new CartesianTraceRecorder())
+  const cancelCartesianTraceRef = useRef<(restoreStartPose: boolean) => void>(() => undefined)
+  const factoryCameraStateRef = useRef<{
+    position: THREE.Vector3
+    target: THREE.Vector3
+    near: number
+    far: number
+  } | null>(null)
+  const previousWorkspaceModeRef = useRef(useRobotStore.getState().workspaceMode)
+  const lastTrainCameraFocusIdRef = useRef<string | null>(null)
+  const cartesianTraceContextRef = useRef('')
   const [isRobotLoaded, setIsRobotLoaded] = useState(false)
   const [isTechnicalDetailsExpanded, setIsTechnicalDetailsExpanded] = useState(false)
   const [collisionReadiness, setCollisionReadiness] = useState<CollisionReadinessState>({
     status: 'loading',
     robotCount: 0
   })
+  const [cartesianTraceUi, setCartesianTraceUi] = useState<CartesianTraceSnapshot>({
+    status: 'idle',
+    rawSampleCount: 0,
+    durationMs: 0
+  })
+  const [cartesianTraceNotice, setCartesianTraceNotice] = useState('')
+  const [cartesianTraceSpeedMode, setCartesianTraceSpeedMode] =
+    useState<CartesianTraceSpeedMode>('normal')
+  const [isCartesianTraceHelpExpanded, setIsCartesianTraceHelpExpanded] = useState(true)
 
   const updateCollisionReadiness = (status: CollisionReadinessStatus, robotCount = 0): void => {
     setCollisionReadiness((current) =>
@@ -398,11 +386,6 @@ export default function Viewport3D(): React.JSX.Element {
             helpers.warningCircle.material.dispose()
           }
         }
-        if (helpers.warningSprite) {
-          scene.remove(helpers.warningSprite)
-          helpers.warningSprite.material.map?.dispose()
-          helpers.warningSprite.material.dispose()
-        }
       }
       safetyHelpersRef.current.delete(robotId)
     }
@@ -440,16 +423,6 @@ export default function Viewport3D(): React.JSX.Element {
         snapshot.material.emissiveIntensity = snapshot.originalEmissiveIntensity
       }
 
-      if (nextState === 'fault') {
-        if (isColorMaterial(snapshot.material)) {
-          snapshot.material.color.setHex(ROBOT_FAULT_COLOR)
-        }
-        if (isHighlightableMaterial(snapshot.material)) {
-          snapshot.material.emissive.setHex(ROBOT_FAULT_EMISSIVE)
-          snapshot.material.emissiveIntensity = 1.35
-        }
-      }
-
       snapshot.material.needsUpdate = true
     }
 
@@ -468,11 +441,6 @@ export default function Viewport3D(): React.JSX.Element {
               helpers.warningCircle.material.dispose()
             }
           }
-          if (helpers.warningSprite) {
-            scene.remove(helpers.warningSprite)
-            helpers.warningSprite.material.map?.dispose()
-            helpers.warningSprite.material.dispose()
-          }
           safetyHelpersRef.current.delete(robotId)
           helpers = undefined
         }
@@ -481,11 +449,9 @@ export default function Viewport3D(): React.JSX.Element {
       if (nextState !== 'normal') {
         const isCollision = nextState === 'fault'
         const circleColor = isCollision ? 0xff1f1f : 0xf59e0b
-        const spriteColor = isCollision ? '#ff1f1f' : '#f59e0b'
 
         if (!helpers) {
           const warningCircle = createWarningCircle(circleColor)
-          const warningSprite = isCollision ? createWarningSprite(spriteColor, true) : undefined
 
           const robot =
             robotId === PREVIEW_COLLISION_ROBOT_ID
@@ -496,13 +462,7 @@ export default function Viewport3D(): React.JSX.Element {
             warningCircle.position.y += 0.01
             scene.add(warningCircle)
 
-            if (warningSprite) {
-              warningSprite.position.copy(robot.position)
-              warningSprite.position.y += 1.1
-              scene.add(warningSprite)
-            }
-
-            safetyHelpersRef.current.set(robotId, { warningCircle, warningSprite })
+            safetyHelpersRef.current.set(robotId, { warningCircle })
           }
         } else {
           const robot =
@@ -514,11 +474,6 @@ export default function Viewport3D(): React.JSX.Element {
               helpers.warningCircle.visible = robot.visible
               helpers.warningCircle.position.copy(robot.position)
               helpers.warningCircle.position.y += 0.01
-            }
-            if (helpers.warningSprite) {
-              helpers.warningSprite.visible = robot.visible
-              helpers.warningSprite.position.copy(robot.position)
-              helpers.warningSprite.position.y += 1.1
             }
           }
         }
@@ -534,13 +489,12 @@ export default function Viewport3D(): React.JSX.Element {
   // Cache the last user config JSON to block infinite store update loop
   const lastUserConfigRef = useRef<string>('')
 
-  const jointAngles = useRobotStore((state) => state.jointAngles)
-  const jointAnglesByRobotId = useRobotStore((state) => state.jointAnglesByRobotId)
   const setJointAngles = useRobotStore((state) => state.setJointAngles)
   const setJointAnglesForRobot = useRobotStore((state) => state.setJointAnglesForRobot)
   const setTCPPose = useRobotStore((state) => state.setTCPPose)
   const setTCPPoseForRobot = useRobotStore((state) => state.setTCPPoseForRobot)
   const isIKMode = useRobotStore((state) => state.isIKMode)
+  const cartesianInteractionMode = useRobotStore((state) => state.cartesianInteractionMode)
   const isRobotPlacementMode = useRobotStore((state) => state.isRobotPlacementMode)
   const robotPlacementTransformMode = useRobotStore((state) => state.robotPlacementTransformMode)
   const isPlaying = useRobotStore((state) => {
@@ -624,7 +578,9 @@ export default function Viewport3D(): React.JSX.Element {
       return
     }
 
-    applyRobotSceneBinding(robot, selectedRobotSceneBinding)
+    // Train uses a local, centered presentation transform. Keep the persisted Factory binding
+    // untouched so switching back restores the exact production layout.
+    applyRobotSceneBinding(robot, workspaceMode === 'train' ? null : selectedRobotSceneBinding)
     collisionSchedulerRef.current?.requestImmediateTick()
   }, [
     isRobotLoaded,
@@ -633,7 +589,8 @@ export default function Viewport3D(): React.JSX.Element {
     selectedRobotSceneBinding?.baseX,
     selectedRobotSceneBinding?.baseY,
     selectedRobotSceneBinding?.baseZ,
-    selectedRobotSceneBinding?.baseYaw
+    selectedRobotSceneBinding?.baseYaw,
+    workspaceMode
   ])
 
   useEffect(() => {
@@ -751,11 +708,15 @@ export default function Viewport3D(): React.JSX.Element {
           Number.isFinite(options.durationMs) &&
           options.durationMs > 0
             ? options.durationMs
-            : Math.max(
-                16,
-                preparedTrajectory.waypointCount *
-                  Math.max(16, 110 - Math.max(1, Math.min(100, speed)))
-              )
+            : typeof preparedTrajectory.durationMs === 'number' &&
+                Number.isFinite(preparedTrajectory.durationMs) &&
+                preparedTrajectory.durationMs > 0
+              ? preparedTrajectory.durationMs
+              : Math.max(
+                  16,
+                  preparedTrajectory.waypointCount *
+                    Math.max(16, 110 - Math.max(1, Math.min(100, speed)))
+                )
 
         if (managePlayingState) {
           useRobotStore.getState().setPlaying(true)
@@ -1537,6 +1498,7 @@ export default function Viewport3D(): React.JSX.Element {
     if (!containerRef.current) return
 
     const container = containerRef.current
+    const cartesianTraceRecorder = cartesianTraceRecorderRef.current
     const sceneGeneration = sceneGenerationRef.current + 1
     sceneGenerationRef.current = sceneGeneration
     const width = Math.max(1, container.clientWidth)
@@ -1550,6 +1512,7 @@ export default function Viewport3D(): React.JSX.Element {
     // Camera
     const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 100)
     camera.position.set(1.5, 1.5, 1.5)
+    cameraRef.current = camera
 
     // Renderer
     const renderer = new THREE.WebGLRenderer({ antialias: true })
@@ -1636,6 +1599,61 @@ export default function Viewport3D(): React.JSX.Element {
     })
     const cageMesh = new THREE.Mesh(cageGeom, cageMat)
     dummyTarget.add(cageMesh)
+
+    // Freehand Cartesian handle. This is intentionally independent from TransformControls:
+    // TransformControls remains the point-positioning tool, while this handle owns trace input.
+    const traceHandle = new THREE.Group()
+    traceHandle.name = 'cartesian_trace_handle'
+
+    const traceCenter = new THREE.Mesh(
+      new THREE.SphereGeometry(0.045, 20, 20),
+      new THREE.MeshBasicMaterial({
+        color: 0x22d3ee,
+        transparent: true,
+        opacity: 0.72,
+        depthTest: false
+      })
+    )
+    traceCenter.name = 'cartesian_trace_handle_center'
+    traceHandle.add(traceCenter)
+
+    const traceRing = new THREE.Mesh(
+      new THREE.TorusGeometry(0.06, 0.006, 10, 32),
+      new THREE.MeshBasicMaterial({
+        color: 0xa5f3fc,
+        transparent: true,
+        opacity: 0.9,
+        depthTest: false
+      })
+    )
+    traceRing.name = 'cartesian_trace_handle_ring'
+    traceHandle.add(traceRing)
+
+    const traceAxes: Array<[THREE.Vector3, number]> = [
+      [new THREE.Vector3(1, 0, 0), 0xef4444],
+      [new THREE.Vector3(0, 1, 0), 0x22c55e],
+      [new THREE.Vector3(0, 0, 1), 0x3b82f6]
+    ]
+    for (const [direction, color] of traceAxes) {
+      const arrow = new THREE.ArrowHelper(direction, new THREE.Vector3(), 0.16, color, 0.045, 0.025)
+      arrow.name = 'cartesian_trace_handle_axis'
+      traceHandle.add(arrow)
+    }
+
+    traceHandle.traverse((child) => {
+      child.renderOrder = 100
+      if (child instanceof THREE.Mesh || child instanceof THREE.Line) {
+        const materials = Array.isArray(child.material) ? child.material : [child.material]
+        for (const material of materials) {
+          material.depthTest = false
+          material.depthWrite = false
+          material.transparent = true
+        }
+      }
+    })
+    traceHandle.visible = false
+    dummyTarget.add(traceHandle)
+    traceHandleRef.current = traceHandle
 
     dummyTarget.visible = false
     scene.add(dummyTarget)
@@ -1852,15 +1870,61 @@ export default function Viewport3D(): React.JSX.Element {
       }
     })
 
-    // Keyboard shortcuts listener for WASD movement and Gizmo transform modes
+    const isCartesianTraceModeActive = (): boolean => {
+      const state = useRobotStore.getState()
+
+      return (
+        state.workspaceMode === 'train' &&
+        state.isIKMode &&
+        state.cartesianInteractionMode === 'trace'
+      )
+    }
+
+    const isCartesianTraceInputEnabled = (): boolean => {
+      const state = useRobotStore.getState()
+      const activeRobotId = state.selectedRobotId
+      const playing = activeRobotId
+        ? (state.robotExecutionById[activeRobotId]?.isPlaying ?? false)
+        : state.isPlaying
+
+      return isCartesianTraceModeActive() && !playing
+    }
+
+    const updateTraceSpeedUi = (): void => {
+      setCartesianTraceSpeedMode(resolveCartesianTraceInput(traceKeysPressedRef.current).speedMode)
+    }
+
+    // Keyboard shortcuts listener for camera, trace wrist control and Gizmo transform modes.
     const handleKeyDown = (event: KeyboardEvent): void => {
       // Ignore when typing in input fields
-      const activeTag = document.activeElement?.tagName
-      if (activeTag === 'INPUT' || activeTag === 'TEXTAREA' || activeTag === 'SELECT') {
+      const activeElement = document.activeElement
+      const activeTag = activeElement?.tagName
+      if (
+        activeTag === 'INPUT' ||
+        activeTag === 'TEXTAREA' ||
+        activeTag === 'SELECT' ||
+        (activeElement instanceof HTMLElement && activeElement.isContentEditable)
+      ) {
         return
       }
 
       const key = event.key.toLowerCase()
+      if (key === 'escape') {
+        cancelCartesianTraceRef.current(true)
+        return
+      }
+
+      // Trace owns these keys for its whole UI mode, even while the robot is loading or
+      // playback temporarily blocks motion. Never let them fall through to camera input.
+      if (isCartesianTraceModeActive() && isCartesianTraceControlKey(key)) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        traceKeysPressedRef.current.add(key)
+        keysPressedRef.current.delete(key)
+        updateTraceSpeedUi()
+        return
+      }
+
       if (['w', 'a', 's', 'd'].includes(key)) {
         keysPressedRef.current.add(key)
       }
@@ -1879,16 +1943,484 @@ export default function Viewport3D(): React.JSX.Element {
 
     const handleKeyUp = (event: KeyboardEvent): void => {
       const key = event.key.toLowerCase()
+      if (isCartesianTraceControlKey(key)) {
+        traceKeysPressedRef.current.delete(key)
+        // Also clear a camera key that may have been held before switching into Trace.
+        keysPressedRef.current.delete(key)
+        updateTraceSpeedUi()
+        if (isCartesianTraceModeActive()) {
+          event.preventDefault()
+          event.stopImmediatePropagation()
+        }
+        return
+      }
+
       if (['w', 'a', 's', 'd'].includes(key)) {
         keysPressedRef.current.delete(key)
       }
     }
 
-    window.addEventListener('keydown', handleKeyDown)
-    window.addEventListener('keyup', handleKeyUp)
+    const handleWindowBlur = (): void => {
+      keysPressedRef.current.clear()
+      traceKeysPressedRef.current.clear()
+      setCartesianTraceSpeedMode('normal')
+    }
+
+    // Capture phase gives Trace priority over any application-level camera shortcut.
+    window.addEventListener('keydown', handleKeyDown, true)
+    window.addEventListener('keyup', handleKeyUp, true)
+    window.addEventListener('blur', handleWindowBlur)
     // Click to select joints or imported 3D objects (Raycasting)
     const raycaster = new THREE.Raycaster()
     const mouse = new THREE.Vector2()
+
+    let tracePointerId: number | null = null
+    let traceRobot: FairinoRobotObject | null = null
+    let traceRobotId: string | null = null
+    let traceCurrentAngles: JointAngles | null = null
+    let traceStartedAtMs = 0
+    let traceLastMotionUpdateMs = 0
+    let traceLastUiUpdateMs = 0
+    let traceLastKeyboardUpdateMs = 0
+    let traceKeyboardWasActive = false
+    const traceDragPlane = new THREE.Plane()
+    const tracePointerStart = new THREE.Vector3()
+    const traceWristStart = new THREE.Vector3()
+    const traceWristQuaternion = new THREE.Quaternion()
+    const traceIntersection = new THREE.Vector3()
+    const tracePlaneNormal = new THREE.Vector3()
+    const tracePointerDelta = new THREE.Vector3()
+    const traceTargetWorldPosition = new THREE.Vector3()
+    const traceTargetWorldMatrix = new THREE.Matrix4()
+    const traceBaseMatrixInverse = new THREE.Matrix4()
+    const traceRelativeMatrix = new THREE.Matrix4()
+    const traceTargetPosition = new THREE.Vector3()
+    const traceTargetQuaternion = new THREE.Quaternion()
+    const traceTargetScale = new THREE.Vector3()
+    const traceWristLocalPosition = new THREE.Vector3()
+    const traceUnitScale = new THREE.Vector3(1, 1, 1)
+
+    const updatePointerCoordinates = (event: PointerEvent): void => {
+      const rect = renderer.domElement.getBoundingClientRect()
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
+    }
+
+    const createTraceSample = (
+      robot: FairinoRobotObject,
+      angles: JointAngles,
+      elapsedMs: number
+    ): CartesianTraceSample | null => {
+      const tcpPose = getRobotTcpPose(robot)
+      return tcpPose
+        ? {
+            elapsedMs: Math.max(0, Math.round(elapsedMs)),
+            tcpPose,
+            jointAngles: [...angles] as JointAngles
+          }
+        : null
+    }
+
+    const clearTracePointerCapture = (): void => {
+      if (tracePointerId !== null && renderer.domElement.hasPointerCapture(tracePointerId)) {
+        renderer.domElement.releasePointerCapture(tracePointerId)
+      }
+      tracePointerId = null
+      controls.enabled = true
+      isTransformDraggingRef.current = false
+    }
+
+    const pauseCartesianTrace = (): CartesianTraceSnapshot => {
+      const recorder = cartesianTraceRecorderRef.current
+      if (!traceRobot || !traceCurrentAngles) return recorder.getSnapshot()
+
+      const finalSample = createTraceSample(
+        traceRobot,
+        traceCurrentAngles,
+        performance.now() - traceStartedAtMs
+      )
+      const snapshot = recorder.stop(finalSample ?? undefined)
+      const robotState = useRobotStore.getState()
+      if (traceRobotId) {
+        robotState.setJointAnglesForRobot(traceRobotId, traceCurrentAngles)
+      } else {
+        robotState.setJointAngles(traceCurrentAngles)
+      }
+
+      setCartesianTraceUi(snapshot)
+      setCartesianTraceNotice(
+        snapshot.status === 'ready'
+          ? robotState.language === 'vi'
+            ? 'Đã tạm dừng. Kéo tiếp hoặc dùng phím để nối quỹ đạo; nhấp phải để lưu; Esc để hủy.'
+            : 'Paused. Drag or use the wrist keys to continue; right-click to save; Esc to cancel.'
+          : robotState.language === 'vi'
+            ? 'Quỹ đạo quá ngắn, chưa có điểm để lưu.'
+            : 'The path is too short to save.'
+      )
+      collisionSchedulerRef.current?.requestImmediateTick()
+      return snapshot
+    }
+
+    const ensureTraceSessionForKeyboard = (now: number): boolean => {
+      if (!isCartesianTraceInputEnabled()) return false
+
+      const robotState = useRobotStore.getState()
+      const robot = robotRef.current
+      if (!robot?.links['wrist3_link']) return false
+
+      const activeRobotId = robotState.selectedRobotId
+      if (traceRobot !== robot || !traceCurrentAngles) {
+        const currentAngles = activeRobotId
+          ? (robotState.jointAnglesByRobotId[activeRobotId] ?? robotState.jointAngles)
+          : robotState.jointAngles
+        traceRobot = robot
+        traceRobotId = activeRobotId
+        traceCurrentAngles = [...currentAngles]
+      }
+
+      const recorder = cartesianTraceRecorderRef.current
+      const snapshot = recorder.getSnapshot()
+      if (snapshot.status === 'idle') {
+        const firstSample = createTraceSample(robot, traceCurrentAngles, 0)
+        if (!firstSample) return false
+        recorder.start(firstSample)
+        traceStartedAtMs = now
+        setCartesianTraceUi(recorder.getSnapshot())
+        setCartesianTraceNotice('')
+      } else if (snapshot.status === 'ready') {
+        if (!recorder.resume()) return false
+        traceStartedAtMs = now - snapshot.durationMs
+        setCartesianTraceUi(recorder.getSnapshot())
+        setCartesianTraceNotice('')
+      }
+
+      return true
+    }
+
+    const updateTraceWristKeyboard = (frameTimestampMs: number): void => {
+      const input = resolveCartesianTraceInput(traceKeysPressedRef.current)
+      const hasWristInput = hasCartesianTraceWristInput(input)
+
+      if (!isCartesianTraceInputEnabled() || !hasWristInput) {
+        traceLastKeyboardUpdateMs = 0
+        if (traceKeyboardWasActive && tracePointerId === null) pauseCartesianTrace()
+        traceKeyboardWasActive = false
+        return
+      }
+
+      traceKeyboardWasActive = true
+      if (!ensureTraceSessionForKeyboard(frameTimestampMs) || !traceRobot || !traceCurrentAngles) {
+        return
+      }
+
+      if (traceLastKeyboardUpdateMs <= 0) {
+        traceLastKeyboardUpdateMs = frameTimestampMs
+        return
+      }
+
+      // A time-based angular velocity is stable across FPS changes and ignores OS key repeat.
+      const deltaSeconds = Math.min(0.05, (frameTimestampMs - traceLastKeyboardUpdateMs) / 1000)
+      traceLastKeyboardUpdateMs = frameTimestampMs
+      if (deltaSeconds <= 0) return
+
+      const nextAngles = [...traceCurrentAngles] as JointAngles
+      const directions = [input.j4Direction, input.j5Direction, input.j6Direction]
+      let changed = false
+      for (let wristIndex = 0; wristIndex < directions.length; wristIndex += 1) {
+        const direction = directions[wristIndex]
+        if (direction === 0) continue
+
+        const jointIndex = wristIndex + 3
+        const limit = TRACE_WRIST_JOINT_LIMITS_DEGREES[wristIndex]
+        const nextValue = THREE.MathUtils.clamp(
+          nextAngles[jointIndex] + direction * input.wristDegreesPerSecond * deltaSeconds,
+          limit.min,
+          limit.max
+        )
+        const roundedValue = Math.round(nextValue * 10) / 10
+        if (roundedValue !== nextAngles[jointIndex]) {
+          nextAngles[jointIndex] = roundedValue
+          changed = true
+        }
+      }
+      if (!changed) return
+
+      traceCurrentAngles = nextAngles
+      applyRobotJointValues(traceCurrentAngles, traceRobot)
+
+      const wristLink = traceRobot.links['wrist3_link']
+      wristLink?.getWorldQuaternion(traceWristQuaternion)
+      const dummyTarget = dummyTargetRef.current
+      if (dummyTarget && wristLink) {
+        wristLink.getWorldPosition(dummyTarget.position)
+        wristLink.getWorldQuaternion(dummyTarget.quaternion)
+        dummyTarget.updateMatrixWorld(true)
+      }
+
+      const sample = createTraceSample(
+        traceRobot,
+        traceCurrentAngles,
+        frameTimestampMs - traceStartedAtMs
+      )
+      if (
+        sample &&
+        cartesianTraceRecorderRef.current.append(sample) &&
+        frameTimestampMs - traceLastUiUpdateMs >= 200
+      ) {
+        traceLastUiUpdateMs = frameTimestampMs
+        setCartesianTraceUi(cartesianTraceRecorderRef.current.getSnapshot())
+      }
+    }
+
+    const cancelCartesianTrace = (restoreStartPose: boolean): void => {
+      const startSample = cartesianTraceRecorderRef.current.cancel()
+
+      if (restoreStartPose && startSample && traceRobot) {
+        applyRobotJointValues(startSample.jointAngles, traceRobot)
+        const robotState = useRobotStore.getState()
+        if (traceRobotId) {
+          robotState.setJointAnglesForRobot(traceRobotId, startSample.jointAngles)
+        } else {
+          robotState.setJointAngles(startSample.jointAngles)
+        }
+      }
+
+      clearTracePointerCapture()
+      traceRobot = null
+      traceRobotId = null
+      traceCurrentAngles = null
+      traceKeyboardWasActive = false
+      traceLastKeyboardUpdateMs = 0
+      traceKeysPressedRef.current.clear()
+      setCartesianTraceSpeedMode('normal')
+      setCartesianTraceUi(cartesianTraceRecorderRef.current.getSnapshot())
+      setCartesianTraceNotice('')
+      collisionSchedulerRef.current?.requestImmediateTick()
+    }
+    cancelCartesianTraceRef.current = cancelCartesianTrace
+
+    const onTracePointerDown = (event: PointerEvent): void => {
+      const robotState = useRobotStore.getState()
+      const activeRobotId = robotState.selectedRobotId
+      const playing = activeRobotId
+        ? (robotState.robotExecutionById[activeRobotId]?.isPlaying ?? false)
+        : robotState.isPlaying
+
+      if (
+        event.button !== 0 ||
+        robotState.workspaceMode !== 'train' ||
+        !robotState.isIKMode ||
+        robotState.cartesianInteractionMode !== 'trace' ||
+        playing
+      ) {
+        return
+      }
+
+      const robot = robotRef.current
+      const wristLink = robot?.links['wrist3_link']
+      if (!robot || !wristLink) return
+
+      updatePointerCoordinates(event)
+      raycaster.setFromCamera(mouse, camera)
+      const wristWasHit = raycaster.intersectObject(wristLink, true).length > 0
+      const traceHandleWasHit = dummyTargetRef.current
+        ? raycaster
+            .intersectObject(dummyTargetRef.current, true)
+            .some((intersection) => intersection.object instanceof THREE.Mesh)
+        : false
+      if (!wristWasHit && !traceHandleWasHit) return
+
+      event.preventDefault()
+      event.stopImmediatePropagation()
+
+      wristLink.getWorldPosition(traceWristStart)
+      wristLink.getWorldQuaternion(traceWristQuaternion)
+      camera.getWorldDirection(tracePlaneNormal).normalize()
+      traceDragPlane.setFromNormalAndCoplanarPoint(tracePlaneNormal, traceWristStart)
+      if (!raycaster.ray.intersectPlane(traceDragPlane, tracePointerStart)) return
+      traceTargetWorldPosition.copy(traceWristStart)
+
+      const currentAngles =
+        traceRobot === robot && traceCurrentAngles
+          ? traceCurrentAngles
+          : activeRobotId
+            ? (robotState.jointAnglesByRobotId[activeRobotId] ?? robotState.jointAngles)
+            : robotState.jointAngles
+      const firstSample = createTraceSample(robot, currentAngles, 0)
+      if (!firstSample) return
+
+      const recorder = cartesianTraceRecorderRef.current
+      const previousSnapshot = recorder.getSnapshot()
+      const now = performance.now()
+
+      tracePointerId = event.pointerId
+      traceRobot = robot
+      traceRobotId = activeRobotId
+      traceCurrentAngles = [...currentAngles]
+      // Paused time is deliberately excluded so playback timing represents only the
+      // user's actual drawing motion. A resumed segment continues the existing draft.
+      if (previousSnapshot.status !== 'recording') {
+        traceStartedAtMs =
+          now - (previousSnapshot.status === 'ready' ? previousSnapshot.durationMs : 0)
+      }
+      traceLastMotionUpdateMs = now
+      traceLastUiUpdateMs = now
+      if (previousSnapshot.status === 'idle') {
+        recorder.start(firstSample)
+      } else if (previousSnapshot.status === 'ready' && !recorder.resume()) {
+        recorder.start(firstSample)
+        traceStartedAtMs = now
+      }
+      setCartesianTraceUi(recorder.getSnapshot())
+      setCartesianTraceNotice('')
+      controls.enabled = false
+      isTransformDraggingRef.current = true
+      renderer.domElement.setPointerCapture(event.pointerId)
+    }
+
+    const onTracePointerMove = (event: PointerEvent): void => {
+      if (event.pointerId !== tracePointerId || !traceRobot || !traceCurrentAngles) {
+        return
+      }
+
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      const now = performance.now()
+      // Numerical IK is the expensive part of freehand control. Thirty solutions per second are
+      // sufficient for pointer input and halve the main-thread work compared with raw 60 Hz events.
+      if (now - traceLastMotionUpdateMs < 33) return
+      traceLastMotionUpdateMs = now
+      updatePointerCoordinates(event)
+      raycaster.setFromCamera(mouse, camera)
+      if (!raycaster.ray.intersectPlane(traceDragPlane, traceIntersection)) return
+
+      const wristLink = traceRobot.links['wrist3_link']
+      const baseLink = traceRobot.links['base_link']
+      if (!wristLink || !baseLink) return
+
+      tracePointerDelta.subVectors(traceIntersection, tracePointerStart)
+      tracePointerStart.copy(traceIntersection)
+      const traceInput = resolveCartesianTraceInput(traceKeysPressedRef.current)
+      traceTargetWorldPosition.addScaledVector(tracePointerDelta, traceInput.pointerGain)
+      traceTargetWorldMatrix.compose(traceTargetWorldPosition, traceWristQuaternion, traceUnitScale)
+      traceBaseMatrixInverse.copy(baseLink.matrixWorld).invert()
+      traceRelativeMatrix.multiplyMatrices(traceBaseMatrixInverse, traceTargetWorldMatrix)
+      traceRelativeMatrix.decompose(traceTargetPosition, traceTargetQuaternion, traceTargetScale)
+
+      wristLink.getWorldPosition(traceWristLocalPosition)
+      traceWristLocalPosition.applyMatrix4(traceBaseMatrixInverse)
+      const targetDelta = traceTargetPosition.distanceTo(traceWristLocalPosition)
+      if (targetDelta > 0.08) {
+        traceTargetPosition
+          .sub(traceWristLocalPosition)
+          .normalize()
+          .multiplyScalar(0.08)
+          .add(traceWristLocalPosition)
+      }
+
+      const solvedAngles = solveIK(
+        traceTargetPosition,
+        traceTargetQuaternion,
+        traceCurrentAngles,
+        traceRobot,
+        {
+          maxIterations: 8,
+          tolerancePositionMeters: 0.0015,
+          toleranceRotationRadians: 0.006,
+          maxStepDegrees: 10
+        }
+      )
+      if (!solvedAngles) {
+        const currentLanguage = useRobotStore.getState().language
+        setCartesianTraceNotice(
+          currentLanguage === 'vi'
+            ? 'Không tìm được nghiệm IK tại vị trí này.'
+            : 'No IK solution at this position.'
+        )
+        return
+      }
+
+      traceCurrentAngles = toJointAngles(solvedAngles)
+      applyRobotJointValues(traceCurrentAngles, traceRobot)
+
+      const dummyTarget = dummyTargetRef.current
+      if (dummyTarget) {
+        wristLink.getWorldPosition(dummyTarget.position)
+        wristLink.getWorldQuaternion(dummyTarget.quaternion)
+        dummyTarget.updateMatrixWorld(true)
+      }
+
+      const sample = createTraceSample(traceRobot, traceCurrentAngles, now - traceStartedAtMs)
+      if (
+        sample &&
+        cartesianTraceRecorderRef.current.append(sample) &&
+        now - traceLastUiUpdateMs >= 200
+      ) {
+        traceLastUiUpdateMs = now
+        setCartesianTraceUi(cartesianTraceRecorderRef.current.getSnapshot())
+      }
+    }
+
+    const finishCartesianTrace = (event: PointerEvent): void => {
+      if (event.pointerId !== tracePointerId || !traceRobot || !traceCurrentAngles) {
+        return
+      }
+
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      traceLastMotionUpdateMs = 0
+      onTracePointerMove(event)
+      clearTracePointerCapture()
+      if (!hasCartesianTraceWristInput(resolveCartesianTraceInput(traceKeysPressedRef.current))) {
+        pauseCartesianTrace()
+      }
+    }
+
+    const onTracePointerCancel = (event: PointerEvent): void => {
+      if (event.pointerId === tracePointerId) cancelCartesianTrace(true)
+    }
+
+    const onTraceContextMenu = (event: MouseEvent): void => {
+      const robotState = useRobotStore.getState()
+      if (
+        robotState.workspaceMode !== 'train' ||
+        !robotState.isIKMode ||
+        robotState.cartesianInteractionMode !== 'trace'
+      ) {
+        return
+      }
+
+      event.preventDefault()
+      const recorder = cartesianTraceRecorderRef.current
+      let snapshot = recorder.getSnapshot()
+      // keyup and contextmenu may happen before the next animation frame. Finalize the
+      // keyboard segment synchronously so a right-click immediately after releasing a key
+      // never gets ignored just because the recorder still reports `recording`.
+      if (
+        snapshot.status === 'recording' &&
+        tracePointerId === null &&
+        !hasCartesianTraceWristInput(resolveCartesianTraceInput(traceKeysPressedRef.current))
+      ) {
+        snapshot = pauseCartesianTrace()
+      }
+      if (snapshot.status !== 'ready') return
+
+      const newSteps = recorder.buildSteps(robotState.steps)
+      if (newSteps.length === 0) return
+      robotState.addSteps(newSteps)
+      recorder.cancel()
+      traceRobot = null
+      traceRobotId = null
+      traceCurrentAngles = null
+      traceKeyboardWasActive = false
+      traceLastKeyboardUpdateMs = 0
+      setCartesianTraceUi(recorder.getSnapshot())
+      setCartesianTraceNotice(
+        robotState.language === 'vi'
+          ? `Đã lưu ${newSteps.length} bước chuyển động vào workflow.`
+          : `Saved ${newSteps.length} motion steps to the workflow.`
+      )
+    }
 
     const onPointerDown = (event: PointerEvent): void => {
       if (
@@ -2040,6 +2572,11 @@ export default function Viewport3D(): React.JSX.Element {
       useSceneStore.getState().setSelectedObjectId(null)
     }
 
+    renderer.domElement.addEventListener('pointerdown', onTracePointerDown, true)
+    renderer.domElement.addEventListener('pointermove', onTracePointerMove, true)
+    renderer.domElement.addEventListener('pointerup', finishCartesianTrace, true)
+    renderer.domElement.addEventListener('pointercancel', onTracePointerCancel, true)
+    renderer.domElement.addEventListener('contextmenu', onTraceContextMenu, true)
     renderer.domElement.addEventListener('pointerdown', onPointerDown)
 
     let lastMeasurementGeometrySignature: string | null = null
@@ -2130,7 +2667,7 @@ export default function Viewport3D(): React.JSX.Element {
 
       if (lastMeasurementGeometrySignature === geometrySignature) {
         projectMeasurementLabel(measureLine, labelEl)
-        projectMeasurementLabel(selfMeasureLine, selfLabelEl)
+        if (selfLabelEl) selfLabelEl.style.display = selfMeasureLine.visible ? 'flex' : 'none'
         return
       }
       lastMeasurementGeometrySignature = geometrySignature
@@ -2391,15 +2928,7 @@ export default function Viewport3D(): React.JSX.Element {
 
           const selfDistanceMm = Math.round(minSelfDistance * 1000)
 
-          if (selfLabelEl && selfTextEl && containerRef.current) {
-            const midPoint = new THREE.Vector3()
-              .addVectors(bestSelfPoints.pointA, bestSelfPoints.pointB)
-              .multiplyScalar(0.5)
-            midPoint.project(camera)
-            const w = containerRef.current.clientWidth
-            const h = containerRef.current.clientHeight
-            selfLabelEl.style.left = `${(midPoint.x * 0.5 + 0.5) * w}px`
-            selfLabelEl.style.top = `${(-midPoint.y * 0.5 + 0.5) * h}px`
+          if (selfLabelEl && selfTextEl) {
             selfLabelEl.style.display = 'flex'
 
             const linkViNames: Record<string, string> = {
@@ -2615,6 +3144,9 @@ export default function Viewport3D(): React.JSX.Element {
     let animationFrameId: number
     // Real-time camera navigation via WASD keys on horizontal plane
     const updateWASDNavigation = (): void => {
+      // Trace mode owns WASD for J4/J5. Camera navigation remains unchanged elsewhere.
+      if (isCartesianTraceInputEnabled()) return
+
       const keys = keysPressedRef.current
       if (keys.size === 0) return
 
@@ -2651,6 +3183,7 @@ export default function Viewport3D(): React.JSX.Element {
         boxHelperRef.current.update()
       }
 
+      updateTraceWristKeyboard(frameTimestampMs)
       updateWASDNavigation()
 
       if (safetyHelpersRef.current) {
@@ -2668,13 +3201,6 @@ export default function Viewport3D(): React.JSX.Element {
               if (!Array.isArray(helpers.warningCircle.material)) {
                 helpers.warningCircle.material.opacity = 0.35 + pulse * 0.35
               }
-            }
-            if (helpers.warningSprite) {
-              helpers.warningSprite.position.copy(robot.position)
-              helpers.warningSprite.position.y += 1.1
-
-              const floatOffset = Math.sin(time * 2.5) * 0.04
-              helpers.warningSprite.position.y += floatOffset
             }
           }
         }
@@ -2720,6 +3246,8 @@ export default function Viewport3D(): React.JSX.Element {
     const loadedObjects = loadedObjectsRef.current
     const loadingObjectIds = loadingObjectIdsRef.current
     const safetyHelpers = safetyHelpersRef.current
+    const pressedKeys = keysPressedRef.current
+    const pressedTraceKeys = traceKeysPressedRef.current
     // Clean up
     return () => {
       const ownsCurrentScene =
@@ -2784,9 +3312,23 @@ export default function Viewport3D(): React.JSX.Element {
         sceneRef.current = null
       }
 
-      window.removeEventListener('keydown', handleKeyDown)
-      window.removeEventListener('keyup', handleKeyUp)
+      window.removeEventListener('keydown', handleKeyDown, true)
+      window.removeEventListener('keyup', handleKeyUp, true)
+      window.removeEventListener('blur', handleWindowBlur)
+      pressedKeys.clear()
+      pressedTraceKeys.clear()
+      cartesianTraceRecorder.cancel()
+      clearTracePointerCapture()
+      cancelCartesianTraceRef.current = () => undefined
+      renderer.domElement.removeEventListener('pointerdown', onTracePointerDown, true)
+      renderer.domElement.removeEventListener('pointermove', onTracePointerMove, true)
+      renderer.domElement.removeEventListener('pointerup', finishCartesianTrace, true)
+      renderer.domElement.removeEventListener('pointercancel', onTracePointerCancel, true)
+      renderer.domElement.removeEventListener('contextmenu', onTraceContextMenu, true)
       renderer.domElement.removeEventListener('pointerdown', onPointerDown)
+      if (cameraRef.current === camera) cameraRef.current = null
+      if (controlsRef.current === controls) controlsRef.current = null
+      if (traceHandleRef.current === traceHandle) traceHandleRef.current = null
       renderer.dispose()
       transformControls.dispose()
       robotMaterialSnapshots.clear()
@@ -3058,6 +3600,7 @@ export default function Viewport3D(): React.JSX.Element {
   useEffect(() => {
     const transformControls = transformControlsRef.current
     const dummyTarget = dummyTargetRef.current
+    const traceHandle = traceHandleRef.current
     const robot = robotRef.current
 
     if (!transformControls || !dummyTarget) return
@@ -3066,6 +3609,7 @@ export default function Viewport3D(): React.JSX.Element {
       transformControls.detach()
       transformControls.getHelper().visible = false
       dummyTarget.visible = false
+      if (traceHandle) traceHandle.visible = false
       highlightJointLink(null)
       return
     }
@@ -3074,6 +3618,7 @@ export default function Viewport3D(): React.JSX.Element {
 
     if (isRobotPlacementMode && placementRobot) {
       dummyTarget.visible = false
+      if (traceHandle) traceHandle.visible = false
       highlightJointLink(null)
 
       const isTranslateMode = robotPlacementTransformMode === 'translate'
@@ -3092,7 +3637,21 @@ export default function Viewport3D(): React.JSX.Element {
       return
     }
 
-    if (isIKMode) {
+    if (isIKMode && cartesianInteractionMode === 'trace') {
+      highlightJointLink(null)
+      transformControls.detach()
+      transformControls.getHelper().visible = false
+
+      const wristLink = robot.links['wrist3_link']
+      if (wristLink && cartesianTraceUi.status !== 'recording') {
+        wristLink.getWorldPosition(dummyTarget.position)
+        wristLink.getWorldQuaternion(dummyTarget.quaternion)
+        dummyTarget.updateMatrixWorld(true)
+      }
+      dummyTarget.visible = true
+      if (traceHandle) traceHandle.visible = true
+    } else if (isIKMode) {
+      if (traceHandle) traceHandle.visible = false
       highlightJointLink(null)
 
       // Only copy the wristLink position to the dummyTarget if we are not actively dragging it
@@ -3124,6 +3683,7 @@ export default function Viewport3D(): React.JSX.Element {
       dummyTarget.visible = true
     } else if (selectedJointName) {
       dummyTarget.visible = false
+      if (traceHandle) traceHandle.visible = false
       highlightJointLink(selectedJointName)
 
       const jointObj = robot.joints[selectedJointName]
@@ -3145,6 +3705,7 @@ export default function Viewport3D(): React.JSX.Element {
       }
     } else if (selectedObjectId) {
       dummyTarget.visible = false
+      if (traceHandle) traceHandle.visible = false
       highlightJointLink(null)
 
       const threeObj = loadedObjectsRef.current.get(selectedObjectId)
@@ -3164,6 +3725,7 @@ export default function Viewport3D(): React.JSX.Element {
         transformControls.getHelper().visible = false
       }
     } else {
+      if (traceHandle) traceHandle.visible = false
       highlightJointLink(null)
       transformControls.detach()
       transformControls.getHelper().visible = false
@@ -3172,6 +3734,8 @@ export default function Viewport3D(): React.JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     isIKMode,
+    cartesianInteractionMode,
+    cartesianTraceUi.status,
     isRobotPlacementMode,
     robotPlacementTransformMode,
     isRobotLoaded,
@@ -3181,18 +3745,130 @@ export default function Viewport3D(): React.JSX.Element {
     selectedRobotId
   ])
 
-  // Update robot joints when jointAngles state changes
   useEffect(() => {
-    if (robotRef.current) {
-      updateRobotJoints(jointAngles, robotRef.current)
-      collisionSchedulerRef.current?.requestImmediateTick()
+    const contextKey = `${workspaceMode}:${selectedRobotId ?? 'preview'}:${isIKMode}:${cartesianInteractionMode}:${isPlaying}`
+    const traceIsAllowed =
+      workspaceMode === 'train' && isIKMode && cartesianInteractionMode === 'trace' && !isPlaying
+
+    if (
+      !traceIsAllowed ||
+      (cartesianTraceContextRef.current !== '' &&
+        cartesianTraceContextRef.current !== contextKey &&
+        cartesianTraceRecorderRef.current.getSnapshot().status !== 'idle')
+    ) {
+      cancelCartesianTraceRef.current(true)
     }
+    cartesianTraceContextRef.current = contextKey
+  }, [cartesianInteractionMode, isIKMode, isPlaying, selectedRobotId, workspaceMode])
+
+  useEffect(() => {
+    const camera = cameraRef.current
+    const controls = controlsRef.current
+    if (!camera || !controls) return
+
+    const previousMode = previousWorkspaceModeRef.current
+
+    if (workspaceMode === 'train') {
+      if (previousMode !== 'train' && !factoryCameraStateRef.current) {
+        factoryCameraStateRef.current = {
+          position: camera.position.clone(),
+          target: controls.target.clone(),
+          near: camera.near,
+          far: camera.far
+        }
+      }
+
+      const activeRobot = selectedRobotId
+        ? (robotRefs.current.get(selectedRobotId) ?? null)
+        : robots.length === 0
+          ? previewRobotRef.current
+          : null
+      const focusId =
+        selectedRobotId ?? (activeRobot === previewRobotRef.current ? 'preview' : null)
+      if (activeRobot && focusId && lastTrainCameraFocusIdRef.current !== focusId) {
+        activeRobot.updateMatrixWorld(true)
+        const bounds = new THREE.Box3().setFromObject(activeRobot)
+        if (!bounds.isEmpty()) {
+          const center = bounds.getCenter(new THREE.Vector3())
+          const size = bounds.getSize(new THREE.Vector3())
+          const viewDirection = camera.position.clone().sub(controls.target)
+          if (viewDirection.lengthSq() < 0.001) viewDirection.set(1, 0.8, 1)
+          viewDirection.normalize()
+
+          const distance = Math.max(1.2, size.length() * 1.7)
+          controls.target.copy(center)
+          camera.position.copy(center).addScaledVector(viewDirection, distance)
+          camera.near = Math.max(0.01, distance / 100)
+          camera.far = Math.max(100, distance * 20)
+          camera.updateProjectionMatrix()
+          controls.update()
+          lastTrainCameraFocusIdRef.current = focusId
+        }
+      }
+    } else {
+      if (previousMode === 'train' && factoryCameraStateRef.current) {
+        camera.position.copy(factoryCameraStateRef.current.position)
+        controls.target.copy(factoryCameraStateRef.current.target)
+        camera.near = factoryCameraStateRef.current.near
+        camera.far = factoryCameraStateRef.current.far
+        camera.updateProjectionMatrix()
+        controls.update()
+      }
+      factoryCameraStateRef.current = null
+      lastTrainCameraFocusIdRef.current = null
+    }
+
+    previousWorkspaceModeRef.current = workspaceMode
+  }, [isRobotLoaded, robots.length, selectedRobotId, workspaceMode])
+
+  // Apply motion state directly to the affected Three.js robot. Subscribing outside React keeps
+  // a 30/60 fps trajectory from re-rendering the entire viewport and re-walking every robot.
+  useEffect(() => {
+    return useRobotStore.subscribe((state, previousState) => {
+      if (
+        state.jointAngles === previousState.jointAngles &&
+        state.jointAnglesByRobotId === previousState.jointAnglesByRobotId
+      ) {
+        return
+      }
+
+      const changedRobotIds = new Set<string>()
+      if (state.jointAnglesByRobotId !== previousState.jointAnglesByRobotId) {
+        for (const [robotId, angles] of Object.entries(state.jointAnglesByRobotId)) {
+          if (angles !== previousState.jointAnglesByRobotId[robotId]) changedRobotIds.add(robotId)
+        }
+      }
+      if (state.selectedRobotId && state.jointAngles !== previousState.jointAngles) {
+        changedRobotIds.add(state.selectedRobotId)
+      }
+
+      for (const robotId of changedRobotIds) {
+        const robot = robotRefs.current.get(robotId)
+        const angles =
+          state.jointAnglesByRobotId[robotId] ??
+          (robotId === state.selectedRobotId ? state.jointAngles : undefined)
+        if (robot && angles) updateRobotJoints(angles, robot)
+      }
+
+      if (
+        !state.selectedRobotId &&
+        state.jointAngles !== previousState.jointAngles &&
+        previewRobotRef.current
+      ) {
+        updateRobotJoints(state.jointAngles, previewRobotRef.current)
+      }
+      // Collision has its own 15 Hz scheduler. Triggering another exact scan for every animation
+      // frame makes recorded trajectories stutter without improving the collision state machine.
+    })
+    // This subscription intentionally lives for the viewport lifetime and reads all mutable
+    // robot objects through refs; resubscribing on each render would reintroduce playback churn.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jointAngles])
+  }, [])
 
   // Sync selectedRobotId and toggle home pose for non-active robots.
   // If no backend robot is available yet, keep the local preview robot active.
   useEffect(() => {
+    const robotState = useRobotStore.getState()
     const activeRobot = selectedRobotId
       ? robotRefs.current.get(selectedRobotId) || null
       : robots.length === 0
@@ -3211,21 +3887,21 @@ export default function Viewport3D(): React.JSX.Element {
 
       const robotAngles =
         id === selectedRobotId
-          ? jointAngles
-          : (jointAnglesByRobotId[id] ?? [...DEFAULT_JOINT_ANGLES])
+          ? robotState.jointAngles
+          : (robotState.jointAnglesByRobotId[id] ?? [...DEFAULT_JOINT_ANGLES])
 
       updateRobotJoints(robotAngles, robot)
     }
 
     if (!selectedRobotId && robots.length === 0 && previewRobotRef.current) {
       previewRobotRef.current.visible = true
-      updateRobotJoints(jointAngles, previewRobotRef.current)
+      updateRobotJoints(robotState.jointAngles, previewRobotRef.current)
     }
 
     collisionSchedulerRef.current?.requestImmediateTick()
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jointAngles, jointAnglesByRobotId, robots.length, selectedRobotId, workspaceMode])
+  }, [robots.length, selectedRobotId, workspaceMode])
 
   // Local preview robot for logged-out / empty backend state.
   // This robot is visual-only and is removed as soon as backend robots exist.
@@ -3386,7 +4062,10 @@ export default function Viewport3D(): React.JSX.Element {
     robots.forEach((robot) => {
       const existingRobot = robotRefs.current.get(robot.id)
       if (existingRobot) {
-        applyRobotSceneBinding(existingRobot, robot.sceneBinding)
+        applyRobotSceneBinding(
+          existingRobot,
+          workspaceMode === 'train' && robot.id === selectedRobotId ? null : robot.sceneBinding
+        )
         existingRobot.updateMatrixWorld(true)
       } else if (!loadingRobotIdsRef.current.has(robot.id)) {
         const robotLoadGeneration = (robotLoadGenerationByIdRef.current.get(robot.id) ?? 0) + 1
@@ -3431,7 +4110,13 @@ export default function Viewport3D(): React.JSX.Element {
 
             const currentRobotState = useRobotStore.getState()
 
-            applyRobotSceneBinding(loadedRobot, currentRobot.sceneBinding)
+            applyRobotSceneBinding(
+              loadedRobot,
+              currentRobotState.workspaceMode === 'train' &&
+                robot.id === currentRobotState.selectedRobotId
+                ? null
+                : currentRobot.sceneBinding
+            )
 
             loadedRobot.traverse((child) => {
               if (child instanceof THREE.Mesh) {
@@ -3489,16 +4174,10 @@ export default function Viewport3D(): React.JSX.Element {
     })
     collisionSchedulerRef.current?.requestImmediateTick()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [robots, selectedRobotId, jointAnglesByRobotId])
+  }, [robots, selectedRobotId, workspaceMode])
 
-  // Helper function to update joint angles, calculate TCP Pose and snap Gizmo Target
-  function updateRobotJoints(angles: number[], targetRobot?: FairinoRobotObject | null): void {
-    const robot = targetRobot !== undefined ? targetRobot : robotRef.current
-    const dummyTarget = dummyTargetRef.current
-    if (!robot) return
-
+  function applyRobotJointValues(angles: number[], robot: FairinoRobotObject): void {
     const jointNames = ['j1', 'j2', 'j3', 'j4', 'j5', 'j6']
-
     jointNames.forEach((name, index) => {
       const joint = robot.joints[name]
       if (!joint) return
@@ -3506,8 +4185,46 @@ export default function Viewport3D(): React.JSX.Element {
       const angleValue = Number.isNaN(angles[index]) ? 0 : angles[index]
       joint.setJointValue((angleValue * Math.PI) / 180)
     })
-
     robot.updateMatrixWorld(true)
+  }
+
+  function getRobotTcpPose(robot: FairinoRobotObject): TCPPose | null {
+    const baseLink = robot.links['base_link']
+    const wristLink = robot.links['wrist3_link']
+    if (!baseLink || !wristLink) return null
+
+    const baseMatrixInverse = new THREE.Matrix4().copy(baseLink.matrixWorld).invert()
+    const relativeMatrix = new THREE.Matrix4().multiplyMatrices(
+      baseMatrixInverse,
+      wristLink.matrixWorld
+    )
+    const position = new THREE.Vector3()
+    const quaternion = new THREE.Quaternion()
+    relativeMatrix.decompose(position, quaternion, new THREE.Vector3())
+
+    const euler = new THREE.Euler().setFromQuaternion(quaternion, 'XYZ')
+    const toMillimeters = (value: number): number =>
+      Number.isNaN(value) ? 0 : Math.round(value * 10000) / 10
+    const toDegrees = (value: number): number =>
+      Number.isNaN(value) ? 0 : Math.round(((value * 180) / Math.PI) * 10) / 10
+
+    return {
+      x: toMillimeters(position.x),
+      y: toMillimeters(position.y),
+      z: toMillimeters(position.z),
+      rx: toDegrees(euler.x),
+      ry: toDegrees(euler.y),
+      rz: toDegrees(euler.z)
+    }
+  }
+
+  // Helper function to update joint angles, calculate TCP Pose and snap Gizmo Target
+  function updateRobotJoints(angles: number[], targetRobot?: FairinoRobotObject | null): void {
+    const robot = targetRobot !== undefined ? targetRobot : robotRef.current
+    const dummyTarget = dummyTargetRef.current
+    if (!robot) return
+
+    applyRobotJointValues(angles, robot)
 
     let robotId: string | null = null
 
@@ -3518,37 +4235,9 @@ export default function Viewport3D(): React.JSX.Element {
       }
     }
 
-    const baseLink = robot.links['base_link']
     const wristLink = robot.links['wrist3_link']
-    if (!baseLink || !wristLink) return
-
-    const baseMatrixInverse = new THREE.Matrix4().copy(baseLink.matrixWorld).invert()
-
-    const relativeMatrix = new THREE.Matrix4().multiplyMatrices(
-      baseMatrixInverse,
-      wristLink.matrixWorld
-    )
-
-    const position = new THREE.Vector3()
-    const quaternion = new THREE.Quaternion()
-    const scale = new THREE.Vector3()
-
-    relativeMatrix.decompose(position, quaternion, scale)
-
-    const euler = new THREE.Euler().setFromQuaternion(quaternion, 'XYZ')
-    const toMillimeters = (value: number): number =>
-      Number.isNaN(value) ? 0 : Math.round(value * 10000) / 10
-    const toDegrees = (value: number): number =>
-      Number.isNaN(value) ? 0 : Math.round(((value * 180) / Math.PI) * 10) / 10
-
-    const nextTcpPose = {
-      x: toMillimeters(position.x),
-      y: toMillimeters(position.y),
-      z: toMillimeters(position.z),
-      rx: toDegrees(euler.x),
-      ry: toDegrees(euler.y),
-      rz: toDegrees(euler.z)
-    }
+    const nextTcpPose = getRobotTcpPose(robot)
+    if (!wristLink || !nextTcpPose) return
 
     if (robotId) {
       setTCPPoseForRobot(robotId, nextTcpPose)
@@ -3575,6 +4264,22 @@ export default function Viewport3D(): React.JSX.Element {
       dummyTarget.updateMatrixWorld(true)
     }
   }
+
+  const isCartesianTraceInputMode =
+    workspaceMode === 'train' && isIKMode && cartesianInteractionMode === 'trace' && !isPlaying
+  const cartesianTraceSpeedLabel =
+    cartesianTraceSpeedMode === 'fast'
+      ? language === 'vi'
+        ? 'Nhanh · 2×'
+        : 'Fast · 2×'
+      : cartesianTraceSpeedMode === 'precision'
+        ? language === 'vi'
+          ? 'Chính xác · 0.25×'
+          : 'Precision · 0.25×'
+        : language === 'vi'
+          ? 'Bình thường · 1×'
+          : 'Normal · 1×'
+
   return (
     <div ref={containerRef} className="relative h-full w-full min-h-0 min-w-0 overflow-hidden">
       <div
@@ -3623,11 +4328,13 @@ export default function Viewport3D(): React.JSX.Element {
         <span id="measure-text">0 mm</span>
       </div>
 
-      {/* Dynamic self-measurement label */}
+      {/* Fixed self-measurement HUD: keep diagnostic text away from the robot and gizmos. */}
       <div
         id="self-measure-label"
-        className="absolute bg-[#1e1e24]/95 border border-amber-500/50 text-[10px] text-white px-2 py-1 rounded shadow-md pointer-events-none font-mono font-bold z-20 flex items-center gap-1.5"
-        style={{ display: 'none', transform: 'translate(-50%, -50%)' }}
+        role="status"
+        aria-live="polite"
+        className="pointer-events-none absolute right-4 top-24 z-20 flex max-w-[min(360px,calc(100%-32px))] items-center gap-1.5 rounded-md border border-amber-500/50 bg-[#1e1e24]/95 px-2.5 py-1.5 font-mono text-[10px] font-bold text-white shadow-md backdrop-blur-sm"
+        style={{ display: 'none' }}
       >
         <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-ping"></span>
         <span id="self-measure-text">0 mm</span>
@@ -3747,29 +4454,95 @@ export default function Viewport3D(): React.JSX.Element {
         </div>
       )}
 
-      {/* Helper floating shortcuts hint */}
-      <div className="absolute top-4 right-4 z-10 bg-[#141720]/85 border border-[#343849] text-slate-400 p-2.5 rounded-lg shadow-lg backdrop-blur-sm max-w-[190px] pointer-events-none flex items-start gap-1.5 transition">
-        <HelpCircle size={13} className="text-blue-400 shrink-0 mt-0.5" />
-        <div className="text-[9px] space-y-1">
-          <span className="font-bold text-white block">Phím tắt:</span>
-          <div>
-            <span className="font-semibold text-slate-300">W/A/S/D</span> - Di chuyển Camera
-          </div>
-          {selectedObjectId && (
-            <div className="pt-1.5 border-t border-white/5 space-y-0.5 mt-1">
-              <div>
-                <span className="font-semibold text-slate-300">1</span> - Dịch chuyển
+      {/* Context-aware shortcuts. Trace mode owns WASD, so never advertise camera control there. */}
+      {isCartesianTraceInputMode ? (
+        <div className="absolute top-4 right-4 z-20 w-[270px] overflow-hidden rounded-lg border border-cyan-500/30 bg-[#11151d]/95 text-slate-300 shadow-xl backdrop-blur-sm">
+          <button
+            type="button"
+            onClick={() => setIsCartesianTraceHelpExpanded((expanded) => !expanded)}
+            aria-expanded={isCartesianTraceHelpExpanded}
+            className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left transition hover:bg-white/5"
+          >
+            <span className="flex min-w-0 items-center gap-2 text-[10px] font-semibold text-cyan-200">
+              <CircleAlert size={15} className="shrink-0" />
+              <span className="truncate">
+                {language === 'vi' ? 'Hướng dẫn vẽ quỹ đạo' : 'Trace controls'}
+              </span>
+            </span>
+            <span
+              className={`shrink-0 rounded border px-1.5 py-0.5 text-[8px] font-semibold ${
+                cartesianTraceSpeedMode === 'fast'
+                  ? 'border-amber-400/30 bg-amber-500/10 text-amber-200'
+                  : cartesianTraceSpeedMode === 'precision'
+                    ? 'border-violet-400/30 bg-violet-500/10 text-violet-200'
+                    : 'border-cyan-400/20 bg-cyan-500/10 text-cyan-200'
+              }`}
+            >
+              {cartesianTraceSpeedLabel}
+            </span>
+          </button>
+
+          {isCartesianTraceHelpExpanded && (
+            <div className="space-y-1.5 border-t border-white/5 px-3 py-2.5 text-[9px] leading-relaxed text-slate-400">
+              <div className="grid grid-cols-[90px_1fr] gap-x-2 gap-y-1">
+                <span className="font-semibold text-slate-200">
+                  {language === 'vi' ? 'Chuột trái' : 'Left mouse'}
+                </span>
+                <span>{language === 'vi' ? 'Di chuyển TCP' : 'Move TCP'}</span>
+                <span className="font-semibold text-slate-200">W · ↑</span>
+                <span>{language === 'vi' ? 'J4 lên' : 'J4 up'}</span>
+                <span className="font-semibold text-slate-200">S · ↓</span>
+                <span>{language === 'vi' ? 'J4 xuống' : 'J4 down'}</span>
+                <span className="font-semibold text-slate-200">A/D · ←/→</span>
+                <span>{language === 'vi' ? 'Điều khiển J5' : 'Control J5'}</span>
+                <span className="font-semibold text-slate-200">Q/E</span>
+                <span>{language === 'vi' ? 'Điều khiển J6' : 'Control J6'}</span>
               </div>
-              <div>
-                <span className="font-semibold text-slate-300">2</span> - Xoay
-              </div>
-              <div>
-                <span className="font-semibold text-slate-300">3</span> - Co giãn
+              <div className="grid grid-cols-2 gap-1.5 border-t border-white/5 pt-1.5">
+                <span>
+                  <b className="text-slate-200">Shift</b> {language === 'vi' ? 'Nhanh' : 'Fast'}
+                </span>
+                <span>
+                  <b className="text-slate-200">Ctrl</b>{' '}
+                  {language === 'vi' ? 'Chính xác' : 'Precision'}
+                </span>
+                <span>
+                  <b className="text-slate-200">
+                    {language === 'vi' ? 'Chuột phải' : 'Right click'}
+                  </b>{' '}
+                  {language === 'vi' ? 'Lưu' : 'Save'}
+                </span>
+                <span>
+                  <b className="text-slate-200">Esc</b> {language === 'vi' ? 'Hủy' : 'Cancel'}
+                </span>
               </div>
             </div>
           )}
         </div>
-      </div>
+      ) : (
+        <div className="pointer-events-none absolute top-4 right-4 z-10 flex max-w-[190px] items-start gap-1.5 rounded-lg border border-[#343849] bg-[#141720]/85 p-2.5 text-slate-400 shadow-lg backdrop-blur-sm transition">
+          <HelpCircle size={13} className="mt-0.5 shrink-0 text-blue-400" />
+          <div className="space-y-1 text-[9px]">
+            <span className="block font-bold text-white">Phím tắt:</span>
+            <div>
+              <span className="font-semibold text-slate-300">W/A/S/D</span> - Di chuyển Camera
+            </div>
+            {selectedObjectId && (
+              <div className="mt-1 space-y-0.5 border-t border-white/5 pt-1.5">
+                <div>
+                  <span className="font-semibold text-slate-300">1</span> - Dịch chuyển
+                </div>
+                <div>
+                  <span className="font-semibold text-slate-300">2</span> - Xoay
+                </div>
+                <div>
+                  <span className="font-semibold text-slate-300">3</span> - Co giãn
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {isRobotPlacementMode && selectedRobot && (
         <div className="absolute bottom-4 left-4 z-10 max-w-xs rounded-lg border border-emerald-500/20 bg-[#141720]/90 px-3.5 py-2.5 text-slate-200 shadow-lg backdrop-blur-sm pointer-events-none">
@@ -3786,14 +4559,58 @@ export default function Viewport3D(): React.JSX.Element {
 
       {/* IK Mode Instructions */}
       {isIKMode && (
-        <div className="absolute bottom-4 left-4 z-10 bg-[#141720]/90 border border-emerald-500/20 text-slate-200 px-3.5 py-2.5 rounded-lg shadow-lg backdrop-blur-sm max-w-xs pointer-events-none">
+        <div className="absolute bottom-4 left-4 z-10 max-w-sm rounded-lg border border-emerald-500/20 bg-[#141720]/90 px-3.5 py-2.5 text-slate-200 shadow-lg backdrop-blur-sm pointer-events-none">
           <div className="flex items-center gap-1.5 text-emerald-400 font-semibold text-[10px] mb-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping"></span>
-            CHẾ ĐỘ CARTESIAN (IK)
+            <span
+              className={`h-1.5 w-1.5 rounded-full bg-emerald-500 ${
+                cartesianTraceUi.status === 'recording' ? 'animate-ping' : ''
+              }`}
+            ></span>
+            {cartesianInteractionMode === 'trace'
+              ? language === 'vi'
+                ? 'CARTESIAN — VẼ QUỸ ĐẠO'
+                : 'CARTESIAN — TRACE PATH'
+              : 'CARTESIAN (IK)'}
           </div>
-          <p className="text-[10px] text-slate-400 leading-normal">
-            Kéo mũi tên 3D (Gizmo) hoặc quả cầu ở đầu gắp robot để điều khiển cánh tay.
-          </p>
+          {cartesianInteractionMode !== 'trace' && (
+            <p className="text-[10px] leading-normal text-slate-400">
+              {language === 'vi'
+                ? 'Kéo Gizmo hoặc điểm điều khiển tại đầu robot để di chuyển Cartesian.'
+                : 'Drag the Gizmo or TCP control point to move in Cartesian space.'}
+            </p>
+          )}
+          {cartesianInteractionMode === 'trace' && (
+            <div className="mt-1.5 flex items-center justify-between gap-3 border-t border-white/5 pt-1.5 text-[9px]">
+              <span
+                className={
+                  cartesianTraceUi.status === 'ready'
+                    ? 'text-cyan-300'
+                    : cartesianTraceUi.status === 'recording'
+                      ? 'text-emerald-300'
+                      : 'text-slate-500'
+                }
+              >
+                {cartesianTraceUi.status === 'recording'
+                  ? language === 'vi'
+                    ? 'Đang ghi'
+                    : 'Recording'
+                  : cartesianTraceUi.status === 'ready'
+                    ? language === 'vi'
+                      ? 'Tạm dừng · có thể vẽ tiếp'
+                      : 'Paused · ready to continue'
+                    : language === 'vi'
+                      ? 'Chờ thao tác'
+                      : 'Waiting'}
+              </span>
+              <span className="font-mono text-slate-400">
+                {cartesianTraceUi.rawSampleCount} pts ·{' '}
+                {(cartesianTraceUi.durationMs / 1000).toFixed(1)}s
+              </span>
+            </div>
+          )}
+          {cartesianInteractionMode === 'trace' && cartesianTraceNotice && (
+            <p className="mt-1 text-[9px] text-amber-300">{cartesianTraceNotice}</p>
+          )}
         </div>
       )}
     </div>

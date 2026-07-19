@@ -41,6 +41,11 @@ import {
   cancelActiveCommand,
   cancelAllActiveCommands
 } from '../../services/commandExecutionRuntime'
+import { buildCommandFailurePresentation } from '../../services/commandFailurePresentation'
+import {
+  recoverAllRobotCommandFaults,
+  recoverRobotCommandFault
+} from '../../services/robotFaultRuntime'
 import ScenePanel from '../scene/ScenePanel'
 import BackendSimulatorPanel from '../BackendSimulatorPanel'
 import AddRobotWizard from './AddRobotWizard'
@@ -65,6 +70,11 @@ interface InfoTooltipProps {
 
 interface SceneBindingSaveFeedback {
   status: 'saving' | 'success' | 'error'
+  message: string
+}
+
+interface CommandRecoveryFeedback {
+  status: 'working' | 'success' | 'error'
   message: string
 }
 
@@ -250,6 +260,11 @@ export default function RobotSidebar({
   const [sceneBindingSaveFeedback, setSceneBindingSaveFeedback] = useState<
     Record<string, SceneBindingSaveFeedback>
   >({})
+  const [commandRecoveryFeedback, setCommandRecoveryFeedback] = useState<
+    Record<string, CommandRecoveryFeedback>
+  >({})
+  const [bulkCommandRecoveryFeedback, setBulkCommandRecoveryFeedback] =
+    useState<CommandRecoveryFeedback | null>(null)
   const homeRunIdRef = useRef(0)
   const robotListAutoLoadKeyRef = useRef('')
   const robotListAbortControllerRef = useRef<AbortController | null>(null)
@@ -274,6 +289,8 @@ export default function RobotSidebar({
     (state) => state.setRobotPlacementTransformMode
   )
   const setIKMode = useRobotStore((state) => state.setIKMode)
+  const cartesianInteractionMode = useRobotStore((state) => state.cartesianInteractionMode)
+  const setCartesianInteractionMode = useRobotStore((state) => state.setCartesianInteractionMode)
   const selectedJointName = useRobotStore((state) => state.selectedJointName)
   const setSelectedJointName = useRobotStore((state) => state.setSelectedJointName)
 
@@ -286,6 +303,9 @@ export default function RobotSidebar({
   const setDebugHitbox = useSceneStore((state) => state.setDebugHitbox)
   const robotFaultsById = useSceneStore((state) => state.robotFaultsById)
   const robotContactsById = useSceneStore((state) => state.robotContactsById)
+  const recoverableCommandFaultRobotIds = Object.values(robotFaultsById)
+    .filter((fault) => fault.active && (fault.kind === 'command' || fault.kind === 'timeout'))
+    .map((fault) => fault.robotId)
 
   const language = useRobotStore((state) => state.language)
   const t = (key: keyof typeof translations.vi): string => translations[language][key]
@@ -824,6 +844,89 @@ export default function RobotSidebar({
 
     setRobotListError('')
   }
+
+  const handleRecoverRobotCommand = async (robotId: string): Promise<void> => {
+    setCommandRecoveryFeedback((current) => ({
+      ...current,
+      [robotId]: { status: 'working', message: 'Đang kiểm tra và giải phóng command cũ...' }
+    }))
+
+    try {
+      const result = await recoverRobotCommandFault(robotId)
+
+      setCommandRecoveryFeedback((current) => ({
+        ...current,
+        [robotId]: {
+          status: result.recovered ? 'success' : 'error',
+          message: result.message
+        }
+      }))
+    } catch (error) {
+      setCommandRecoveryFeedback((current) => ({
+        ...current,
+        [robotId]: {
+          status: 'error',
+          message: error instanceof Error ? error.message : 'Không thể khôi phục command.'
+        }
+      }))
+    }
+  }
+
+  const handleRecoverAllRobotCommands = async (): Promise<void> => {
+    if (recoverableCommandFaultRobotIds.length === 0) return
+
+    const confirmed = window.confirm(
+      language === 'vi'
+        ? `Khôi phục lỗi command/timeout cho ${recoverableCommandFaultRobotIds.length} robot? Collision và E-Stop sẽ không bị xóa.`
+        : `Recover command/timeout faults for ${recoverableCommandFaultRobotIds.length} robots? Collision and E-Stop will not be cleared.`
+    )
+    if (!confirmed) return
+
+    setBulkCommandRecoveryFeedback({
+      status: 'working',
+      message: 'Đang kiểm tra và khôi phục các command bị kẹt...'
+    })
+    setCommandRecoveryFeedback((current) => {
+      const next = { ...current }
+      for (const robotId of recoverableCommandFaultRobotIds) {
+        next[robotId] = { status: 'working', message: 'Đang khôi phục cùng Factory...' }
+      }
+      return next
+    })
+
+    try {
+      const result = await recoverAllRobotCommandFaults()
+      const failedRobotIds = Object.keys(result.failedByRobotId)
+
+      setCommandRecoveryFeedback((current) => {
+        const next = { ...current }
+        for (const robotId of result.recoveredRobotIds) {
+          next[robotId] = {
+            status: 'success',
+            message: 'Đã xóa trạng thái lỗi. Robot có thể nhận chương trình mới.'
+          }
+        }
+        for (const robotId of failedRobotIds) {
+          next[robotId] = { status: 'error', message: result.failedByRobotId[robotId] }
+        }
+        return next
+      })
+
+      setBulkCommandRecoveryFeedback({
+        status: failedRobotIds.length === 0 ? 'success' : 'error',
+        message:
+          failedRobotIds.length === 0
+            ? `Đã khôi phục ${result.recoveredRobotIds.length} robot. Có thể chạy chương trình mới.`
+            : `Đã khôi phục ${result.recoveredRobotIds.length} robot; ${failedRobotIds.length} robot chưa đủ điều kiện an toàn.`
+      })
+    } catch (error) {
+      setBulkCommandRecoveryFeedback({
+        status: 'error',
+        message:
+          error instanceof Error ? error.message : 'Không thể khôi phục command toàn Factory.'
+      })
+    }
+  }
   const handleSelectBackendRobot = (
     robot: BackendRobot,
     options?: {
@@ -1241,6 +1344,44 @@ export default function RobotSidebar({
                 <InfoTooltip text={t('tooltipIK')} />
               </button>
             </div>
+            {isIKMode && (
+              <div className="mt-2 rounded-lg border border-cyan-500/20 bg-cyan-950/10 p-2">
+                <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-cyan-300">
+                  {language === 'vi' ? 'Cách điều khiển Cartesian' : 'Cartesian interaction'}
+                </div>
+                <div className="grid grid-cols-2 gap-1 rounded-md bg-[#101014] p-1">
+                  <button
+                    type="button"
+                    onClick={() => setCartesianInteractionMode('point')}
+                    className={`rounded px-2 py-1.5 text-[10px] font-semibold transition ${
+                      cartesianInteractionMode === 'point'
+                        ? 'bg-cyan-600 text-white shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {language === 'vi' ? 'Điểm / Gizmo' : 'Point / Gizmo'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setCartesianInteractionMode('trace')}
+                    className={`rounded px-2 py-1.5 text-[10px] font-semibold transition ${
+                      cartesianInteractionMode === 'trace'
+                        ? 'bg-cyan-600 text-white shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {language === 'vi' ? 'Vẽ quỹ đạo' : 'Trace path'}
+                  </button>
+                </div>
+                {cartesianInteractionMode === 'trace' && (
+                  <p className="mt-1.5 text-[9px] leading-relaxed text-slate-400">
+                    {language === 'vi'
+                      ? 'Mở biểu tượng (!) ở góc trên khung nhìn để xem điều khiển chuột, J4–J6 và tốc độ.'
+                      : 'Open the (!) icon at the top of the viewport for mouse, J4–J6 and speed controls.'}
+                  </p>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="flex shrink-0 items-center justify-between border-b border-[#2d2d34] bg-[#141417]/50 px-4 py-3">
@@ -1576,6 +1717,40 @@ export default function RobotSidebar({
                   <Home size={12} />
                   Return All Home
                 </button>
+
+                <button
+                  type="button"
+                  onClick={() => void handleRecoverAllRobotCommands()}
+                  disabled={
+                    recoverableCommandFaultRobotIds.length === 0 ||
+                    bulkCommandRecoveryFeedback?.status === 'working'
+                  }
+                  className="col-span-2 flex items-center justify-center gap-1.5 rounded-lg border border-red-400/50 bg-red-950/20 px-2 py-2 text-xs font-bold text-red-200 transition hover:bg-red-950/40 disabled:cursor-not-allowed disabled:opacity-40"
+                  title="Chỉ khôi phục lỗi command/timeout; không xóa collision hoặc Global E-Stop"
+                >
+                  <RefreshCw
+                    size={12}
+                    className={
+                      bulkCommandRecoveryFeedback?.status === 'working' ? 'animate-spin' : ''
+                    }
+                  />
+                  {bulkCommandRecoveryFeedback?.status === 'working'
+                    ? 'Đang khôi phục tất cả...'
+                    : `Khôi phục tất cả lỗi lệnh (${recoverableCommandFaultRobotIds.length})`}
+                </button>
+
+                {bulkCommandRecoveryFeedback &&
+                  bulkCommandRecoveryFeedback.status !== 'working' && (
+                    <p
+                      className={`col-span-2 rounded border px-2 py-1.5 text-[9px] leading-relaxed ${
+                        bulkCommandRecoveryFeedback.status === 'success'
+                          ? 'border-emerald-500/30 bg-emerald-950/20 text-emerald-300'
+                          : 'border-red-500/30 bg-red-950/20 text-red-300'
+                      }`}
+                    >
+                      {bulkCommandRecoveryFeedback.message}
+                    </p>
+                  )}
               </div>
 
               <div className="flex justify-end gap-2 mb-4">
@@ -1701,6 +1876,20 @@ export default function RobotSidebar({
                     const isSelected = selectedRobotId === robot.id
                     const robotRuntime = robotRuntimeById[robot.id]
                     const robotExecution = robotExecutionById[robot.id]
+                    const robotFault = robotFaultsById[robot.id]
+                    const commandFault =
+                      robotFault?.active &&
+                      (robotFault.kind === 'command' || robotFault.kind === 'timeout')
+                        ? robotFault
+                        : null
+                    const commandFailure = commandFault
+                      ? buildCommandFailurePresentation(
+                          robotExecution?.lastError ||
+                            robotRuntime?.lastError ||
+                            commandFault.message
+                        )
+                      : null
+                    const recoveryFeedback = commandRecoveryFeedback[robot.id]
                     const robotBadge = getRobotRuntimeBadge(robotRuntime)
                     const isConfiguredForConnection = simulatorConfig.robotId === robot.id
                     const robotSimulatorConfig = getRobotSimulatorConfig(robot)
@@ -1903,7 +2092,66 @@ export default function RobotSidebar({
                           </div>
                         )}
 
+                        {commandFailure && (
+                          <div className="mt-2 rounded border border-red-500/40 bg-red-950/30 px-2.5 py-2 text-[9px] text-red-100">
+                            <div className="flex items-start gap-1.5">
+                              <AlertTriangle className="mt-0.5 shrink-0 text-red-400" size={13} />
+                              <div className="min-w-0 flex-1">
+                                <p className="font-bold text-red-200">{commandFailure.title}</p>
+                                <p className="mt-0.5 leading-relaxed text-red-100/85">
+                                  {commandFailure.detail}
+                                </p>
+                                <p className="mt-1 leading-relaxed text-amber-200/90">
+                                  {commandFailure.suggestion}
+                                </p>
+                              </div>
+                            </div>
+
+                            <details className="mt-1.5 border-t border-red-500/20 pt-1.5">
+                              <summary className="cursor-pointer select-none text-[8px] font-bold text-slate-400 hover:text-slate-200">
+                                Chi tiết kỹ thuật
+                              </summary>
+                              <p className="mt-1 break-all font-mono text-[8px] leading-relaxed text-slate-400">
+                                {commandFailure.technicalDetail}
+                              </p>
+                            </details>
+
+                            <button
+                              type="button"
+                              disabled={recoveryFeedback?.status === 'working'}
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                void handleRecoverRobotCommand(robot.id)
+                              }}
+                              className="mt-2 flex w-full items-center justify-center gap-1 rounded border border-red-400/40 bg-red-500/15 px-2 py-1.5 text-[9px] font-bold text-red-100 transition hover:bg-red-500/25 disabled:cursor-wait disabled:opacity-50"
+                            >
+                              <RefreshCw
+                                size={11}
+                                className={
+                                  recoveryFeedback?.status === 'working' ? 'animate-spin' : ''
+                                }
+                              />
+                              {recoveryFeedback?.status === 'working'
+                                ? 'Đang khôi phục...'
+                                : 'Khôi phục để chạy chương trình mới'}
+                            </button>
+
+                            {recoveryFeedback && recoveryFeedback.status !== 'working' && (
+                              <p
+                                className={`mt-1.5 text-[8px] leading-relaxed ${
+                                  recoveryFeedback.status === 'success'
+                                    ? 'text-emerald-300'
+                                    : 'text-red-300'
+                                }`}
+                              >
+                                {recoveryFeedback.message}
+                              </p>
+                            )}
+                          </div>
+                        )}
+
                         {robotRuntime?.lastError &&
+                          !commandFailure &&
                           !(
                             robotCollisionPresentation &&
                             isTechnicalCollisionError(robotRuntime.lastError)
@@ -1913,6 +2161,7 @@ export default function RobotSidebar({
                             </p>
                           )}
                         {robotExecution?.lastError &&
+                          !commandFailure &&
                           !(
                             robotCollisionPresentation &&
                             isTechnicalCollisionError(robotExecution.lastError)
