@@ -96,7 +96,7 @@ export function setupMenu(mainWindow: BrowserWindow): void {
             dialog.showMessageBox(mainWindow, {
               type: 'info',
               title: 'Về FaiRobot Studio',
-              message: 'FaiRobot Studio v1.0.0',
+              message: 'FaiRobot Studio v1.0.1',
               detail: 'Ứng dụng mô phỏng và lập trình kéo thả trực quan cho robot Fairino FR5.'
             })
           }

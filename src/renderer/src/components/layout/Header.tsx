@@ -415,7 +415,7 @@ export default function Header({ onLogout }: HeaderProps): React.JSX.Element {
         </div>
         <div>
           <h1 className="text-sm font-bold leading-tight text-white">FaiRobot Studio</h1>
-          <span className="text-[10px] text-slate-500">v1.0.0 (Beta)</span>
+          <span className="text-[10px] text-slate-500">v1.0.1 (Beta)</span>
         </div>
       </div>
 

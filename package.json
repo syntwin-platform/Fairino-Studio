@@ -1,10 +1,10 @@
 {
   "name": "fairobot-studio",
-  "version": "1.0.0",
-  "description": "An Electron application with React and TypeScript",
+  "version": "1.0.1",
+  "description": "Industrial robot operation, simulation and monitoring application powered by SynTwin",
   "main": "./out/main/index.js",
-  "author": "example.com",
-  "homepage": "https://electron-vite.org",
+  "author": "SynTwin Platform",
+  "homepage": "https://syn-twin-kappa.vercel.app",
   "scripts": {
     "format": "prettier --write .",
     "lint": "eslint --cache .",
