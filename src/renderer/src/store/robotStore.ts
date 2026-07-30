@@ -174,6 +174,7 @@ interface RobotState {
   setRobotRuntime: (robotId: string, status: Partial<BackendSimulatorStatus>) => void
   clearRobotRuntime: (robotId: string) => void
   clearAllRobotRuntime: () => void
+  clearAccountSession: () => void
   setJointAngles: (angles: JointAngles) => void
   setJointAnglesForRobot: (robotId: string, angles: JointAngles) => void
   setJointAnglesForRobots: (patch: Record<string, JointAngles>) => void
@@ -493,6 +494,35 @@ export const useRobotStore = create<RobotState>((set) => ({
       robotRuntimeById: {}
     }),
 
+  clearAccountSession: () => {
+    persistTrainingViewState({
+      selectedRobotId: null,
+      jointAngles: [...DEFAULT_JOINT_ANGLES]
+    })
+    flushPersistedTrainingViewState()
+
+    set({
+      robots: [],
+      selectedRobotId: null,
+      robotRuntimeById: {},
+      robotExecutionById: {},
+      jointAnglesByRobotId: {},
+      tcpPoseByRobotId: {},
+      jointAngles: [...DEFAULT_JOINT_ANGLES],
+      tcpPose: { ...DEFAULT_TCP_POSE },
+      isIKMode: false,
+      cartesianInteractionMode: 'point',
+      isRobotPlacementMode: false,
+      robotPlacementTransformMode: 'translate',
+      isPlaying: false,
+      currentStepIndex: 0,
+      selectedJointName: null,
+      cabinetDigitalOutputs: {},
+      toolDigitalOutputs: {},
+      gripperState: 'open'
+    })
+  },
+
   setJointAngles: (angles) => {
     persistTrainingViewState({ jointAngles: angles })
     set((state) => ({
@@ -534,7 +564,12 @@ export const useRobotStore = create<RobotState>((set) => ({
         ? normalizedPatch[state.selectedRobotId]
         : undefined
 
-      if (selectedAngles) persistTrainingViewState({ jointAngles: selectedAngles })
+      // Factory playback owns runtime poses and can update at 60 fps. Persisting those poses would
+      // continuously restart the Training-view debounce timer and could overwrite the user's saved
+      // Training pose. Explicit Training edits still use the existing persistence path.
+      if (selectedAngles && state.workspaceMode === 'train') {
+        persistTrainingViewState({ jointAngles: selectedAngles })
+      }
 
       return {
         jointAngles: selectedAngles ?? state.jointAngles,

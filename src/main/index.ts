@@ -1,9 +1,47 @@
-import { app, shell, BrowserWindow, ipcMain, dialog } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog, net } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import fs from 'fs/promises'
 import { setupMenu } from './menu'
+import type { BackendRequestOptions, BackendResponsePayload } from '../preload/api.types'
+
+const ALLOWED_CLOUD_BACKEND_HOSTS = new Set([
+  'syntwin-api-staging-v7emjerksa-as.a.run.app',
+  'syntwin-api-staging-635200920916.asia-southeast1.run.app'
+])
+
+const ALLOWED_BACKEND_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
+
+function validateBackendUrl(rawUrl: string): URL {
+  let url: URL
+
+  try {
+    url = new URL(rawUrl)
+  } catch {
+    throw new Error('Backend URL is invalid.')
+  }
+
+  if (url.username || url.password) {
+    throw new Error('Backend URL must not contain credentials.')
+  }
+
+  const isLocalBackend =
+    url.protocol === 'http:' &&
+    ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) &&
+    url.port === '5200'
+
+  const isCloudBackend =
+    url.protocol === 'https:' &&
+    !url.port &&
+    ALLOWED_CLOUD_BACKEND_HOSTS.has(url.hostname.toLowerCase())
+
+  if (!isLocalBackend && !isCloudBackend) {
+    throw new Error('Backend destination is not allowed.')
+  }
+
+  return url
+}
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -19,7 +57,8 @@ function createWindow(): void {
     ...(process.platform === 'linux' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false
+      sandbox: false,
+      backgroundThrottling: false
     }
   })
 
@@ -87,6 +126,41 @@ app.whenReady().then(() => {
       return { success: false, error: getErrorMessage(error) }
     }
   })
+
+  ipcMain.handle(
+    'backend-request',
+    async (
+      _,
+      rawUrl: string,
+      options: BackendRequestOptions = {}
+    ): Promise<BackendResponsePayload> => {
+      const url = validateBackendUrl(rawUrl)
+      const method = (options.method || 'GET').toUpperCase()
+
+      if (!ALLOWED_BACKEND_METHODS.has(method)) {
+        throw new Error(`Backend method ${method} is not allowed.`)
+      }
+
+      const headers = new Headers(options.headers)
+      headers.delete('host')
+      headers.delete('cookie')
+      headers.delete('content-length')
+
+      const response = await net.fetch(url.toString(), {
+        method,
+        headers,
+        body: method === 'GET' || method === 'OPTIONS' ? undefined : options.body,
+        redirect: 'follow'
+      })
+
+      return {
+        status: response.status,
+        statusText: response.statusText,
+        headers: Object.fromEntries(response.headers.entries()),
+        body: await response.text()
+      }
+    }
+  )
 
   createWindow()
 

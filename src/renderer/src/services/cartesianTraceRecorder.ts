@@ -9,7 +9,9 @@ export const DEFAULT_CARTESIAN_TRACE_CONFIG: CartesianTraceConfig = {
   sampleIntervalMs: 33,
   minPositionDeltaMm: 2,
   minRotationDeltaDeg: 0.5,
+  minJointDeltaDeg: 0.25,
   simplifyToleranceMm: 1.5,
+  simplifyJointToleranceDeg: 0.35,
   maxDurationMs: 5 * 60 * 1000,
   maxRawSamples: 9000,
   maxOutputPoints: 1200,
@@ -34,6 +36,51 @@ function rotationDistance(a: TCPPose, b: TCPPose): number {
     normalizedAngleDelta(a.rx, b.rx),
     normalizedAngleDelta(a.ry, b.ry),
     normalizedAngleDelta(a.rz, b.rz)
+  )
+}
+
+function jointDistance(
+  a: CartesianTraceSample['jointAngles'],
+  b: CartesianTraceSample['jointAngles']
+): number {
+  return Math.max(...a.map((angle, index) => Math.abs(angle - b[index])))
+}
+
+function jointInterpolationError(
+  sample: CartesianTraceSample,
+  start: CartesianTraceSample,
+  end: CartesianTraceSample
+): number {
+  const durationMs = end.elapsedMs - start.elapsedMs
+  const progress =
+    durationMs > Number.EPSILON
+      ? Math.max(0, Math.min(1, (sample.elapsedMs - start.elapsedMs) / durationMs))
+      : 0
+
+  return Math.max(
+    ...sample.jointAngles.map((angle, index) => {
+      const interpolated =
+        start.jointAngles[index] + (end.jointAngles[index] - start.jointAngles[index]) * progress
+      return Math.abs(angle - interpolated)
+    })
+  )
+}
+
+function timedPositionInterpolationError(
+  sample: CartesianTraceSample,
+  start: CartesianTraceSample,
+  end: CartesianTraceSample
+): number {
+  const durationMs = end.elapsedMs - start.elapsedMs
+  const progress =
+    durationMs > Number.EPSILON
+      ? Math.max(0, Math.min(1, (sample.elapsedMs - start.elapsedMs) / durationMs))
+      : 0
+
+  return Math.hypot(
+    sample.tcpPose.x - (start.tcpPose.x + (end.tcpPose.x - start.tcpPose.x) * progress),
+    sample.tcpPose.y - (start.tcpPose.y + (end.tcpPose.y - start.tcpPose.y) * progress),
+    sample.tcpPose.z - (start.tcpPose.z + (end.tcpPose.z - start.tcpPose.z) * progress)
   )
 }
 
@@ -63,30 +110,53 @@ function simplifyRange(
   samples: CartesianTraceSample[],
   startIndex: number,
   endIndex: number,
-  toleranceMm: number,
+  config: CartesianTraceConfig,
   retainedIndices: Set<number>
 ): void {
   if (endIndex <= startIndex + 1) return
 
   let furthestIndex = -1
-  let furthestDistance = toleranceMm
+  let furthestScore = 1
 
   for (let index = startIndex + 1; index < endIndex; index += 1) {
-    const distance = pointToSegmentDistance(
+    const positionErrorMm = pointToSegmentDistance(
       samples[index].tcpPose,
       samples[startIndex].tcpPose,
       samples[endIndex].tcpPose
     )
-    if (distance > furthestDistance) {
-      furthestDistance = distance
+    // Recorded traces are replayed by interpolating joint angles on their original timeline.
+    // A Cartesian-only RDP pass can therefore remove a joint-space bend and create a robot pose
+    // that the operator never made. Retain whichever sample has the largest normalized error in
+    // either representation so playback follows both the drawn TCP path and the recorded posture.
+    const jointErrorDeg = jointInterpolationError(
+      samples[index],
+      samples[startIndex],
+      samples[endIndex]
+    )
+    // Spatial RDP alone removes points which lie on the same line even when the operator
+    // accelerated, slowed down or used Shift/Ctrl. Playback then has the right shape but the
+    // wrong speed. Compare against the position expected at the recorded timestamp as well.
+    const timedPositionErrorMm = timedPositionInterpolationError(
+      samples[index],
+      samples[startIndex],
+      samples[endIndex]
+    )
+    const score = Math.max(
+      positionErrorMm / Math.max(config.simplifyToleranceMm, Number.EPSILON),
+      timedPositionErrorMm / Math.max(config.simplifyToleranceMm, Number.EPSILON),
+      jointErrorDeg / Math.max(config.simplifyJointToleranceDeg, Number.EPSILON)
+    )
+
+    if (score > furthestScore) {
+      furthestScore = score
       furthestIndex = index
     }
   }
 
   if (furthestIndex < 0) return
   retainedIndices.add(furthestIndex)
-  simplifyRange(samples, startIndex, furthestIndex, toleranceMm, retainedIndices)
-  simplifyRange(samples, furthestIndex, endIndex, toleranceMm, retainedIndices)
+  simplifyRange(samples, startIndex, furthestIndex, config, retainedIndices)
+  simplifyRange(samples, furthestIndex, endIndex, config, retainedIndices)
 }
 
 function simplifySamples(
@@ -96,7 +166,7 @@ function simplifySamples(
   if (samples.length <= 2) return [...samples]
 
   const retainedIndices = new Set<number>([0, samples.length - 1])
-  simplifyRange(samples, 0, samples.length - 1, config.simplifyToleranceMm, retainedIndices)
+  simplifyRange(samples, 0, samples.length - 1, config, retainedIndices)
 
   for (let index = 1; index < samples.length - 1; index += 1) {
     if (
@@ -109,16 +179,11 @@ function simplifySamples(
 
   const simplified = [...retainedIndices].sort((a, b) => a - b).map((index) => samples[index])
 
-  if (simplified.length <= config.maxOutputPoints) return simplified
-
-  const output: CartesianTraceSample[] = []
-  const lastIndex = simplified.length - 1
-  for (let index = 0; index < config.maxOutputPoints; index += 1) {
-    const sourceIndex = Math.round((index / (config.maxOutputPoints - 1)) * lastIndex)
-    const sample = simplified[sourceIndex]
-    if (output.at(-1) !== sample) output.push(sample)
-  }
-  return output
+  // maxOutputPoints is a soft UI/storage target. Uniformly dropping safety-critical samples here
+  // reintroduces the exact invalid-posture bug that the joint-aware pass prevents. A long trace is
+  // allowed to exceed the target; a future packed MoveTrace representation can optimize storage
+  // without changing the recorded motion.
+  return simplified
 }
 
 function createTraceGroupId(): string {
@@ -130,6 +195,17 @@ function createTraceGroupId(): string {
 
 function previousMotionStep(steps: WorkflowStep[]): WorkflowStep | undefined {
   return [...steps].reverse().find((step) => step.type === 'MoveJ' || step.type === 'MoveL')
+}
+
+/**
+ * A freehand trace stores the exact joint branch that the operator trained.
+ * Re-solving these samples from TCP would be lossy because the same TCP pose
+ * can have multiple valid IK solutions.
+ */
+export function isAuthoritativeRecordedTraceStep(
+  step: WorkflowStep
+): step is WorkflowStep & { jointAngles: NonNullable<WorkflowStep['jointAngles']> } {
+  return step.type === 'MoveL' && step.trace !== undefined && step.jointAngles !== undefined
 }
 
 export class CartesianTraceRecorder {
@@ -165,7 +241,12 @@ export class CartesianTraceRecorder {
 
     const moved = positionDistance(previous.tcpPose, sample.tcpPose)
     const rotated = rotationDistance(previous.tcpPose, sample.tcpPose)
-    if (moved < this.config.minPositionDeltaMm && rotated < this.config.minRotationDeltaDeg) {
+    const jointsMoved = jointDistance(previous.jointAngles, sample.jointAngles)
+    if (
+      moved < this.config.minPositionDeltaMm &&
+      rotated < this.config.minRotationDeltaDeg &&
+      jointsMoved < this.config.minJointDeltaDeg
+    ) {
       return false
     }
 
@@ -181,7 +262,8 @@ export class CartesianTraceRecorder {
       finalSample &&
       previous &&
       (positionDistance(previous.tcpPose, finalSample.tcpPose) > 0.01 ||
-        rotationDistance(previous.tcpPose, finalSample.tcpPose) > 0.01)
+        rotationDistance(previous.tcpPose, finalSample.tcpPose) > 0.01 ||
+        jointDistance(previous.jointAngles, finalSample.jointAngles) > 0.01)
     ) {
       this.samples.push(finalSample)
     }
@@ -218,8 +300,11 @@ export class CartesianTraceRecorder {
     const previous = previousMotionStep(existingSteps)
     const startsAtPreviousEndpoint =
       previous?.tcpPose !== undefined &&
+      previous.jointAngles !== undefined &&
       positionDistance(previous.tcpPose, first.tcpPose) <= 3 &&
-      rotationDistance(previous.tcpPose, first.tcpPose) <= 1
+      rotationDistance(previous.tcpPose, first.tcpPose) <= 1 &&
+      jointDistance(previous.jointAngles, first.jointAngles) <=
+        this.config.simplifyJointToleranceDeg
 
     // When the previous workflow step already owns the trace start pose, the
     // first emitted command is samples[1]. Re-index the emitted commands so a

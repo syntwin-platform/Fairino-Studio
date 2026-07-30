@@ -338,6 +338,12 @@ export class FactoryRunStepCoordinator {
     this.runs.delete(factoryRunId)
   }
 
+  clear(reason = new FactoryRunCoordinatorError('Factory session cleared.')): void {
+    for (const factoryRunId of [...this.runs.keys()]) {
+      this.abortRun(factoryRunId, reason)
+    }
+  }
+
   private getRun(factoryRunId: string): FactoryRunCoordinatorState {
     const run = this.runs.get(factoryRunId)
 

@@ -11,6 +11,8 @@ interface CachedDeviceSession {
 
 const cachedSessionsByKey = new Map<string, CachedDeviceSession>()
 const activeSessionPromisesByKey = new Map<string, Promise<string>>()
+export const BACKEND_DEVICE_RUNTIME_SESSION_STORAGE_PREFIX =
+  'syntwin.backendDevice.runtimeSessionId.'
 
 function getSessionKey(config: BackendSimulatorConfig): string {
   return [
@@ -21,7 +23,7 @@ function getSessionKey(config: BackendSimulatorConfig): string {
 }
 
 function getRuntimeSessionStorageKey(config: BackendSimulatorConfig): string {
-  return `syntwin.backendDevice.runtimeSessionId.${config.robotId.trim()}`
+  return `${BACKEND_DEVICE_RUNTIME_SESSION_STORAGE_PREFIX}${config.robotId.trim()}`
 }
 
 export function getCachedDeviceRuntimeSessionId(config: BackendSimulatorConfig): string | null {
@@ -31,6 +33,8 @@ export function getCachedDeviceRuntimeSessionId(config: BackendSimulatorConfig):
   if (cachedSession?.runtimeSessionId) {
     return cachedSession.runtimeSessionId
   }
+
+  if (typeof window === 'undefined') return null
 
   return window.sessionStorage.getItem(getRuntimeSessionStorageKey(config))
 }
@@ -45,6 +49,20 @@ export function invalidateDeviceSession(config?: BackendSimulatorConfig): void {
   const key = getSessionKey(config)
   cachedSessionsByKey.delete(key)
   activeSessionPromisesByKey.delete(key)
+}
+
+export function clearAllDeviceSessions(): void {
+  invalidateDeviceSession()
+
+  if (typeof window === 'undefined') return
+
+  for (let index = window.sessionStorage.length - 1; index >= 0; index -= 1) {
+    const key = window.sessionStorage.key(index)
+
+    if (key?.startsWith(BACKEND_DEVICE_RUNTIME_SESSION_STORAGE_PREFIX)) {
+      window.sessionStorage.removeItem(key)
+    }
+  }
 }
 
 export async function getDeviceAccessToken(config: BackendSimulatorConfig): Promise<string> {

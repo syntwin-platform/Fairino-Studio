@@ -4,6 +4,7 @@ import {
   FileCode2,
   HelpCircle,
   Home,
+  KeyRound,
   Move3D,
   Plus,
   RefreshCw,
@@ -15,8 +16,9 @@ import {
   ChevronsLeft,
   ChevronsRight
 } from 'lucide-react'
+import { backendFetch } from '../../services/backendFetch'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { ReactElement } from 'react'
+import type { ChangeEvent, ReactElement } from 'react'
 import {
   waitForRobotCommand,
   type BackendCommandResponse,
@@ -52,8 +54,10 @@ import AddRobotWizard from './AddRobotWizard'
 import {
   BackendRobotClientError,
   deleteRobot,
+  listCompanies,
   listRobots,
   updateRobotSceneBinding as updateBackendRobotSceneBinding,
+  type BackendCompany,
   type BackendRobot
 } from '../../services/backendRobotClient'
 import { checkBackendHealth } from '../../services/backendHealthClient'
@@ -63,6 +67,15 @@ import {
   BackendSimulatorConfigByRobotId,
   BackendSimulatorStatus
 } from '../../types/backendDevice'
+
+const FACTORY_SIDEBAR_TCP_POSE = Object.freeze({
+  x: 0,
+  y: 0,
+  z: 0,
+  rx: 0,
+  ry: 0,
+  rz: 0
+})
 
 interface InfoTooltipProps {
   text: string
@@ -228,6 +241,7 @@ interface RobotSidebarProps {
   onSimulatorConfigChange: (config: BackendSimulatorConfig) => void
   onSimulatorConnect: () => Promise<void>
   onSimulatorDisconnect: () => void
+  onSimulatorConfigsImport: (configs: BackendSimulatorConfigByRobotId) => void
   onSimulatorConnectRobot: (config: BackendSimulatorConfig) => Promise<void>
   onSimulatorDisconnectRobot: (robotId: string) => void
 }
@@ -239,6 +253,7 @@ export default function RobotSidebar({
   onSimulatorConfigChange,
   onSimulatorConnect,
   onSimulatorDisconnect,
+  onSimulatorConfigsImport,
   onSimulatorConnectRobot,
   onSimulatorDisconnectRobot
 }: RobotSidebarProps): ReactElement {
@@ -249,9 +264,16 @@ export default function RobotSidebar({
     () => window.localStorage.getItem(ADD_ROBOT_COMPANY_KEY) || ''
   )
 
+  const [backendCompanies, setBackendCompanies] = useState<BackendCompany[]>([])
+  const [companyListLoading, setCompanyListLoading] = useState(false)
+  const [companyListResolved, setCompanyListResolved] = useState(false)
   const [backendRobots, setBackendRobots] = useState<BackendRobot[]>([])
   const [robotListLoading, setRobotListLoading] = useState(false)
   const [robotListError, setRobotListError] = useState('')
+  const [credentialImportFeedback, setCredentialImportFeedback] = useState<{
+    status: 'success' | 'error'
+    message: string
+  } | null>(null)
   const [deletingRobotId, setDeletingRobotId] = useState('')
   const [factoryActionBusy, setFactoryActionBusy] = useState(false)
   const [robotListReloadRevision, setRobotListReloadRevision] = useState(0)
@@ -269,8 +291,13 @@ export default function RobotSidebar({
   const robotListAutoLoadKeyRef = useRef('')
   const robotListAbortControllerRef = useRef<AbortController | null>(null)
   const robotListRetryTimeoutRef = useRef<number | null>(null)
+  const credentialFileInputRef = useRef<HTMLInputElement | null>(null)
   const robotCardRefs = useRef<Record<string, HTMLDivElement | null>>({})
-  const jointAngles = useRobotStore((state) => state.jointAngles)
+  // Joint/TCP controls are only rendered in Training. Returning stable values in Factory prevents
+  // the complete (and intentionally feature-rich) sidebar from re-rendering for every motion frame.
+  const jointAngles = useRobotStore((state) =>
+    state.workspaceMode === 'train' ? state.jointAngles : DEFAULT_JOINT_ANGLES
+  )
   const setJointAngles = useRobotStore((state) => state.setJointAngles)
   const setPlaying = useRobotStore((state) => state.setPlaying)
   const isPlaying = useRobotStore((state) => {
@@ -280,7 +307,9 @@ export default function RobotSidebar({
   })
   const setCurrentStepIndex = useRobotStore((state) => state.setCurrentStepIndex)
   const setSelectedStepId = useRobotStore((state) => state.setSelectedStepId)
-  const tcpPose = useRobotStore((state) => state.tcpPose)
+  const tcpPose = useRobotStore((state) =>
+    state.workspaceMode === 'train' ? state.tcpPose : FACTORY_SIDEBAR_TCP_POSE
+  )
   const isIKMode = useRobotStore((state) => state.isIKMode)
   const isRobotPlacementMode = useRobotStore((state) => state.isRobotPlacementMode)
   const setRobotPlacementMode = useRobotStore((state) => state.setRobotPlacementMode)
@@ -404,7 +433,7 @@ export default function RobotSidebar({
     jointAngles: number[],
     speed = 30
   ): Promise<BackendCommandResponse> => {
-    const response = await fetch(
+    const response = await backendFetch(
       `${context.backendUrl.trim().replace(/\/+$/, '')}/api/robots/${encodeURIComponent(robotId)}/commands`,
       {
         method: 'POST',
@@ -600,17 +629,25 @@ export default function RobotSidebar({
 
   const loadBackendRobots = useCallback(async (): Promise<void> => {
     if (!backendToken) {
-      setRobotListError('Hãy đăng nhập Backend trước.')
+      setRobotListError(
+        language === 'vi' ? 'Hãy đăng nhập tài khoản SynTwin trước.' : 'Sign in to SynTwin first.'
+      )
       return
     }
 
     if (!simulatorConfig.backendUrl.trim()) {
-      setRobotListError('Backend URL đang trống.')
+      setRobotListError(
+        language === 'vi'
+          ? 'Chưa chọn môi trường kết nối.'
+          : 'No connection environment is selected.'
+      )
       return
     }
 
     if (!addRobotCompanyId.trim()) {
-      setRobotListError('Company ID đang trống.')
+      setRobotListError(
+        language === 'vi' ? 'Chưa chọn doanh nghiệp.' : 'No organization is selected.'
+      )
       return
     }
 
@@ -654,11 +691,20 @@ export default function RobotSidebar({
       if (error instanceof BackendRobotClientError && error.status === 401) {
         clearBackendAccessToken()
         setBackendRobots([])
-        setRobotListError('Phiên đăng nhập Backend đã hết hạn. Hãy đăng nhập lại.')
+        setRobotListError(
+          language === 'vi'
+            ? 'Phiên đăng nhập SynTwin đã hết hạn. Hãy đăng nhập lại.'
+            : 'Your SynTwin session has expired. Please sign in again.'
+        )
         return
       }
 
-      const message = error instanceof Error ? error.message : 'Không tải được danh sách robot.'
+      const message =
+        error instanceof Error
+          ? error.message
+          : language === 'vi'
+            ? 'Không tải được danh sách robot.'
+            : 'Unable to load the robot list.'
       setRobotListError(message)
 
       if (
@@ -680,6 +726,7 @@ export default function RobotSidebar({
     addRobotCompanyId,
     backendToken,
     clearBackendAccessToken,
+    language,
     scheduleRobotListRetry,
     selectRobot,
     setBackendConnectivity,
@@ -689,7 +736,83 @@ export default function RobotSidebar({
   ])
 
   useEffect(() => {
-    if (!backendToken || !simulatorConfig.backendUrl.trim() || !addRobotCompanyId.trim()) {
+    const backendUrl = simulatorConfig.backendUrl.trim()
+
+    setCompanyListResolved(false)
+    setBackendCompanies([])
+
+    if (!backendToken || !backendUrl) {
+      setCompanyListLoading(false)
+      return
+    }
+
+    const controller = new AbortController()
+    setCompanyListLoading(true)
+    setRobotListError('')
+
+    void listCompanies(backendUrl, backendToken, controller.signal)
+      .then((companies) => {
+        if (controller.signal.aborted) return
+
+        setBackendCompanies(companies)
+        setAddRobotCompanyId((currentCompanyId) => {
+          const normalizedCurrentId = currentCompanyId.trim()
+          const currentCompanyStillExists = companies.some(
+            (company) => company.id === normalizedCurrentId
+          )
+          const selectedCompanyId = currentCompanyStillExists
+            ? normalizedCurrentId
+            : (companies.find((company) => company.currentUserRole === 'Owner')?.id ??
+              companies[0]?.id ??
+              '')
+
+          if (selectedCompanyId) {
+            window.localStorage.setItem(ADD_ROBOT_COMPANY_KEY, selectedCompanyId)
+          } else {
+            window.localStorage.removeItem(ADD_ROBOT_COMPANY_KEY)
+          }
+
+          return selectedCompanyId
+        })
+        setCompanyListResolved(true)
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) return
+
+        if (error instanceof BackendRobotClientError && error.status === 401) {
+          clearBackendAccessToken()
+          setRobotListError(
+            language === 'vi'
+              ? 'Phiên đăng nhập SynTwin đã hết hạn. Hãy đăng nhập lại.'
+              : 'Your SynTwin session has expired. Please sign in again.'
+          )
+          return
+        }
+
+        setRobotListError(
+          error instanceof Error
+            ? error.message
+            : language === 'vi'
+              ? 'Không tải được danh sách doanh nghiệp.'
+              : 'Unable to load the organization list.'
+        )
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setCompanyListLoading(false)
+        }
+      })
+
+    return () => controller.abort()
+  }, [backendToken, clearBackendAccessToken, language, simulatorConfig.backendUrl])
+
+  useEffect(() => {
+    if (
+      !companyListResolved ||
+      !backendToken ||
+      !simulatorConfig.backendUrl.trim() ||
+      !addRobotCompanyId.trim()
+    ) {
       return
     }
 
@@ -704,6 +827,7 @@ export default function RobotSidebar({
   }, [
     addRobotCompanyId,
     backendToken,
+    companyListResolved,
     loadBackendRobots,
     robotListReloadRevision,
     simulatorConfig.backendUrl
@@ -736,7 +860,12 @@ export default function RobotSidebar({
       } catch (error) {
         if (controller.signal.aborted) return
 
-        const message = error instanceof Error ? error.message : 'Backend hiện không phản hồi.'
+        const message =
+          error instanceof Error
+            ? error.message
+            : language === 'vi'
+              ? 'Dịch vụ SynTwin hiện không phản hồi.'
+              : 'The SynTwin service is not responding.'
         setBackendConnectivity('offline', message)
       }
     }
@@ -748,7 +877,7 @@ export default function RobotSidebar({
       controller.abort()
       window.clearInterval(intervalId)
     }
-  }, [backendToken, setBackendConnectivity, simulatorConfig.backendUrl])
+  }, [backendToken, language, setBackendConnectivity, simulatorConfig.backendUrl])
 
   useEffect(
     () => () => {
@@ -767,8 +896,27 @@ export default function RobotSidebar({
     robotListAbortControllerRef.current?.abort()
     robotListAbortControllerRef.current = null
     robotListAutoLoadKeyRef.current = ''
+    robotCardRefs.current = {}
+    setIsHoming(false)
+    setIsAddRobotOpen(false)
+    setAddRobotCompanyId('')
+    setBackendCompanies([])
+    setCompanyListLoading(false)
+    setCompanyListResolved(false)
     setRobotListLoading(false)
     setBackendRobots([])
+    setRobotListError('')
+    setCredentialImportFeedback(null)
+    setDeletingRobotId('')
+    setFactoryActionBusy(false)
+    setSceneBindingSaveFeedback({})
+    setCommandRecoveryFeedback({})
+    setBulkCommandRecoveryFeedback(null)
+    window.localStorage.removeItem(ADD_ROBOT_COMPANY_KEY)
+
+    if (credentialFileInputRef.current) {
+      credentialFileInputRef.current.value = ''
+    }
 
     if (robotListRetryTimeoutRef.current !== null) {
       window.clearTimeout(robotListRetryTimeoutRef.current)
@@ -782,11 +930,101 @@ export default function RobotSidebar({
     setJointAngles(updated)
   }
 
+  const handleCredentialFileChange = async (
+    event: ChangeEvent<HTMLInputElement>
+  ): Promise<void> => {
+    const file = event.target.files?.[0]
+
+    if (!file) return
+
+    try {
+      setCredentialImportFeedback(null)
+      const parsed = JSON.parse(await file.text()) as unknown
+
+      if (!Array.isArray(parsed)) {
+        throw new Error(
+          language === 'vi'
+            ? 'Tệp thông tin kết nối không đúng định dạng.'
+            : 'The connection information file has an invalid format.'
+        )
+      }
+
+      const knownRobotIds = new Set(backendRobots.map((robot) => robot.id))
+      const importedConfigs: BackendSimulatorConfigByRobotId = {}
+      let ignoredCount = 0
+
+      for (const item of parsed) {
+        if (!item || typeof item !== 'object') {
+          ignoredCount += 1
+          continue
+        }
+
+        const credential = item as Record<string, unknown>
+        const robotId = typeof credential.robotId === 'string' ? credential.robotId.trim() : ''
+        const deviceSecret =
+          typeof credential.deviceSecret === 'string' ? credential.deviceSecret.trim() : ''
+
+        if (!robotId || !deviceSecret || !knownRobotIds.has(robotId)) {
+          ignoredCount += 1
+          continue
+        }
+
+        importedConfigs[robotId] = {
+          ...simulatorConfig,
+          ...simulatorConfigByRobotId[robotId],
+          backendUrl: simulatorConfig.backendUrl.trim(),
+          robotId,
+          deviceSecret,
+          enabled: false
+        }
+      }
+
+      const importedCount = Object.keys(importedConfigs).length
+
+      if (importedCount === 0) {
+        throw new Error(
+          language === 'vi'
+            ? 'Không tìm thấy thông tin kết nối phù hợp với robot của doanh nghiệp hiện tại.'
+            : 'No connection information matches robots in the current organization.'
+        )
+      }
+
+      onSimulatorConfigsImport(importedConfigs)
+      setCredentialImportFeedback({
+        status: 'success',
+        message:
+          ignoredCount > 0
+            ? language === 'vi'
+              ? `Đã nạp khóa kết nối cho ${importedCount} robot; bỏ qua ${ignoredCount} mục không hợp lệ hoặc không thuộc doanh nghiệp.`
+              : `Connection keys were loaded for ${importedCount} robots; ${ignoredCount} invalid or unrelated entries were skipped.`
+            : language === 'vi'
+              ? `Đã nạp khóa kết nối cho ${importedCount} robot. Robot đã sẵn sàng kết nối.`
+              : `Connection keys were loaded for ${importedCount} robots. They are ready to connect.`
+      })
+    } catch (error) {
+      setCredentialImportFeedback({
+        status: 'error',
+        message:
+          error instanceof Error
+            ? error.message
+            : language === 'vi'
+              ? 'Không đọc được tệp thông tin kết nối robot.'
+              : 'Unable to read the robot connection information file.'
+      })
+    } finally {
+      event.target.value = ''
+    }
+  }
+
   const handleConnectReadyRobots = async (): Promise<void> => {
     const readyRobots = backendRobots.filter((robot) => canConnectBackendRobot(robot))
 
     if (readyRobots.length === 0) {
-      setRobotListError('Không có robot nào đủ Backend URL + Robot ID + Device Secret để connect.')
+      setRobotListError(
+        language === 'vi'
+          ? 'Chưa có robot nào có đủ mã robot và khóa kết nối.'
+          : 'No robot has both a robot code and connection key yet.'
+      )
       return
     }
 
@@ -807,7 +1045,11 @@ export default function RobotSidebar({
     const onlineRobots = backendRobots.filter((robot) => isBackendRobotRuntimeActive(robot))
 
     if (onlineRobots.length === 0) {
-      setRobotListError('Không có robot nào đang online/running để disconnect.')
+      setRobotListError(
+        language === 'vi'
+          ? 'Không có robot nào đang trực tuyến để ngắt kết nối.'
+          : 'No online robot is available to disconnect.'
+      )
       return
     }
 
@@ -951,22 +1193,36 @@ export default function RobotSidebar({
   }
   const handleDeleteBackendRobot = async (robot: BackendRobot): Promise<void> => {
     if (!backendToken) {
-      setRobotListError('Hãy đăng nhập Backend trước khi xóa robot.')
+      setRobotListError(
+        language === 'vi'
+          ? 'Hãy đăng nhập tài khoản SynTwin trước khi xóa robot.'
+          : 'Sign in to SynTwin before deleting a robot.'
+      )
       return
     }
 
     if (!simulatorConfig.backendUrl.trim()) {
-      setRobotListError('Backend URL đang trống.')
+      setRobotListError(
+        language === 'vi'
+          ? 'Chưa chọn môi trường kết nối.'
+          : 'No connection environment is selected.'
+      )
       return
     }
 
     if (isBackendRobotRuntimeActive(robot)) {
-      setRobotListError('Không thể xóa robot đang online/running. Hãy Disconnect robot trước.')
+      setRobotListError(
+        language === 'vi'
+          ? 'Không thể xóa robot đang trực tuyến. Hãy ngắt kết nối robot trước.'
+          : 'An online robot cannot be deleted. Disconnect it first.'
+      )
       return
     }
 
     const confirmed = window.confirm(
-      `Xóa robot "${robot.robotName}" khỏi danh sách sử dụng?\n\nRobot sẽ bị disable trong backend.`
+      language === 'vi'
+        ? `Xóa robot "${robot.robotName}" khỏi danh sách sử dụng?\n\nRobot sẽ được vô hiệu hóa trên hệ thống SynTwin.`
+        : `Remove "${robot.robotName}" from the active robot list?\n\nThe robot will be disabled in SynTwin.`
     )
 
     if (!confirmed) return
@@ -990,7 +1246,13 @@ export default function RobotSidebar({
         })
       }
     } catch (error) {
-      setRobotListError(error instanceof Error ? error.message : 'Không xóa được robot.')
+      setRobotListError(
+        error instanceof Error
+          ? error.message
+          : language === 'vi'
+            ? 'Không xóa được robot.'
+            : 'Unable to delete the robot.'
+      )
     } finally {
       setDeletingRobotId('')
     }
@@ -1003,7 +1265,9 @@ export default function RobotSidebar({
   ): void => {
     if (isBackendRobotRuntimeActive(robot)) {
       setRobotListError(
-        'Không thể sửa vị trí robot khi robot đang online/running. Hãy Disconnect trước.'
+        language === 'vi'
+          ? 'Không thể sửa vị trí khi robot đang trực tuyến. Hãy ngắt kết nối trước.'
+          : 'The position cannot be edited while the robot is online. Disconnect it first.'
       )
       return
     }
@@ -1048,7 +1312,10 @@ export default function RobotSidebar({
     }
 
     if (isBackendRobotRuntimeActive(robot)) {
-      const message = 'Disconnect robot trước khi lưu vị trí.'
+      const message =
+        language === 'vi'
+          ? 'Hãy ngắt kết nối robot trước khi lưu vị trí.'
+          : 'Disconnect the robot before saving its position.'
 
       setRobotListError(message)
       setFeedback('error', message)
@@ -1056,21 +1323,30 @@ export default function RobotSidebar({
     }
 
     if (!backendToken) {
-      const message = 'Hãy đăng nhập Backend trước khi lưu vị trí.'
+      const message =
+        language === 'vi'
+          ? 'Hãy đăng nhập tài khoản SynTwin trước khi lưu vị trí.'
+          : 'Sign in to SynTwin before saving the position.'
       setRobotListError(message)
       setFeedback('error', message)
       return
     }
 
     if (!simulatorConfig.backendUrl.trim()) {
-      const message = 'Backend URL đang trống.'
+      const message =
+        language === 'vi'
+          ? 'Chưa chọn môi trường kết nối.'
+          : 'No connection environment is selected.'
       setRobotListError(message)
       setFeedback('error', message)
       return
     }
 
     const expectedBinding = getLiveRobotSceneBinding(robot)
-    setFeedback('saving', 'Đang lưu vị trí vào Backend...')
+    setFeedback(
+      'saving',
+      language === 'vi' ? 'Đang lưu vị trí lên SynTwin...' : 'Saving the position to SynTwin...'
+    )
 
     try {
       await updateBackendRobotSceneBinding(simulatorConfig.backendUrl, backendToken, robot.id, {
@@ -1094,7 +1370,11 @@ export default function RobotSidebar({
       const persistedRobot = refreshedRobots.find((item) => item.id === robot.id)
 
       if (!persistedRobot || !hasPersistedSceneBinding(persistedRobot, expectedBinding)) {
-        throw new Error('Backend chưa trả lại đúng vị trí vừa lưu.')
+        throw new Error(
+          language === 'vi'
+            ? 'SynTwin chưa xác nhận đúng vị trí vừa lưu.'
+            : 'SynTwin did not confirm the saved position correctly.'
+        )
       }
 
       setBackendRobots((current) =>
@@ -1103,6 +1383,11 @@ export default function RobotSidebar({
 
       upsertRobot(toRobotInstance(persistedRobot))
       selectRobot(persistedRobot.id)
+
+      // The persisted binding is now the new locked position. Leaving placement mode only after
+      // the read-back verification succeeds detaches the viewport gizmo without hiding it when a
+      // save fails and the user still needs to correct the position.
+      setRobotPlacementMode(false)
 
       setRobotListError('')
       setFeedback('success', `Đã lưu thành công lúc ${new Date().toLocaleTimeString()}.`)
@@ -1606,11 +1891,9 @@ export default function RobotSidebar({
             <div className="mb-3 flex items-start justify-between gap-3">
               <div>
                 <p className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                  Danh sách thiết bị
+                  {t('deviceManagement')}
                 </p>
-                <p className="mt-1 text-[11px] text-slate-500">
-                  Tạo robot backend thật rồi bind vào simulator config hiện tại.
-                </p>
+                <p className="mt-1 text-[11px] text-slate-500">{t('deviceManagementHint')}</p>
               </div>
 
               <button
@@ -1622,38 +1905,56 @@ export default function RobotSidebar({
                 className="flex shrink-0 items-center gap-1.5 rounded bg-blue-600 px-3 py-2 text-xs font-bold text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-40"
                 title={
                   !backendToken
-                    ? 'Hãy đăng nhập Backend trước'
+                    ? t('signInFirst')
                     : !addRobotCompanyId.trim()
-                      ? 'Nhập Company ID trước'
-                      : 'Thêm robot'
+                      ? t('chooseCompanyFirst')
+                      : t('addRobot')
                 }
               >
                 <Plus size={13} />
-                Add Robot
+                {t('addRobot')}
               </button>
             </div>
 
             <label className="block">
               <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                Company ID
+                {t('company')}
               </span>
-              <input
+              <select
                 value={addRobotCompanyId}
                 onChange={(event) => handleAddRobotCompanyIdChange(event.target.value)}
+                disabled={!backendToken || companyListLoading}
                 className="mt-1 w-full rounded-md border border-[#2d2d34] bg-[#0c0e16] px-3 py-2 text-xs text-white outline-none transition focus:border-blue-500"
-                placeholder="Copy company id từ GET /api/companies"
-              />
+              >
+                <option value="">
+                  {companyListLoading
+                    ? t('loadingCompanies')
+                    : backendCompanies.length === 0
+                      ? t('noCompanies')
+                      : t('chooseCompany')}
+                </option>
+                {backendCompanies.map((company) => (
+                  <option key={company.id} value={company.id}>
+                    {company.name} ({company.currentUserRole})
+                  </option>
+                ))}
+              </select>
+              {addRobotCompanyId && (
+                <span className="mt-1 block break-all text-[9px] text-slate-600">
+                  {addRobotCompanyId}
+                </span>
+              )}
             </label>
 
             {!backendToken && (
               <p className="mt-2 rounded border border-amber-500/30 bg-amber-950/20 px-3 py-2 text-[11px] text-amber-200">
-                Hãy đăng nhập Backend ở panel bên phải trước khi Add Robot.
+                {t('signInToManageRobots')}
               </p>
             )}
 
             <div className="mt-3 border-t border-[#2d2d34] pt-3">
               <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2">
-                Factory Actions
+                {t('factoryActions')}
               </p>
               <button
                 type="button"
@@ -1662,7 +1963,7 @@ export default function RobotSidebar({
                 className="mb-3 flex w-full items-center justify-center gap-2 rounded-lg bg-violet-600 px-3 py-2 text-xs font-bold text-white transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <FileCode2 size={14} />
-                Import LUA & Run Factory
+                {t('importLuaRunFactory')}
               </button>
 
               <div className="grid grid-cols-2 gap-2 mb-3">
@@ -1674,9 +1975,9 @@ export default function RobotSidebar({
                     backendRobots.every((robot) => !canConnectBackendRobot(robot))
                   }
                   className="rounded-lg border border-emerald-500/40 bg-emerald-950/10 px-2 py-1.5 text-xs font-bold text-emerald-300 transition hover:bg-emerald-950/30 disabled:cursor-not-allowed disabled:opacity-40 text-center"
-                  title="Connect tất cả robot đã có Device Secret"
+                  title={t('connectReadyHint')}
                 >
-                  Connect Ready
+                  {t('connectReady')}
                 </button>
 
                 <button
@@ -1684,10 +1985,10 @@ export default function RobotSidebar({
                   onClick={handleStopAllRobotMotion}
                   disabled={factoryRuntimeSummary.running === 0}
                   className="flex items-center justify-center gap-1.5 rounded-lg border border-red-500/50 bg-red-950/15 px-2 py-1.5 text-xs font-bold text-red-300 transition hover:bg-red-950/35 disabled:cursor-not-allowed disabled:opacity-40"
-                  title="Dừng toàn bộ workflow và backend command đang chạy"
+                  title={t('stopAllHint')}
                 >
                   <Square size={12} />
-                  Stop All
+                  {t('stopAll')}
                 </button>
 
                 <button
@@ -1698,9 +1999,9 @@ export default function RobotSidebar({
                     backendRobots.every((robot) => !isBackendRobotRuntimeActive(robot))
                   }
                   className="rounded-lg border border-amber-500/40 bg-amber-950/10 px-2 py-1.5 text-xs font-bold text-amber-300 transition hover:bg-amber-950/30 disabled:cursor-not-allowed disabled:opacity-40 text-center"
-                  title="Disconnect tất cả robot đang online/running"
+                  title={t('disconnectOnlineHint')}
                 >
-                  Disconnect Online
+                  {t('disconnectOnline')}
                 </button>
 
                 <button
@@ -1708,14 +2009,10 @@ export default function RobotSidebar({
                   onClick={handleReturnAllHome}
                   disabled={isFactoryRunning}
                   className="flex items-center justify-center gap-1.5 rounded-lg border border-blue-500/45 bg-blue-950/15 px-2 py-1.5 text-xs font-bold text-blue-300 transition hover:bg-blue-950/35 disabled:cursor-not-allowed disabled:opacity-40"
-                  title={
-                    isFactoryRunning
-                      ? 'Hãy dừng Factory Run trước khi đưa toàn bộ robot về Home.'
-                      : 'Đưa toàn bộ robot trong Factory về tư thế Home'
-                  }
+                  title={isFactoryRunning ? t('stopFactoryBeforeHome') : t('returnAllHomeHint')}
                 >
                   <Home size={12} />
-                  Return All Home
+                  {t('returnAllHome')}
                 </button>
 
                 <button
@@ -1753,7 +2050,24 @@ export default function RobotSidebar({
                   )}
               </div>
 
-              <div className="flex justify-end gap-2 mb-4">
+              <div className="mb-2 flex justify-end gap-2">
+                <input
+                  ref={credentialFileInputRef}
+                  type="file"
+                  accept="application/json,.json"
+                  className="hidden"
+                  onChange={(event) => void handleCredentialFileChange(event)}
+                />
+                <button
+                  type="button"
+                  onClick={() => credentialFileInputRef.current?.click()}
+                  disabled={!backendToken || backendRobots.length === 0 || factoryActionBusy}
+                  className="flex items-center gap-1 rounded border border-amber-500/40 px-2 py-1.5 text-[10px] font-semibold text-amber-300 transition hover:bg-amber-950/30 hover:text-amber-200 disabled:cursor-not-allowed disabled:opacity-40"
+                  title={t('importConnectionKeysHint')}
+                >
+                  <KeyRound size={11} />
+                  {t('importConnectionKeys')}
+                </button>
                 <button
                   type="button"
                   onClick={() => void loadBackendRobots()}
@@ -1767,20 +2081,31 @@ export default function RobotSidebar({
                   className="flex items-center gap-1 rounded border border-[#343849] px-2 py-1.5 text-[10px] font-semibold text-slate-300 transition hover:bg-[#242833] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <RefreshCw size={11} className={robotListLoading ? 'animate-spin' : ''} />
-                  Refresh
+                  {t('refresh')}
                 </button>
               </div>
+              {credentialImportFeedback && (
+                <p
+                  className={`mb-4 rounded border px-3 py-2 text-[10px] leading-relaxed ${
+                    credentialImportFeedback.status === 'success'
+                      ? 'border-emerald-500/30 bg-emerald-950/20 text-emerald-300'
+                      : 'border-red-500/40 bg-red-950/30 text-red-200'
+                  }`}
+                >
+                  {credentialImportFeedback.message}
+                </p>
+              )}
             </div>
 
             {backendRobots.length > 0 && (
               <div className="mt-4 border-t border-[#2d2d34] pt-4">
                 <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2">
-                  Factory Summary
+                  {t('factorySummary')}
                 </p>
                 <div className="mb-4 grid grid-cols-3 gap-1 rounded border border-[#2d2d34] bg-[#080a10] p-2">
                   <div className="col-span-3 flex items-center justify-between rounded border border-violet-500/30 bg-violet-950/20 px-3 py-2">
                     <p className="text-[9px] font-bold uppercase tracking-wider text-violet-300">
-                      Running Robots
+                      {t('runningRobots')}
                     </p>
                     <p className="text-base font-bold text-violet-200">
                       {factoryRuntimeSummary.running}
@@ -1788,14 +2113,14 @@ export default function RobotSidebar({
                   </div>
                   <div className="rounded bg-[#111827] px-2 py-1">
                     <p className="text-[8px] font-bold uppercase tracking-wider text-slate-500">
-                      Total
+                      {t('total')}
                     </p>
                     <p className="text-sm font-bold text-white">{factoryRuntimeSummary.total}</p>
                   </div>
 
                   <div className="rounded bg-emerald-950/20 px-2 py-1">
                     <p className="text-[8px] font-bold uppercase tracking-wider text-emerald-500">
-                      Online
+                      {t('online')}
                     </p>
                     <p className="text-sm font-bold text-emerald-300">
                       {factoryRuntimeSummary.online}
@@ -1804,14 +2129,14 @@ export default function RobotSidebar({
 
                   <div className="rounded bg-blue-950/20 px-2 py-1">
                     <p className="text-[8px] font-bold uppercase tracking-wider text-blue-400">
-                      Ready
+                      {t('ready')}
                     </p>
                     <p className="text-sm font-bold text-blue-300">{factoryRuntimeSummary.ready}</p>
                   </div>
 
                   <div className="rounded bg-amber-950/20 px-2 py-1">
                     <p className="text-[8px] font-bold uppercase tracking-wider text-amber-400">
-                      Connecting
+                      {t('connecting')}
                     </p>
                     <p className="text-sm font-bold text-amber-300">
                       {factoryRuntimeSummary.connecting}
@@ -1820,14 +2145,14 @@ export default function RobotSidebar({
 
                   <div className="rounded bg-red-950/20 px-2 py-1">
                     <p className="text-[8px] font-bold uppercase tracking-wider text-red-400">
-                      Error
+                      {t('error')}
                     </p>
                     <p className="text-sm font-bold text-red-300">{factoryRuntimeSummary.error}</p>
                   </div>
 
                   <div className="rounded bg-slate-900 px-2 py-1">
                     <p className="text-[8px] font-bold uppercase tracking-wider text-slate-500">
-                      Offline
+                      {t('offline')}
                     </p>
                     <p className="text-sm font-bold text-slate-300">
                       {factoryRuntimeSummary.offline}
@@ -1848,10 +2173,10 @@ export default function RobotSidebar({
                 }`}
               >
                 {backendConnectivity === 'online'
-                  ? 'Backend đang kết nối.'
+                  ? t('systemConnected')
                   : backendConnectivity === 'checking'
-                    ? 'Đang kiểm tra kết nối Backend...'
-                    : 'Backend đang offline. Hệ thống sẽ tự thử tải lại danh sách robot.'}
+                    ? t('systemChecking')
+                    : t('systemOfflineRetrying')}
               </p>
             )}
 
@@ -1863,13 +2188,13 @@ export default function RobotSidebar({
 
             <div className="mt-4 border-t border-[#2d2d34] pt-4">
               <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2">
-                Robots từ Backend
+                {t('robotsFromSystem')}
               </p>
 
               <div className="space-y-2">
                 {backendRobots.length === 0 ? (
                   <p className="rounded border border-[#2d2d34] bg-[#0c0e16] px-3 py-3 text-center text-[11px] text-slate-500">
-                    Chưa có robot nào được load.
+                    {t('noRobotsLoaded')}
                   </p>
                 ) : (
                   backendRobots.map((robot) => {
@@ -1995,7 +2320,7 @@ export default function RobotSidebar({
                                 navigator.clipboard.writeText(robot.id)
                               }}
                               className="mt-1 font-mono text-[9px] text-slate-500 hover:text-blue-400 select-all cursor-pointer transition flex items-center gap-1"
-                              title="Click để copy ID"
+                              title={t('clickToCopyCode')}
                             >
                               ID: {robot.id.slice(0, 8)}...
                             </span>
@@ -2009,39 +2334,39 @@ export default function RobotSidebar({
 
                               {isConfiguredForConnection && !isSelected && (
                                 <span className="rounded border border-blue-500/30 bg-blue-950/20 px-1.5 py-0.5 text-[9px] font-bold text-blue-300">
-                                  CONFIG
+                                  {t('configured')}
                                 </span>
                               )}
 
                               {isCollision && (
                                 <span className="inline-flex items-center gap-1 rounded bg-red-500/25 px-1.5 py-0.5 text-[9px] font-bold text-red-300 border border-red-500/30">
-                                  Va chạm
+                                  {t('collisionWarning')}
                                 </span>
                               )}
                               {isProximity && (
                                 <span className="inline-flex items-center gap-1 rounded bg-amber-500/25 px-1.5 py-0.5 text-[9px] font-bold text-amber-300 border border-amber-500/30">
-                                  Gần va chạm
+                                  {t('nearCollision')}
                                 </span>
                               )}
                               {isLatchedFaultWaitingReset && (
                                 <span className="inline-flex items-center gap-1 rounded bg-rose-500/10 px-1.5 py-0.5 text-[9px] font-bold text-rose-300 border border-rose-500/20">
-                                  Đã dừng – chờ reset
+                                  {t('stoppedWaitingReset')}
                                 </span>
                               )}
 
                               {homingStatuses[robot.id] === 'homing' && (
                                 <span className="inline-flex items-center gap-1 rounded bg-amber-600/20 px-1.5 py-0.5 text-[9px] font-bold text-amber-300 border border-amber-500/30 animate-pulse">
-                                  Homing...
+                                  {t('homing')}
                                 </span>
                               )}
                               {homingStatuses[robot.id] === 'success' && (
                                 <span className="inline-flex items-center gap-1 rounded bg-emerald-600/20 px-1.5 py-0.5 text-[9px] font-bold text-emerald-300 border border-emerald-500/30">
-                                  Home thành công
+                                  {t('homeSucceeded')}
                                 </span>
                               )}
                               {homingStatuses[robot.id] === 'failed' && (
                                 <span className="inline-flex items-center gap-1 rounded bg-red-600/20 px-1.5 py-0.5 text-[9px] font-bold text-red-300 border border-red-500/30">
-                                  Home thất bại
+                                  {t('homeFailed')}
                                 </span>
                               )}
                             </div>
@@ -2049,13 +2374,17 @@ export default function RobotSidebar({
                         </div>
 
                         <div className="mt-2.5 grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] text-slate-400">
-                          <span>BE: {robot.status}</span>
-                          <span>Mode: {robot.connectionType}</span>
-                          <span className="truncate">
-                            Heartbeat: {formatRuntimeTime(robotRuntime?.lastHeartbeatAt)}
+                          <span>
+                            {t('systemConnection')}: {robot.status}
+                          </span>
+                          <span>
+                            {t('connectionType')}: {robot.connectionType}
                           </span>
                           <span className="truncate">
-                            Telemetry: {formatRuntimeTime(robotRuntime?.lastTelemetryAt)}
+                            {t('lastHeartbeat')}: {formatRuntimeTime(robotRuntime?.lastHeartbeatAt)}
+                          </span>
+                          <span className="truncate">
+                            {t('lastTelemetry')}: {formatRuntimeTime(robotRuntime?.lastTelemetryAt)}
                           </span>
                           <span
                             className={
@@ -2064,10 +2393,10 @@ export default function RobotSidebar({
                                 : 'text-slate-500 col-span-2'
                             }
                           >
-                            Execution:{' '}
+                            {t('execution')}:{' '}
                             {robotExecution?.isPlaying
-                              ? `Running step ${robotExecution.currentStepIndex + 1}`
-                              : 'Idle'}
+                              ? `${t('runningStep')} ${robotExecution.currentStepIndex + 1}`
+                              : t('idle')}
                           </span>
                         </div>
 
@@ -2109,7 +2438,7 @@ export default function RobotSidebar({
 
                             <details className="mt-1.5 border-t border-red-500/20 pt-1.5">
                               <summary className="cursor-pointer select-none text-[8px] font-bold text-slate-400 hover:text-slate-200">
-                                Chi tiết kỹ thuật
+                                {t('technicalDetails')}
                               </summary>
                               <p className="mt-1 break-all font-mono text-[8px] leading-relaxed text-slate-400">
                                 {commandFailure.technicalDetail}
@@ -2132,8 +2461,8 @@ export default function RobotSidebar({
                                 }
                               />
                               {recoveryFeedback?.status === 'working'
-                                ? 'Đang khôi phục...'
-                                : 'Khôi phục để chạy chương trình mới'}
+                                ? t('recovering')
+                                : t('recover')}
                             </button>
 
                             {recoveryFeedback && recoveryFeedback.status !== 'working' && (
@@ -2183,7 +2512,7 @@ export default function RobotSidebar({
                               openSingleFactoryProgram(robot.id)
                             }}
                             className="flex items-center justify-center gap-1 rounded bg-violet-600/15 border border-violet-500/30 py-1 text-[9px] font-bold text-violet-300 transition hover:bg-violet-600/30 hover:text-white disabled:opacity-45"
-                            title={`Import và chạy LUA cho ${robot.robotName}`}
+                            title={`${t('importRunLuaForRobot')} ${robot.robotName}`}
                           >
                             <FileCode2 size={10} />
                             LUA
@@ -2197,9 +2526,9 @@ export default function RobotSidebar({
                                 onSimulatorDisconnectRobot(robot.id)
                               }}
                               className="flex items-center justify-center rounded bg-amber-600/15 border border-amber-500/30 py-1 text-[9px] font-bold text-amber-300 transition hover:bg-amber-600/30 hover:text-white"
-                              title="Disconnect robot này"
+                              title={t('disconnectThisRobot')}
                             >
-                              Disconnect
+                              {t('disconnect')}
                             </button>
                           ) : (
                             <button
@@ -2212,11 +2541,11 @@ export default function RobotSidebar({
                               className="flex items-center justify-center rounded bg-emerald-600/15 border border-emerald-500/30 py-1 text-[9px] font-bold text-emerald-300 transition hover:bg-emerald-600/30 hover:text-white disabled:opacity-45"
                               title={
                                 canConnectRobot
-                                  ? 'Connect robot này'
-                                  : 'Nhập Device Secret trong tab Connection trước'
+                                  ? t('connectThisRobot')
+                                  : t('enterConnectionKeyFirst')
                               }
                             >
-                              Connect
+                              {t('connect')}
                             </button>
                           )}
 
@@ -2229,11 +2558,11 @@ export default function RobotSidebar({
                             disabled={deletingRobotId === robot.id || isRobotRuntimeActive}
                             className="flex items-center justify-center gap-1 rounded bg-red-600/10 border border-red-500/30 py-1 text-[9px] font-bold text-red-300 transition hover:bg-red-600/25 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed"
                             title={
-                              isRobotRuntimeActive ? 'Disconnect robot trước khi xóa' : 'Xóa robot'
+                              isRobotRuntimeActive ? t('disconnectBeforeDelete') : t('deleteRobot')
                             }
                           >
                             <Trash2 size={10} />
-                            Xóa
+                            {t('deleteRobot')}
                           </button>
                         </div>
 
@@ -2241,13 +2570,14 @@ export default function RobotSidebar({
                           <div className="mt-3 rounded border border-[#2d2d34] bg-[#080a10] p-2">
                             {isRobotRuntimeActive && (
                               <p className="mb-2 rounded border border-amber-500/30 bg-amber-950/20 px-2 py-1 text-[10px] text-amber-200">
-                                Robot đang online/running. Disconnect trước khi sửa vị trí trong
-                                scene.
+                                {language === 'vi'
+                                  ? 'Robot đang trực tuyến. Hãy ngắt kết nối trước khi sửa vị trí.'
+                                  : 'The robot is online. Disconnect it before editing its position.'}
                               </p>
                             )}
                             <div className="mb-2 flex items-center justify-between gap-2">
                               <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                                Vị trí trong scene
+                                {t('scenePosition')}
                               </span>
 
                               <button

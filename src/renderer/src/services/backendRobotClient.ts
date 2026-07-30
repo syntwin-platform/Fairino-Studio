@@ -1,3 +1,5 @@
+import { backendFetch } from './backendFetch'
+
 export interface BackendRobotModel {
   id: string
   vendor: string
@@ -45,6 +47,18 @@ export interface BackendRobot {
   createdAt: string
   updatedAt?: string | null
   sceneBinding?: BackendRobotSceneBinding | null
+}
+
+export interface BackendCompany {
+  id: string
+  name: string
+  slug: string
+  status: string
+  currentUserRole: string
+  subscriptionPlan: string
+  maxRobots: number
+  canView3D: boolean
+  canSendCommand: boolean
 }
 
 export interface CreateBackendRobotSceneBindingRequest {
@@ -131,7 +145,7 @@ async function api<T>(
   let response: Response
 
   try {
-    response = await fetch(apiUrl(backendUrl, path), {
+    response = await backendFetch(apiUrl(backendUrl, path), {
       ...init,
       signal: controller.signal,
       headers: {
@@ -172,6 +186,17 @@ export async function listRobotModels(
   signal?: AbortSignal
 ): Promise<BackendRobotModel[]> {
   return api<BackendRobotModel[]>(backendUrl, '/api/robot-models', token, {
+    method: 'GET',
+    signal
+  })
+}
+
+export async function listCompanies(
+  backendUrl: string,
+  token: string,
+  signal?: AbortSignal
+): Promise<BackendCompany[]> {
+  return api<BackendCompany[]>(backendUrl, '/api/companies', token, {
     method: 'GET',
     signal
   })

@@ -62,11 +62,29 @@ export interface TcpPose {
   rz: number
 }
 
+export interface DeviceIoSnapshot {
+  cabinetDigitalOutputs: Record<number, boolean>
+  toolDigitalOutputs: Record<number, boolean>
+  gripperState: 'open' | 'closed'
+}
+
+export interface DeviceExecutionSnapshot {
+  currentCommandId?: string
+  state: 'Idle' | 'Running' | 'Failed'
+  currentStepIndex?: number
+  totalSteps?: number
+  progressPercent?: number
+  startedAt?: string
+  lastError?: string
+}
+
 export interface DeviceTelemetryPayload {
   robotId: string
   tcpPose: TcpPose
   jointAngles: number[]
-  temperature: number | null
+  sequenceNumber?: number
+  io?: DeviceIoSnapshot
+  execution?: DeviceExecutionSnapshot
   statusCode: string
   collisionWarning: boolean
   timestamp: string
@@ -90,11 +108,24 @@ export interface DeviceCommandResultPayload {
   completedAt: string
 }
 
+export interface TelemetryRuntimeSample {
+  recordedAt: string
+  roundTripMs: number
+  sequenceNumber?: number
+}
+
 export interface BackendSimulatorStatus {
   isRunning: boolean
   isConnected: boolean
   lastHeartbeatAt?: string
   lastTelemetryAt?: string
+  lastTelemetrySequenceNumber?: number
+  lastTelemetryRoundTripMs?: number
+  lastTelemetryStatusCode?: string
+  lastCollisionWarning?: boolean
+  lastIoSnapshot?: DeviceIoSnapshot
+  lastExecutionSnapshot?: DeviceExecutionSnapshot
+  telemetrySamples?: TelemetryRuntimeSample[]
   lastCommandAt?: string
   lastResultAt?: string
   lastError?: string
@@ -150,9 +181,23 @@ export const defaultRobotRuntimeConfig: RobotRuntimeConfig = {
   ]
 }
 
+export const LOCAL_BACKEND_URL = 'http://localhost:5200'
+export const CLOUD_STAGING_BACKEND_URL = 'https://syntwin-api-staging-v7emjerksa-as.a.run.app'
+
+export const BACKEND_ENVIRONMENT_OPTIONS = [
+  {
+    label: 'Local Backend',
+    url: LOCAL_BACKEND_URL
+  },
+  {
+    label: 'Cloud Staging Backend',
+    url: CLOUD_STAGING_BACKEND_URL
+  }
+] as const
+
 export const defaultBackendSimulatorConfig: BackendSimulatorConfig = {
   enabled: false,
-  backendUrl: 'http://localhost:5200',
+  backendUrl: LOCAL_BACKEND_URL,
   robotId: '',
   deviceSecret: '',
   heartbeatIntervalMs: 3000,

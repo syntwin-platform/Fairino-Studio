@@ -4,6 +4,8 @@ import type { IpcRendererEvent } from 'electron'
 
 import type {
   AppApi,
+  BackendRequestOptions,
+  BackendResponsePayload,
   OpenDialogOptions,
   OpenDialogResult,
   SaveDialogOptions,
@@ -28,6 +30,9 @@ const api: AppApi = {
 
   readFile: (filePath) =>
     ipcRenderer.invoke('read-file', filePath) as ReturnType<AppApi['readFile']>,
+
+  backendRequest: (url: string, options?: BackendRequestOptions): Promise<BackendResponsePayload> =>
+    ipcRenderer.invoke('backend-request', url, options) as Promise<BackendResponsePayload>,
 
   onMenuAction: (callback) => {
     const listener = (_event: IpcRendererEvent, action: string): void => callback(action)

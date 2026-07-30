@@ -1,4 +1,5 @@
 import type { RobotRuntimeConfig } from '../types/backendDevice'
+import { backendFetch } from './backendFetch'
 
 function apiUrl(backendUrl: string, path: string): string {
   return `${backendUrl.replace(/\/+$/, '')}${path}`
@@ -24,7 +25,7 @@ export async function getRobotRuntimeConfig(
   robotId: string,
   token: string
 ): Promise<RobotRuntimeConfig> {
-  const response = await fetch(apiUrl(backendUrl, `/api/robots/${robotId}/runtime-config`), {
+  const response = await backendFetch(apiUrl(backendUrl, `/api/robots/${robotId}/runtime-config`), {
     method: 'GET',
     headers: {
       Authorization: `Bearer ${token}`

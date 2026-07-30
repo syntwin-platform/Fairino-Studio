@@ -5,14 +5,13 @@ import {
   Download,
   History,
   LoaderCircle,
-  LogIn,
-  LogOut,
   RefreshCw,
   X,
   Shield
 } from 'lucide-react'
 import { useRobotStore } from '../store/robotStore'
 import CenterModal from './ui/CenterModal'
+import { backendFetch } from '../services/backendFetch'
 import { WorkflowStep } from '../types/robot.types'
 import {
   BackendSimulatorConfig,
@@ -28,8 +27,8 @@ import RobotSafetyPolicyPanel from './RobotSafetyPolicyPanel'
 import TelemetryHistoryPanel from './TelemetryHistoryPanel'
 import { getCachedDeviceRuntimeSessionId } from '../services/backendDeviceSession'
 import { useBackendAuthStore } from '../store/backendAuthStore'
+import { translations } from '../i18n/translations'
 const CONFIG_KEY = 'syntwin.backendSimulator.config'
-const EMAIL_KEY = 'syntwin.backendProgram.email'
 
 interface ProgramResponse {
   id: string
@@ -69,11 +68,15 @@ interface ProgramStepRequest {
   payload: Record<string, unknown>
 }
 
-function getConfig(): BackendSimulatorConfig {
+function getConfig(language: 'vi' | 'en'): BackendSimulatorConfig {
   const raw = localStorage.getItem(CONFIG_KEY)
 
   if (!raw) {
-    throw new Error('Hãy cấu hình Backend Simulator trước')
+    throw new Error(
+      language === 'vi'
+        ? 'Hãy chọn môi trường kết nối trước.'
+        : 'Select a connection environment first.'
+    )
   }
 
   const config = JSON.parse(raw) as BackendSimulatorConfig
@@ -81,11 +84,13 @@ function getConfig(): BackendSimulatorConfig {
   const activeRobotId = selectedRobotId?.trim() || config.robotId?.trim()
 
   if (!config.backendUrl?.trim()) {
-    throw new Error('Backend URL đang trống')
+    throw new Error(
+      language === 'vi' ? 'Chưa chọn môi trường kết nối.' : 'No connection environment is selected.'
+    )
   }
 
   if (!activeRobotId) {
-    throw new Error('Robot ID đang trống')
+    throw new Error(language === 'vi' ? 'Chưa chọn robot.' : 'No robot is selected.')
   }
 
   return {
@@ -224,7 +229,7 @@ function convertStep(step: WorkflowStep, index: number): ProgramStepRequest {
 
 async function api<T>(backendUrl: string, path: string, init: RequestInit): Promise<T> {
   const baseUrl = backendUrl.replace(/\/+$/, '')
-  const response = await fetch(`${baseUrl}${path}`, init)
+  const response = await backendFetch(`${baseUrl}${path}`, init)
 
   if (!response.ok) {
     const text = await response.text()
@@ -321,9 +326,14 @@ function getCommandFailureMetadata(command?: CommandResponse): CommandFailureMet
   return rawPayload.failure as CommandFailureMetadata
 }
 
-function getCommandFailureMessage(command?: CommandResponse): string {
+function getCommandFailureMessage(
+  command: CommandResponse | undefined,
+  language: 'vi' | 'en'
+): string {
   if (!command) {
-    return 'Xem lỗi trong Backend Simulator.'
+    return language === 'vi'
+      ? 'Xem chi tiết lỗi trong bảng điều khiển kết nối.'
+      : 'See error details in the connection panel.'
   }
 
   const metadata = getCommandFailureMetadata(command)
@@ -333,7 +343,9 @@ function getCommandFailureMessage(command?: CommandResponse): string {
   const message = resultMessage || failureReason || technicalMessage
 
   if (!message) {
-    return 'Xem lỗi trong Backend Simulator.'
+    return language === 'vi'
+      ? 'Xem chi tiết lỗi trong bảng điều khiển kết nối.'
+      : 'See error details in the connection panel.'
   }
 
   if (metadata?.stepIndex || metadata?.stepType || metadata?.stepLabel) {
@@ -548,15 +560,11 @@ export default function BackendProgramControls(): React.ReactElement {
   const setSelectedStepId = useRobotStore((state) => state.setSelectedStepId)
   const robots = useRobotStore((state) => state.robots)
   const selectedRobotId = useRobotStore((state) => state.selectedRobotId)
-
-  const [email, setEmail] = useState(() => localStorage.getItem(EMAIL_KEY) || '')
-
-  const [password, setPassword] = useState('')
+  const language = useRobotStore((state) => state.language)
+  const t = (key: keyof typeof translations.vi): string => translations[language][key]
 
   const token = useBackendAuthStore((state) => state.accessToken)
   const backendConnectivity = useBackendAuthStore((state) => state.connectivity)
-  const setBackendAccessToken = useBackendAuthStore((state) => state.setAccessToken)
-  const clearBackendAccessToken = useBackendAuthStore((state) => state.clearAccessToken)
   const setBackendConnectivity = useBackendAuthStore((state) => state.setConnectivity)
 
   const [busy, setBusy] = useState(false)
@@ -585,12 +593,12 @@ export default function BackendProgramControls(): React.ReactElement {
   const anchorRef = useRef<HTMLButtonElement | null>(null)
 
   const activeRobot = robots.find((robot) => robot.id === selectedRobotId) ?? null
-  const activeRobotTitle = activeRobot?.name ?? 'No robot selected'
+  const activeRobotTitle = activeRobot?.name ?? t('noRobotSelected')
   const activeRobotSubtitle = activeRobot
     ? activeRobot.model
     : selectedRobotId
       ? selectedRobotId
-      : 'Select a robot before running backend commands'
+      : t('selectRobotBeforeCommands')
 
   const selectedCommand = selectedCommandDetailId
     ? (commandHistory.find((c) => c.id === selectedCommandDetailId) ?? null)
@@ -618,7 +626,7 @@ export default function BackendProgramControls(): React.ReactElement {
       }
 
       try {
-        const config = getConfig()
+        const config = getConfig(language)
 
         const commands = await api<CommandResponse[]>(
           config.backendUrl,
@@ -634,7 +642,11 @@ export default function BackendProgramControls(): React.ReactElement {
         setBackendConnectivity('online')
       } catch (error) {
         const errorMessage =
-          error instanceof Error ? error.message : 'Failed to load command history.'
+          error instanceof Error
+            ? error.message
+            : language === 'vi'
+              ? 'Không tải được lịch sử lệnh.'
+              : 'Failed to load command history.'
         setHistoryError(errorMessage)
 
         if (isBackendNetworkError(error)) {
@@ -646,7 +658,7 @@ export default function BackendProgramControls(): React.ReactElement {
         }
       }
     },
-    [token, setBackendConnectivity]
+    [language, token, setBackendConnectivity]
   )
 
   useEffect(() => {
@@ -678,68 +690,29 @@ export default function BackendProgramControls(): React.ReactElement {
     anchorRef.current = null
   }, [selectedRobotId])
 
-  const handleLogin = async (): Promise<void> => {
-    setBusy(true)
-    setFailed(false)
-    setMessage('Đang đăng nhập...')
-    setBackendConnectivity('checking')
-
-    try {
-      const config = getConfig()
-
-      const result = await api<{ accessToken: string }>(config.backendUrl, '/api/auth/login', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          email: email.trim(),
-          password
-        })
-      })
-
-      localStorage.setItem(EMAIL_KEY, email.trim())
-
-      setBackendAccessToken(result.accessToken)
-      setBackendConnectivity('online')
-      setPassword('')
-      setMessage('Đăng nhập thành công')
-    } catch (error) {
-      setFailed(true)
-      setMessage(error instanceof Error ? error.message : 'Đăng nhập thất bại')
-
-      if (isBackendNetworkError(error)) {
-        setBackendConnectivity(
-          'offline',
-          error instanceof Error ? error.message : 'Không kết nối được Backend.'
-        )
-      } else {
-        setBackendConnectivity('online')
-      }
-    } finally {
-      setBusy(false)
-    }
-  }
-
   const handleExportBackendLua = async (): Promise<void> => {
     if (!token) {
       setFailed(true)
-      setMessage('Hãy đăng nhập trước')
+      setMessage(language === 'vi' ? 'Hãy đăng nhập trước.' : 'Please sign in first.')
       return
     }
 
     if (!lastProgramId) {
       setFailed(true)
-      setMessage('Chưa có Backend Program để export')
+      setMessage(
+        language === 'vi'
+          ? 'Chưa có chương trình nào để xuất.'
+          : 'There is no program available to export.'
+      )
       return
     }
 
     setBusy(true)
     setFailed(false)
-    setMessage('Đang export LUA từ Backend...')
+    setMessage(language === 'vi' ? 'Đang xuất chương trình LUA...' : 'Exporting the LUA program...')
 
     try {
-      const config = getConfig()
+      const config = getConfig(language)
 
       const exported = await exportLuaProgramFromBackend(
         config.backendUrl,
@@ -759,10 +732,18 @@ export default function BackendProgramControls(): React.ReactElement {
       link.click()
       URL.revokeObjectURL(url)
 
-      setMessage(`Đã export ${exported.fileName}`)
+      setMessage(
+        language === 'vi' ? `Đã xuất ${exported.fileName}` : `Exported ${exported.fileName}`
+      )
     } catch (error) {
       setFailed(true)
-      setMessage(error instanceof Error ? error.message : 'Export LUA thất bại')
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : language === 'vi'
+            ? 'Không thể xuất chương trình LUA.'
+            : 'Unable to export the LUA program.'
+      )
     } finally {
       setBusy(false)
     }
@@ -771,13 +752,17 @@ export default function BackendProgramControls(): React.ReactElement {
   const handleSaveAndRun = async (): Promise<void> => {
     if (!token) {
       setFailed(true)
-      setMessage('Hãy đăng nhập trước')
+      setMessage(language === 'vi' ? 'Hãy đăng nhập trước.' : 'Please sign in first.')
       return
     }
 
     if (steps.length === 0) {
       setFailed(true)
-      setMessage('Workflow chưa có step')
+      setMessage(
+        language === 'vi'
+          ? 'Quy trình chưa có bước thực thi.'
+          : 'The workflow has no execution steps.'
+      )
       return
     }
 
@@ -786,9 +771,13 @@ export default function BackendProgramControls(): React.ReactElement {
     setSafetyDiagnostics(null)
 
     try {
-      const config = getConfig()
+      const config = getConfig(language)
       const name = (projectName.trim() || 'fairino_ui_program').slice(0, 100)
-      setMessage('Đang tải Runtime Config...')
+      setMessage(
+        language === 'vi'
+          ? 'Đang tải cấu hình vận hành...'
+          : 'Loading the operating configuration...'
+      )
 
       const runtimeConfigWarning = await loadRuntimeConfigForProgram(config, token)
 
@@ -796,7 +785,7 @@ export default function BackendProgramControls(): React.ReactElement {
         console.warn(`Runtime config fallback: ${runtimeConfigWarning}`)
       }
 
-      setMessage('Đang tạo Program...')
+      setMessage(language === 'vi' ? 'Đang tạo chương trình...' : 'Creating the program...')
 
       const program = await api<ProgramResponse>(
         config.backendUrl,
@@ -814,7 +803,9 @@ export default function BackendProgramControls(): React.ReactElement {
       )
       setLastProgramId(program.id)
 
-      setMessage('Đang Publish...')
+      setMessage(
+        language === 'vi' ? 'Đang kiểm tra và phát hành...' : 'Validating and publishing...'
+      )
 
       try {
         await api<ProgramResponse>(
@@ -842,7 +833,11 @@ export default function BackendProgramControls(): React.ReactElement {
         throw publishErr
       }
 
-      setMessage('Đang gửi RunProgram...')
+      setMessage(
+        language === 'vi'
+          ? 'Đang gửi yêu cầu chạy chương trình...'
+          : 'Sending the program run request...'
+      )
 
       let command: CommandResponse
       try {
@@ -882,7 +877,9 @@ export default function BackendProgramControls(): React.ReactElement {
 
       let latestCommand: CommandResponse = command
       let status = latestCommand.status
-      setMessage(`RunProgram: ${status}`)
+      setMessage(
+        language === 'vi' ? `Trạng thái chương trình: ${status}` : `Program status: ${status}`
+      )
 
       for (let attempt = 0; attempt < 300; attempt++) {
         if (
@@ -911,132 +908,86 @@ export default function BackendProgramControls(): React.ReactElement {
         latestCommand = commands.find((item) => item.id === command.id) || latestCommand
         status = latestCommand.status || 'Unknown'
 
-        setMessage(`RunProgram: ${status}`)
+        setMessage(
+          language === 'vi' ? `Trạng thái chương trình: ${status}` : `Program status: ${status}`
+        )
       }
 
       if (status !== 'Completed') {
-        const failureMessage = getCommandFailureMessage(latestCommand)
-        throw new Error(`RunProgram ${status}: ${failureMessage}`)
+        const failureMessage = getCommandFailureMessage(latestCommand, language)
+        throw new Error(
+          language === 'vi'
+            ? `Chạy chương trình ${status}: ${failureMessage}`
+            : `Program run ${status}: ${failureMessage}`
+        )
       }
 
-      setMessage('RunProgram: Completed')
+      setMessage(language === 'vi' ? 'Chương trình đã hoàn tất.' : 'Program completed.')
     } catch (error) {
       setFailed(true)
-      setMessage(error instanceof Error ? error.message : 'Save and Run thất bại')
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : language === 'vi'
+            ? 'Không thể lưu và chạy chương trình.'
+            : 'Unable to save and run the program.'
+      )
     } finally {
       setBusy(false)
     }
   }
 
-  const handleLogout = (): void => {
-    clearBackendAccessToken()
-    setPassword('')
-    setMessage('')
-    setFailed(false)
-    setSafetyDiagnostics(null)
-    setIsTelemetryModalOpen(false)
-    setCommandHistory([])
-    setHistoryError('')
-    setSelectedCommandDetailId(null)
-    anchorRef.current = null
-  }
-
   return (
     <div className="shrink-0 border-b border-[#2d2d34] bg-[#18181c] p-3 text-slate-200">
       <div className="mb-2 flex items-center justify-between">
-        <span className="text-[10px] font-bold uppercase text-slate-400">Backend Program</span>
+        <span className="text-[10px] font-bold uppercase text-slate-400">
+          {language === 'vi' ? 'Điều khiển chương trình' : 'Program control'}
+        </span>
 
         <span
           className={
-            token && backendConnectivity === 'online'
+            backendConnectivity === 'online'
               ? 'text-[10px] text-emerald-400'
-              : token && backendConnectivity === 'offline'
+              : backendConnectivity === 'offline'
                 ? 'text-[10px] text-amber-300'
-                : token
-                  ? 'text-[10px] text-blue-300'
-                  : 'text-[10px] text-slate-500'
+                : 'text-[10px] text-blue-300'
           }
         >
-          {!token
-            ? 'Chưa đăng nhập'
-            : backendConnectivity === 'offline'
-              ? 'Backend offline'
-              : backendConnectivity === 'checking'
-                ? 'Đang kiểm tra...'
-                : 'Đã đăng nhập'}
+          {backendConnectivity === 'offline'
+            ? t('systemOffline')
+            : backendConnectivity === 'checking'
+              ? t('checking')
+              : t('signedIn')}
         </span>
       </div>
 
       <div className="mb-3 rounded border border-[#343849] bg-[#10131b] px-3 py-2">
         <div className="text-[9px] font-bold uppercase tracking-wider text-slate-500">
-          Active Robot
+          {t('activeRobot')}
         </div>
         <div className="mt-1 truncate text-xs font-semibold text-white">{activeRobotTitle}</div>
         <div className="mt-0.5 truncate text-[10px] text-slate-400">{activeRobotSubtitle}</div>
       </div>
 
-      {!token ? (
-        <div className="grid grid-cols-2 gap-2">
-          <input
-            type="email"
-            value={email}
-            onChange={(event) => setEmail(event.target.value)}
-            placeholder="Email"
-            className="min-w-0 rounded border border-[#393942] bg-[#0f0f12] px-2 py-1.5 text-[11px] text-white outline-none"
-          />
+      <div className="flex gap-2">
+        <button
+          onClick={() => void handleSaveAndRun()}
+          disabled={busy || steps.length === 0}
+          className="flex flex-1 items-center justify-center gap-1.5 rounded bg-blue-600 px-3 py-2 text-xs font-bold text-white transition hover:bg-blue-500 disabled:opacity-40"
+        >
+          {busy ? <LoaderCircle size={13} className="animate-spin" /> : <CloudUpload size={13} />}
+          {t('savePublishRun')}
+        </button>
 
-          <input
-            type="password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') {
-                void handleLogin()
-              }
-            }}
-            placeholder="Mật khẩu"
-            className="min-w-0 rounded border border-[#393942] bg-[#0f0f12] px-2 py-1.5 text-[11px] text-white outline-none"
-          />
-
-          <button
-            onClick={() => void handleLogin()}
-            disabled={busy || !email.trim() || !password}
-            className="col-span-2 flex items-center justify-center gap-1.5 rounded bg-blue-600 px-2 py-1.5 text-xs font-semibold text-white disabled:opacity-40"
-          >
-            {busy ? <LoaderCircle size={12} className="animate-spin" /> : <LogIn size={12} />}
-            Đăng nhập Backend
-          </button>
-        </div>
-      ) : (
-        <div className="flex gap-2">
-          <button
-            onClick={() => void handleSaveAndRun()}
-            disabled={busy || steps.length === 0}
-            className="flex flex-1 items-center justify-center gap-1.5 rounded bg-blue-600 px-3 py-2 text-xs font-bold text-white transition hover:bg-blue-500 disabled:opacity-40"
-          >
-            {busy ? <LoaderCircle size={13} className="animate-spin" /> : <CloudUpload size={13} />}
-            Lưu, Publish và Chạy
-          </button>
-
-          <button
-            onClick={() => void handleExportBackendLua()}
-            disabled={busy || !lastProgramId}
-            title="Export LUA từ Backend"
-            className="rounded border border-[#393942] px-2 text-slate-400 hover:border-blue-500 hover:text-white disabled:opacity-40"
-          >
-            <Download size={13} />
-          </button>
-
-          <button
-            onClick={handleLogout}
-            disabled={busy}
-            title="Đăng xuất"
-            className="rounded border border-[#393942] px-2 text-slate-400"
-          >
-            <LogOut size={13} />
-          </button>
-        </div>
-      )}
+        <button
+          onClick={() => void handleExportBackendLua()}
+          disabled={busy || !lastProgramId}
+          title={t('exportLuaFromSystem')}
+          className="rounded border border-[#393942] px-2 text-slate-400 hover:border-blue-500 hover:text-white disabled:opacity-40"
+        >
+          <Download size={13} />
+        </button>
+      </div>
 
       {/* Safety diagnostics panel (publish / RunProgram 400 response) */}
       {safetyDiagnostics && (
@@ -1070,7 +1021,7 @@ export default function BackendProgramControls(): React.ReactElement {
             className="flex flex-1 items-center justify-center gap-1.5 rounded border border-[#343849] bg-[#242833] py-2 text-[10px] font-bold uppercase tracking-wider text-slate-300 transition hover:bg-[#2d313f] hover:text-white"
           >
             <Shield size={12} className="text-blue-400" />
-            Safety Policy
+            {t('safetyPolicy')}
           </button>
 
           <button
@@ -1079,7 +1030,7 @@ export default function BackendProgramControls(): React.ReactElement {
             className="flex flex-1 items-center justify-center gap-1.5 rounded border border-[#343849] bg-[#242833] py-2 text-[10px] font-bold uppercase tracking-wider text-slate-300 transition hover:bg-[#2d313f] hover:text-white"
           >
             <History size={12} className="text-blue-400" />
-            History ({commandHistory.length})
+            {t('commandHistory')} ({commandHistory.length})
           </button>
 
           <button
@@ -1088,7 +1039,7 @@ export default function BackendProgramControls(): React.ReactElement {
             className="flex items-center justify-center gap-1.5 rounded border border-[#343849] bg-[#242833] py-2 text-[10px] font-bold uppercase tracking-wider text-slate-300 transition hover:bg-[#2d313f] hover:text-white"
           >
             <Activity size={12} className="text-blue-400" />
-            Telemetry
+            {t('telemetryHistory')}
           </button>
         </div>
       )}
@@ -1098,15 +1049,15 @@ export default function BackendProgramControls(): React.ReactElement {
         (() => {
           let cfg: BackendSimulatorConfig | null = null
           try {
-            cfg = getConfig()
+            cfg = getConfig(language)
           } catch {
             /* not configured yet */
           }
 
           return cfg ? (
             <CenterModal
-              title="Robot Safety Policy"
-              subtitle={`Robot ID: ${cfg.robotId}`}
+              title={t('safetyPolicy')}
+              subtitle={`${t('robotCode')}: ${cfg.robotId}`}
               icon={<Shield size={16} />}
               open={isSafetyModalOpen}
               onClose={() => setIsSafetyModalOpen(false)}
@@ -1127,15 +1078,15 @@ export default function BackendProgramControls(): React.ReactElement {
         (() => {
           let cfg: BackendSimulatorConfig | null = null
           try {
-            cfg = getConfig()
+            cfg = getConfig(language)
           } catch {
             /* not configured yet */
           }
 
           return cfg ? (
             <CenterModal
-              title="Telemetry History"
-              subtitle={`Robot ID: ${cfg.robotId}`}
+              title={t('telemetryHistory')}
+              subtitle={`${t('robotCode')}: ${cfg.robotId}`}
               icon={<Activity size={16} />}
               open={isTelemetryModalOpen}
               onClose={() => setIsTelemetryModalOpen(false)}
@@ -1154,8 +1105,8 @@ export default function BackendProgramControls(): React.ReactElement {
       {/* Command History Modal */}
       {token && (
         <CenterModal
-          title="Command History"
-          subtitle="Các lệnh đã gửi tới Robot từ Backend"
+          title={t('commandHistory')}
+          subtitle={t('commandsSentToRobot')}
           icon={<History size={16} />}
           open={isHistoryModalOpen}
           onClose={() => {
@@ -1167,7 +1118,7 @@ export default function BackendProgramControls(): React.ReactElement {
         >
           <div className="flex flex-col h-[60vh] text-slate-200">
             <div className="flex justify-between items-center mb-3">
-              <span className="text-xs text-slate-400">Hiển thị 10 command gần nhất</span>
+              <span className="text-xs text-slate-400">{t('latestTenCommands')}</span>
               <button
                 type="button"
                 disabled={historyLoading || busy}
@@ -1175,7 +1126,7 @@ export default function BackendProgramControls(): React.ReactElement {
                 className="flex items-center gap-1 px-3 py-1 rounded border border-[#343849] bg-[#242833] text-xs text-slate-300 hover:bg-[#2d313f] hover:text-white transition disabled:opacity-40"
               >
                 <RefreshCw size={12} className={historyLoading ? 'animate-spin' : ''} />
-                Refresh
+                {t('refresh')}
               </button>
             </div>
 
@@ -1188,7 +1139,9 @@ export default function BackendProgramControls(): React.ReactElement {
             <div className="flex-1 overflow-y-auto border border-[#343849] rounded-lg bg-[#0c0e16]">
               {commandHistory.length === 0 ? (
                 <p className="p-8 text-center text-xs text-slate-500">
-                  Chưa có lịch sử lệnh nào được thực thi.
+                  {language === 'vi'
+                    ? 'Chưa có lịch sử lệnh nào được thực thi.'
+                    : 'No command history is available yet.'}
                 </p>
               ) : (
                 commandHistory.map((command) => {
@@ -1196,7 +1149,7 @@ export default function BackendProgramControls(): React.ReactElement {
                     command.status === 'Failed' ||
                     command.status === 'Timeout' ||
                     command.status === 'Cancelled'
-                      ? getCommandFailureMessage(command)
+                      ? getCommandFailureMessage(command, language)
                       : ''
 
                   const isDetailOpen = selectedCommandDetailId === command.id

@@ -1,5 +1,6 @@
 import { SafetyValidationError } from './backendSafetyClient'
 import type { SafetyDiagnostic } from '../types/backendDevice'
+import { backendFetch } from './backendFetch'
 
 export interface BackendProgramContext {
   backendUrl: string
@@ -33,7 +34,7 @@ async function request<T>(
   path: string,
   init: RequestInit
 ): Promise<T> {
-  const response = await fetch(url(context, path), {
+  const response = await backendFetch(url(context, path), {
     ...init,
     headers: {
       'Content-Type': 'application/json',

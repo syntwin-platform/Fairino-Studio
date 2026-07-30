@@ -5,11 +5,15 @@ import {
   PendingDeviceCommand,
   DeviceSessionResponse
 } from '../types/backendDevice'
+import { backendFetch } from './backendFetch'
 
 export class BackendDeviceRequestError extends Error {
   constructor(
     readonly status: number,
-    message: string
+    message: string,
+    readonly errorCode?: string,
+    readonly retryable = false,
+    readonly retryAfterMs?: number
   ) {
     super(message)
     this.name = 'BackendDeviceRequestError'
@@ -18,7 +22,7 @@ export class BackendDeviceRequestError extends Error {
 
 export class BackendDeviceContractError extends Error {
   constructor(message: string) {
-    super(`Factory Run arm response contract mismatch: ${message}`)
+    super(`Device response contract mismatch: ${message}`)
     this.name = 'BackendDeviceContractError'
   }
 }
@@ -61,6 +65,23 @@ export interface DeviceFactoryRunStartedResponse {
   actualStartedAtUtc: string
   startLateByMs: number
   actualStartSkewMs?: number | null
+}
+
+export interface DeviceFactoryRunProgramArtifactStep {
+  orderIndex: number
+  stepType: string
+  label?: string
+  payload?: unknown
+}
+
+export interface DeviceFactoryRunProgramArtifactResponse {
+  factoryRunId: string
+  targetId: string
+  factoryRunProgramId: string
+  contractVersion: number
+  compiledProgramHash: string
+  programName: string
+  steps: DeviceFactoryRunProgramArtifactStep[]
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -141,6 +162,64 @@ export function parseDeviceFactoryRunArmResponse(value: unknown): DeviceFactoryR
   }
 }
 
+export function parseDeviceFactoryRunProgramArtifactResponse(
+  value: unknown
+): DeviceFactoryRunProgramArtifactResponse {
+  if (!isRecord(value)) {
+    throw new BackendDeviceContractError('program artifact response body must be an object.')
+  }
+
+  if (value.contractVersion !== 1) {
+    throw new BackendDeviceContractError('program artifact contractVersion must be 1.')
+  }
+
+  if (!Array.isArray(value.steps) || value.steps.length === 0) {
+    throw new BackendDeviceContractError('program artifact steps must be a non-empty array.')
+  }
+
+  const orderIndexes = new Set<number>()
+  const steps = value.steps.map((rawStep, index): DeviceFactoryRunProgramArtifactStep => {
+    if (!isRecord(rawStep)) {
+      throw new BackendDeviceContractError(`program artifact step ${index + 1} must be an object.`)
+    }
+
+    if (!Number.isInteger(rawStep.orderIndex) || (rawStep.orderIndex as number) < 1) {
+      throw new BackendDeviceContractError(
+        `program artifact step ${index + 1} has an invalid orderIndex.`
+      )
+    }
+
+    const orderIndex = rawStep.orderIndex as number
+    if (orderIndexes.has(orderIndex)) {
+      throw new BackendDeviceContractError(
+        `program artifact contains duplicate orderIndex ${orderIndex}.`
+      )
+    }
+    orderIndexes.add(orderIndex)
+
+    if (typeof rawStep.stepType !== 'string' || !rawStep.stepType.trim()) {
+      throw new BackendDeviceContractError(`program artifact step ${orderIndex} requires stepType.`)
+    }
+
+    return {
+      orderIndex,
+      stepType: rawStep.stepType.trim(),
+      label: typeof rawStep.label === 'string' ? rawStep.label : undefined,
+      payload: rawStep.payload
+    }
+  })
+
+  return {
+    factoryRunId: readRequiredString(value, 'factoryRunId'),
+    targetId: readRequiredString(value, 'targetId'),
+    factoryRunProgramId: readRequiredString(value, 'factoryRunProgramId'),
+    contractVersion: 1,
+    compiledProgramHash: readRequiredString(value, 'compiledProgramHash'),
+    programName: readRequiredString(value, 'programName'),
+    steps: steps.sort((first, second) => first.orderIndex - second.orderIndex)
+  }
+}
+
 function apiUrl(config: BackendSimulatorConfig, path: string): string {
   return `${config.backendUrl.replace(/\/+$/, '')}${path}`
 }
@@ -167,10 +246,52 @@ async function readErrorMessage(response: Response): Promise<string> {
     : `HTTP ${response.status}: ${response.statusText}`
 }
 
+async function readDeviceRequestError(response: Response): Promise<BackendDeviceRequestError> {
+  const body = await response.text().catch(() => '')
+  let errorCode: string | undefined
+  let retryable = false
+  let retryAfterMs: number | undefined
+  let message = body.trim() || response.statusText
+
+  if (body.trim()) {
+    try {
+      const parsed = JSON.parse(body) as unknown
+      if (isRecord(parsed)) {
+        if (typeof parsed.message === 'string' && parsed.message.trim()) {
+          message = parsed.message.trim()
+        }
+        if (typeof parsed.errorCode === 'string' && parsed.errorCode.trim()) {
+          errorCode = parsed.errorCode.trim()
+        }
+        if (typeof parsed.retryable === 'boolean') {
+          retryable = parsed.retryable
+        }
+        if (
+          typeof parsed.retryAfterMs === 'number' &&
+          Number.isFinite(parsed.retryAfterMs) &&
+          parsed.retryAfterMs >= 0
+        ) {
+          retryAfterMs = Math.round(parsed.retryAfterMs)
+        }
+      }
+    } catch {
+      // Keep the raw response body for backward-compatible, non-JSON errors.
+    }
+  }
+
+  return new BackendDeviceRequestError(
+    response.status,
+    `HTTP ${response.status}: ${message}`,
+    errorCode,
+    retryable,
+    retryAfterMs
+  )
+}
+
 export async function createDeviceSession(
   config: BackendSimulatorConfig
 ): Promise<DeviceSessionResponse> {
-  const response = await fetch(apiUrl(config, '/api/device/session'), {
+  const response = await backendFetch(apiUrl(config, '/api/device/session'), {
     method: 'POST',
     headers: deviceSessionHeaders(config)
   })
@@ -187,7 +308,7 @@ export async function postHeartbeat(
   accessToken: string,
   signal?: AbortSignal
 ): Promise<void> {
-  const response = await fetch(apiUrl(config, '/api/device/heartbeat'), {
+  const response = await backendFetch(apiUrl(config, '/api/device/heartbeat'), {
     method: 'POST',
     headers: deviceBearerHeaders(accessToken),
     signal
@@ -204,7 +325,7 @@ export async function postTelemetry(
   accessToken: string,
   signal?: AbortSignal
 ): Promise<void> {
-  const response = await fetch(apiUrl(config, '/api/device/telemetry'), {
+  const response = await backendFetch(apiUrl(config, '/api/device/telemetry'), {
     method: 'POST',
     headers: deviceBearerHeaders(accessToken),
     body: JSON.stringify(telemetry),
@@ -227,11 +348,14 @@ export async function getPendingCommand(
     waitSeconds: '5'
   })
 
-  const response = await fetch(apiUrl(config, `/api/device/commands/pending?${query.toString()}`), {
-    method: 'GET',
-    headers: deviceBearerHeaders(accessToken),
-    signal
-  })
+  const response = await backendFetch(
+    apiUrl(config, `/api/device/commands/pending?${query.toString()}`),
+    {
+      method: 'GET',
+      headers: deviceBearerHeaders(accessToken),
+      signal
+    }
+  )
 
   if (response.status === 204) {
     return null
@@ -250,7 +374,7 @@ export async function postCommandResult(
   accessToken: string,
   signal?: AbortSignal
 ): Promise<void> {
-  const response = await fetch(apiUrl(config, '/api/device/commands/result'), {
+  const response = await backendFetch(apiUrl(config, '/api/device/commands/result'), {
     method: 'POST',
     headers: deviceBearerHeaders(accessToken),
     body: JSON.stringify(result),
@@ -268,7 +392,7 @@ export async function postFactoryRunArmed(
   accessToken: string,
   signal?: AbortSignal
 ): Promise<DeviceFactoryRunArmResponse> {
-  const response = await fetch(apiUrl(config, '/api/device/factory-runs/armed'), {
+  const response = await backendFetch(apiUrl(config, '/api/device/factory-runs/armed'), {
     method: 'POST',
     headers: deviceBearerHeaders(accessToken),
     body: JSON.stringify(requestBody),
@@ -276,7 +400,7 @@ export async function postFactoryRunArmed(
   })
 
   if (!response.ok) {
-    throw new BackendDeviceRequestError(response.status, await readErrorMessage(response))
+    throw await readDeviceRequestError(response)
   }
 
   return parseDeviceFactoryRunArmResponse(await response.json())
@@ -288,7 +412,7 @@ export async function postFactoryRunStarted(
   accessToken: string,
   signal?: AbortSignal
 ): Promise<DeviceFactoryRunStartedResponse> {
-  const response = await fetch(apiUrl(config, '/api/device/factory-runs/started'), {
+  const response = await backendFetch(apiUrl(config, '/api/device/factory-runs/started'), {
     method: 'POST',
     headers: deviceBearerHeaders(accessToken),
     body: JSON.stringify(requestBody),
@@ -300,4 +424,31 @@ export async function postFactoryRunStarted(
   }
 
   return (await response.json()) as DeviceFactoryRunStartedResponse
+}
+
+export async function getFactoryRunProgramArtifact(
+  config: BackendSimulatorConfig,
+  factoryRunId: string,
+  targetId: string,
+  accessToken: string,
+  signal?: AbortSignal
+): Promise<DeviceFactoryRunProgramArtifactResponse> {
+  const response = await backendFetch(
+    apiUrl(
+      config,
+      `/api/device/factory-runs/${encodeURIComponent(factoryRunId)}` +
+        `/targets/${encodeURIComponent(targetId)}/program-artifact`
+    ),
+    {
+      method: 'GET',
+      headers: deviceBearerHeaders(accessToken),
+      signal
+    }
+  )
+
+  if (!response.ok) {
+    throw await readDeviceRequestError(response)
+  }
+
+  return parseDeviceFactoryRunProgramArtifactResponse(await response.json())
 }

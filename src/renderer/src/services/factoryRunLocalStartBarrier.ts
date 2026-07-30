@@ -289,6 +289,12 @@ export class FactoryRunLocalStartBarrierCoordinator {
     return barrier.expectedParticipantCount
   }
 
+  clear(reason = 'Factory session cleared.'): void {
+    for (const [factoryRunId, barrier] of [...this.barriers.entries()]) {
+      this.rejectBarrier(factoryRunId, barrier, reason)
+    }
+  }
+
   private createBarrier(
     factoryRunId: string,
     scheduledAtMs: number,

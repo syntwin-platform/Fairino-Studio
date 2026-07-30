@@ -1,5 +1,15 @@
-import { describe, expect, it } from 'vitest'
-import { BackendDeviceContractError, parseDeviceFactoryRunArmResponse } from './backendDeviceClient'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import {
+  BackendDeviceContractError,
+  BackendDeviceRequestError,
+  parseDeviceFactoryRunArmResponse,
+  parseDeviceFactoryRunProgramArtifactResponse,
+  postFactoryRunArmed
+} from './backendDeviceClient'
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 function validArmResponse(): Record<string, unknown> {
   return {
@@ -51,5 +61,100 @@ describe('parseDeviceFactoryRunArmResponse', () => {
 
     expect(() => parseDeviceFactoryRunArmResponse(negative)).toThrow(/non-negative integers/i)
     expect(() => parseDeviceFactoryRunArmResponse(fractional)).toThrow(/non-negative integers/i)
+  })
+})
+
+describe('parseDeviceFactoryRunProgramArtifactResponse', () => {
+  it('accepts and sorts a valid shared program artifact', () => {
+    const result = parseDeviceFactoryRunProgramArtifactResponse({
+      factoryRunId: 'run-artifact',
+      targetId: 'target-artifact',
+      factoryRunProgramId: 'program-artifact',
+      contractVersion: 1,
+      compiledProgramHash: 'ABC123',
+      programName: 'large-program',
+      steps: [
+        { orderIndex: 2, stepType: 'Comment', payload: {} },
+        { orderIndex: 1, stepType: 'Comment', payload: {} }
+      ]
+    })
+
+    expect(result.steps.map((step) => step.orderIndex)).toEqual([1, 2])
+  })
+
+  it('rejects unsupported versions and duplicate step indexes', () => {
+    const baseArtifact = {
+      factoryRunId: 'run-artifact',
+      targetId: 'target-artifact',
+      factoryRunProgramId: 'program-artifact',
+      contractVersion: 1,
+      compiledProgramHash: 'ABC123',
+      programName: 'large-program',
+      steps: [
+        { orderIndex: 1, stepType: 'Comment', payload: {} },
+        { orderIndex: 1, stepType: 'Comment', payload: {} }
+      ]
+    }
+
+    expect(() =>
+      parseDeviceFactoryRunProgramArtifactResponse({
+        ...baseArtifact,
+        contractVersion: 2
+      })
+    ).toThrow(/contractVersion must be 1/i)
+    expect(() => parseDeviceFactoryRunProgramArtifactResponse(baseArtifact)).toThrow(
+      /duplicate orderIndex/i
+    )
+  })
+})
+
+describe('postFactoryRunArmed', () => {
+  it('preserves the structured retry contract returned by the backend', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            message: 'Factory run barrier is busy. Please retry the arm request.',
+            errorCode: 'factory_run_arm_busy',
+            retryable: true,
+            retryAfterMs: 250
+          }),
+          {
+            status: 503,
+            headers: { 'Content-Type': 'application/json' }
+          }
+        )
+      )
+    )
+
+    const request = postFactoryRunArmed(
+      {
+        enabled: true,
+        backendUrl: 'http://localhost:5200',
+        robotId: 'robot-1',
+        deviceSecret: 'secret',
+        heartbeatIntervalMs: 3000,
+        telemetryIntervalMs: 250,
+        commandPollIntervalMs: 250
+      },
+      {
+        factoryRunId: 'run-1',
+        targetId: 'target-1',
+        commandId: 'command-1',
+        robotId: 'robot-1',
+        receivedAtUtc: '2026-07-23T00:00:00.000Z',
+        armedAtUtc: '2026-07-23T00:00:01.000Z',
+        estimatedStepDurationsMs: [100, 200]
+      },
+      'token'
+    )
+
+    await expect(request).rejects.toMatchObject({
+      status: 503,
+      errorCode: 'factory_run_arm_busy',
+      retryable: true,
+      retryAfterMs: 250
+    } satisfies Partial<BackendDeviceRequestError>)
   })
 })

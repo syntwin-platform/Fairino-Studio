@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactElement } from 'react'
 
 import { useRobotStore } from '../../store/robotStore'
@@ -30,6 +30,7 @@ import {
 } from '../../services/robotMotionRuntime'
 import ProgramImportPanel from './ProgramImportPanel'
 import WorkflowStepDetailsModal from './WorkflowStepDetailsModal'
+import { isAuthoritativeRecordedTraceStep } from '../../services/cartesianTraceRecorder'
 
 const DEFAULT_SPEED = 30
 const DEFAULT_ACC = 30
@@ -37,6 +38,47 @@ const DEFAULT_WAIT_MS = 500
 
 interface InfoTooltipProps {
   text: string
+}
+
+interface WorkflowDisplayRow {
+  key: string
+  steps: WorkflowStep[]
+  startIndex: number
+  endIndex: number
+  traceGroupId?: string
+}
+
+function buildWorkflowDisplayRows(steps: WorkflowStep[]): WorkflowDisplayRow[] {
+  const rows: WorkflowDisplayRow[] = []
+  let index = 0
+
+  while (index < steps.length) {
+    const first = steps[index]
+    const groupId = first.trace?.groupId
+
+    if (!groupId) {
+      rows.push({ key: first.id, steps: [first], startIndex: index, endIndex: index })
+      index += 1
+      continue
+    }
+
+    const startIndex = index
+    const groupedSteps: WorkflowStep[] = []
+    while (index < steps.length && steps[index].trace?.groupId === groupId) {
+      groupedSteps.push(steps[index])
+      index += 1
+    }
+
+    rows.push({
+      key: `trace:${groupId}`,
+      steps: groupedSteps,
+      startIndex,
+      endIndex: index - 1,
+      traceGroupId: groupId
+    })
+  }
+
+  return rows
 }
 
 function InfoTooltip({ text }: InfoTooltipProps): ReactElement {
@@ -95,6 +137,22 @@ export default function WorkflowPanel(): ReactElement {
   const currentStepIndex = selectedRobotId
     ? (selectedExecution?.currentStepIndex ?? 0)
     : legacyCurrentStepIndex
+  const displayRows = useMemo(() => buildWorkflowDisplayRows(steps), [steps])
+  const stepCardRefs = useRef(new Map<string, HTMLDivElement>())
+  const activeDisplayRowKey = useMemo(
+    () =>
+      displayRows.find(
+        (row) => currentStepIndex >= row.startIndex && currentStepIndex <= row.endIndex
+      )?.key,
+    [currentStepIndex, displayRows]
+  )
+
+  useEffect(() => {
+    if (!isPlaying || !activeDisplayRowKey) return
+    stepCardRefs.current
+      .get(activeDisplayRowKey)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  }, [activeDisplayRowKey, isPlaying])
   const collisionWarning = useSceneStore(selectCollisionWarning)
   const isRecordBlocked = isPlaying || collisionWarning
   const moveLPreviewAbortRef = useRef<AbortController | null>(null)
@@ -261,6 +319,12 @@ export default function WorkflowPanel(): ReactElement {
     moveLPreviewAbortRef.current?.abort()
     moveLPreviewAbortRef.current = null
 
+    if (isAuthoritativeRecordedTraceStep(step)) {
+      // Preview the exact trained joint branch instead of asking MoveL IK to choose again.
+      setRunJointAngles(step.jointAngles)
+      return
+    }
+
     if (step.type === 'MoveL') {
       void previewMoveLStep(step)
       return
@@ -294,32 +358,60 @@ export default function WorkflowPanel(): ReactElement {
     speed: number
   ): Promise<void> => {
     const startAngles = [...getRunJointAngles()]
-    const duration =
+    const duration = Math.max(
+      1,
       getMotionDurationMs(startAngles, targetAngles, speed) / useRobotStore.getState().playbackSpeed
-    const stepsCount = 30
-    const intervalTime = duration / stepsCount
+    )
 
-    for (let i = 1; i <= stepsCount; i++) {
-      if (!isRunActive()) break
+    await new Promise<void>((resolve) => {
+      const startedAtMs = performance.now()
 
-      const t = i / stepsCount
-      const interpolated = startAngles.map((start, idx) => {
-        const target = targetAngles[idx]
-        return start + (target - start) * t
-      })
+      const renderFrame = (nowMs: number): void => {
+        if (!isRunActive()) {
+          resolve()
+          return
+        }
 
-      setRunJointAngles(interpolated as JointAngles)
-      await wait(intervalTime)
-    }
+        const progress = Math.min(1, Math.max(0, (nowMs - startedAtMs) / duration))
+        // Smoothstep avoids a visible snap when playback starts from HOME or an arbitrary pose.
+        const easedProgress = progress * progress * (3 - 2 * progress)
+        const interpolated = startAngles.map(
+          (start, index) => start + (targetAngles[index] - start) * easedProgress
+        ) as JointAngles
+
+        setRunJointAngles(interpolated)
+        if (progress >= 1) {
+          setRunJointAngles(targetAngles)
+          resolve()
+          return
+        }
+
+        window.requestAnimationFrame(renderFrame)
+      }
+
+      window.requestAnimationFrame(renderFrame)
+    })
   }
 
   const animateRecordedTraceGroup = async (
     traceSteps: Array<WorkflowStep & { jointAngles: NonNullable<WorkflowStep['jointAngles']> }>,
-    firstWorkflowIndex: number
+    firstWorkflowIndex: number,
+    expectedStartAngles?: JointAngles
   ): Promise<void> => {
     if (traceSteps.length === 0) return
 
-    const startAngles = [...getRunJointAngles()]
+    const currentStartAngles = getRunJointAngles()
+    if (
+      expectedStartAngles &&
+      Math.max(
+        ...expectedStartAngles.map((angle, index) => Math.abs(angle - currentStartAngles[index]))
+      ) > 0.25
+    ) {
+      await animateJointMotion(expectedStartAngles, traceSteps[0].speed)
+      if (!isRunActive()) return
+    }
+
+    const startAngles = [...(expectedStartAngles ?? getRunJointAngles())]
     const playbackSpeed = Math.max(0.1, useRobotStore.getState().playbackSpeed)
     const segmentEndsMs: number[] = []
     let totalRecordedMs = 0
@@ -334,6 +426,7 @@ export default function WorkflowPanel(): ReactElement {
     await new Promise<void>((resolve) => {
       const startedAtMs = performance.now()
       let lastAppliedAtMs = startedAtMs
+      let activeSegmentIndex = -1
       setSelectedStepId(traceSteps[0].id)
       setRunStepIndex(firstWorkflowIndex)
 
@@ -353,6 +446,11 @@ export default function WorkflowPanel(): ReactElement {
         }
 
         const step = traceSteps[segmentIndex]
+        if (segmentIndex !== activeSegmentIndex) {
+          activeSegmentIndex = segmentIndex
+          setSelectedStepId(step.id)
+          setRunStepIndex(firstWorkflowIndex + segmentIndex)
+        }
         const segmentStartMs = segmentIndex === 0 ? 0 : segmentEndsMs[segmentIndex - 1]
         const segmentDurationMs = Math.max(1, segmentEndsMs[segmentIndex] - segmentStartMs)
         const progress = Math.min(
@@ -366,7 +464,10 @@ export default function WorkflowPanel(): ReactElement {
         ) as NonNullable<WorkflowStep['jointAngles']>
 
         if (recordedElapsedMs >= totalRecordedMs) {
-          setRunJointAngles(traceSteps.at(-1)!.jointAngles)
+          const lastStep = traceSteps.at(-1)!
+          setRunJointAngles(lastStep.jointAngles)
+          setSelectedStepId(lastStep.id)
+          setRunStepIndex(firstWorkflowIndex + traceSteps.length - 1)
           resolve()
           return
         }
@@ -516,7 +617,12 @@ export default function WorkflowPanel(): ReactElement {
 
           // Replay one continuous time line. Planning each MoveL separately added a frame of
           // overhead per sample and made long drawings visibly slower than the recorded gesture.
-          await animateRecordedTraceGroup(traceSteps, currentIndex)
+          const previousStepAngles = steps[currentIndex - 1]?.jointAngles
+          await animateRecordedTraceGroup(
+            traceSteps,
+            currentIndex,
+            previousStepAngles ? ([...previousStepAngles] as JointAngles) : undefined
+          )
           if (!isRunActive()) break
           currentIndex += traceSteps.length
           setRunStepIndex(currentIndex)
@@ -588,14 +694,35 @@ export default function WorkflowPanel(): ReactElement {
     clearSteps()
   }
 
+  const moveDisplayRow = (rowIndex: number, direction: 'up' | 'down'): void => {
+    const nextIndex = direction === 'up' ? rowIndex - 1 : rowIndex + 1
+    if (nextIndex < 0 || nextIndex >= displayRows.length) return
+
+    const reorderedRows = [...displayRows]
+    const current = reorderedRows[rowIndex]
+    reorderedRows[rowIndex] = reorderedRows[nextIndex]
+    reorderedRows[nextIndex] = current
+    reorderSteps(reorderedRows.flatMap((row) => row.steps))
+  }
+
+  const removeDisplayRow = (row: WorkflowDisplayRow): void => {
+    if (!row.traceGroupId) {
+      removeStep(row.steps[0].id)
+      return
+    }
+
+    const removedIds = new Set(row.steps.map((step) => step.id))
+    reorderSteps(steps.filter((step) => !removedIds.has(step.id)))
+  }
+
   const moveStep = (index: number, direction: 'up' | 'down'): void => {
     const nextIndex = direction === 'up' ? index - 1 : index + 1
     if (nextIndex < 0 || nextIndex >= steps.length) return
 
     const newSteps = [...steps]
-    const temp = newSteps[index]
+    const current = newSteps[index]
     newSteps[index] = newSteps[nextIndex]
-    newSteps[nextIndex] = temp
+    newSteps[nextIndex] = current
     reorderSteps(newSteps)
   }
 
@@ -732,7 +859,12 @@ export default function WorkflowPanel(): ReactElement {
           {/* Steps List */}
           <div className="flex-1 overflow-y-auto p-4 space-y-2">
             <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-2">
-              {t('workflowSteps')} ({steps.length})
+              {t('workflowSteps')} ({displayRows.length})
+              {displayRows.length !== steps.length && (
+                <span className="ml-1 font-normal normal-case text-slate-500">
+                  · {steps.length} mẫu chuyển động
+                </span>
+              )}
             </span>
 
             {workflowError && (
@@ -746,6 +878,128 @@ export default function WorkflowPanel(): ReactElement {
                 <span className="text-xs">{t('noSteps')}</span>
                 <span className="text-[10px] mt-1">{t('useButtonsHint')}</span>
               </div>
+            ) : displayRows.length < steps.length ? (
+              displayRows.map((row, rowIndex) => {
+                const step = row.steps.at(-1)!
+                const isTrace = row.traceGroupId !== undefined
+                const isSelected = row.steps.some((item) => item.id === selectedStepId)
+                const isCurrentSim =
+                  isPlaying &&
+                  currentStepIndex >= row.startIndex &&
+                  currentStepIndex <= row.endIndex
+                const traceDurationMs = row.steps.reduce(
+                  (total, item) => total + (item.trace?.segmentDurationMs ?? 0),
+                  0
+                )
+                const activeTraceSample = Math.min(
+                  row.steps.length,
+                  Math.max(1, currentStepIndex - row.startIndex + 1)
+                )
+
+                return (
+                  <div
+                    key={row.key}
+                    ref={(node) => {
+                      if (node) stepCardRefs.current.set(row.key, node)
+                      else stepCardRefs.current.delete(row.key)
+                    }}
+                    onClick={() => handleStepClick(step)}
+                    className={`flex cursor-pointer items-start justify-between rounded-lg border p-3 text-left transition ${
+                      isCurrentSim
+                        ? 'border-emerald-500 bg-emerald-950/20'
+                        : isSelected
+                          ? 'border-blue-500 bg-blue-950/10'
+                          : 'border-[#2d2d34] bg-[#121214] hover:bg-[#1a1a1f]'
+                    }`}
+                  >
+                    <div className="min-w-0 flex-1 pr-2">
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          className={`rounded px-1.5 py-0.5 text-[9px] font-bold ${
+                            isTrace ? 'bg-cyan-900/60 text-cyan-300' : 'bg-slate-800 text-slate-300'
+                          }`}
+                        >
+                          {isTrace ? 'TRACE' : step.type}
+                        </span>
+                        <span className="block truncate text-xs font-bold text-white">
+                          {isTrace
+                            ? language === 'vi'
+                              ? 'Quỹ đạo đã vẽ'
+                              : 'Recorded trace'
+                            : step.label || 'Unnamed'}
+                        </span>
+                      </div>
+
+                      {isTrace ? (
+                        <div className="mt-1.5 space-y-1 text-[10px] text-slate-400">
+                          <p>
+                            {row.steps.length} mẫu · {(traceDurationMs / 1000).toFixed(2)} giây
+                          </p>
+                          {isCurrentSim && (
+                            <div className="space-y-1 text-emerald-300">
+                              <p>
+                                Đang chạy mẫu {activeTraceSample}/{row.steps.length}
+                              </p>
+                              <div className="h-1 overflow-hidden rounded bg-slate-800">
+                                <div
+                                  className="h-full bg-emerald-400 transition-[width] duration-75"
+                                  style={{
+                                    width: `${(activeTraceSample / row.steps.length) * 100}%`
+                                  }}
+                                />
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <p className="mt-1 truncate font-mono text-[10px] text-slate-400">
+                          {step.type}
+                        </p>
+                      )}
+                    </div>
+
+                    <div
+                      className="flex shrink-0 items-center gap-1"
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <button
+                        onClick={() => moveDisplayRow(rowIndex, 'up')}
+                        disabled={rowIndex === 0 || isPlaying}
+                        className="cursor-pointer rounded p-1 text-slate-500 hover:bg-[#2d2d34] hover:text-slate-300 disabled:opacity-30"
+                        title="Move Up"
+                      >
+                        <ArrowUp size={12} />
+                      </button>
+                      <button
+                        onClick={() => moveDisplayRow(rowIndex, 'down')}
+                        disabled={rowIndex === displayRows.length - 1 || isPlaying}
+                        className="cursor-pointer rounded p-1 text-slate-500 hover:bg-[#2d2d34] hover:text-slate-300 disabled:opacity-30"
+                        title="Move Down"
+                      >
+                        <ArrowDown size={12} />
+                      </button>
+                      {!isTrace && (
+                        <button
+                          onClick={() => setEditingStepId(step.id)}
+                          disabled={isPlaying}
+                          className="cursor-pointer rounded p-1 text-slate-500 hover:bg-[#2d2d34] hover:text-blue-400 disabled:opacity-30"
+                          title="Settings"
+                        >
+                          <Settings size={12} />
+                        </button>
+                      )}
+                      <button
+                        onClick={() => removeDisplayRow(row)}
+                        disabled={isPlaying}
+                        className="cursor-pointer rounded p-1 text-slate-500 hover:bg-rose-950/30 hover:text-rose-400 disabled:opacity-30"
+                        title={isTrace ? 'Delete trace' : 'Delete'}
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                  </div>
+                )
+              })
             ) : (
               steps.map((step, idx) => {
                 const isSelected = selectedStepId === step.id
@@ -754,6 +1008,10 @@ export default function WorkflowPanel(): ReactElement {
                 return (
                   <div
                     key={step.id}
+                    ref={(node) => {
+                      if (node) stepCardRefs.current.set(step.id, node)
+                      else stepCardRefs.current.delete(step.id)
+                    }}
                     onClick={() => handleStepClick(step)}
                     className={`p-3 rounded-lg border text-left cursor-pointer transition flex justify-between items-start ${
                       isCurrentSim

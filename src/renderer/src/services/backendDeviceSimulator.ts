@@ -9,6 +9,7 @@ import { cancelActiveCommandForRobot, getActiveCommandIdForRobot } from './comma
 import { useRobotStore } from '../store/robotStore'
 import { useSceneStore } from '../store/sceneStore'
 import {
+  getFactoryRunProgramArtifact,
   getPendingCommand,
   postCommandResult,
   postFactoryRunArmed,
@@ -31,6 +32,7 @@ interface BackendDeviceSimulatorSessionState {
   telemetryInFlight: boolean
   commandExecutionInFlight: boolean
   commandPollAbortController: AbortController | null
+  telemetrySequenceNumber: number
   running: boolean
   runId: number
 }
@@ -43,6 +45,7 @@ function createSessionState(): BackendDeviceSimulatorSessionState {
     telemetryInFlight: false,
     commandExecutionInFlight: false,
     commandPollAbortController: null,
+    telemetrySequenceNumber: 0,
     running: false,
     runId: 0
   }
@@ -96,10 +99,63 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
-export function buildTelemetryFromStores(config: BackendSimulatorConfig): DeviceTelemetryPayload {
+function mapDigitalOutputs(outputs: Record<number, 0 | 1>): Record<number, boolean> {
+  return Object.fromEntries(
+    Object.entries(outputs).map(([index, value]) => [Number(index), value === 1])
+  )
+}
+
+const MAX_TELEMETRY_RUNTIME_SAMPLES = 30
+
+export function buildTelemetryRuntimeStatus(
+  telemetry: DeviceTelemetryPayload,
+  roundTripMs: number,
+  previousStatus?: BackendSimulatorStatus,
+  recordedAt = new Date().toISOString()
+): Partial<BackendSimulatorStatus> {
+  const normalizedRoundTripMs = Math.max(0, Math.round(roundTripMs * 10) / 10)
+  const telemetrySamples = [
+    ...(previousStatus?.telemetrySamples ?? []),
+    {
+      recordedAt,
+      roundTripMs: normalizedRoundTripMs,
+      sequenceNumber: telemetry.sequenceNumber
+    }
+  ].slice(-MAX_TELEMETRY_RUNTIME_SAMPLES)
+
+  return {
+    isConnected: true,
+    lastTelemetryAt: recordedAt,
+    lastTelemetrySequenceNumber: telemetry.sequenceNumber,
+    lastTelemetryRoundTripMs: normalizedRoundTripMs,
+    lastTelemetryStatusCode: telemetry.statusCode,
+    lastCollisionWarning: telemetry.collisionWarning,
+    lastIoSnapshot: telemetry.io,
+    lastExecutionSnapshot: telemetry.execution,
+    telemetrySamples,
+    lastError: undefined
+  }
+}
+
+export function buildTelemetryFromStores(
+  config: BackendSimulatorConfig,
+  sequenceNumber?: number
+): DeviceTelemetryPayload {
   const robotState = useRobotStore.getState()
   const sceneState = useSceneStore.getState()
   const robotId = config.robotId.trim()
+  const executionState = robotState.robotExecutionById[robotId]
+  const currentCommandId = getActiveCommandIdForRobot(robotId) ?? undefined
+  const isSelectedRobot = robotState.selectedRobotId === robotId
+  const totalSteps =
+    isSelectedRobot && robotState.steps.length > 0 ? robotState.steps.length : undefined
+  const currentStepIndex = executionState?.isPlaying
+    ? Math.max(0, executionState.currentStepIndex)
+    : undefined
+  const progressPercent =
+    totalSteps && currentStepIndex !== undefined
+      ? Math.min(100, ((currentStepIndex + 1) / totalSteps) * 100)
+      : undefined
 
   const jointAngles = [...(robotState.jointAnglesByRobotId[robotId] ?? robotState.jointAngles)]
   const tcpPose = {
@@ -113,8 +169,24 @@ export function buildTelemetryFromStores(config: BackendSimulatorConfig): Device
     robotId: config.robotId,
     tcpPose,
     jointAngles,
-    temperature: null,
-    statusCode: robotState.robotExecutionById[robotId]?.isPlaying ? 'RUNNING' : 'IDLE',
+    sequenceNumber,
+    io: isSelectedRobot
+      ? {
+          cabinetDigitalOutputs: mapDigitalOutputs(robotState.cabinetDigitalOutputs),
+          toolDigitalOutputs: mapDigitalOutputs(robotState.toolDigitalOutputs),
+          gripperState: robotState.gripperState
+        }
+      : undefined,
+    execution: {
+      currentCommandId,
+      state: executionState?.lastError ? 'Failed' : executionState?.isPlaying ? 'Running' : 'Idle',
+      currentStepIndex,
+      totalSteps,
+      progressPercent,
+      startedAt: executionState?.startedAt,
+      lastError: executionState?.lastError
+    },
+    statusCode: executionState?.isPlaying ? 'RUNNING' : 'IDLE',
     collisionWarning: sceneState.robotContactsById[robotId]?.level === 'collision',
     timestamp: new Date().toISOString()
   }
@@ -160,16 +232,20 @@ async function sendTelemetry(
   session.telemetryInFlight = true
 
   try {
-    const telemetry = buildTelemetryFromStores(config)
+    session.telemetrySequenceNumber += 1
+    const telemetry = buildTelemetryFromStores(config, session.telemetrySequenceNumber)
+    const startedAt = performance.now()
     await withDeviceToken(config, (token) => postTelemetry(config, telemetry, token))
 
     if (session.runId !== currentRunId) return
 
-    callbacks.onStatusChange({
-      isConnected: true,
-      lastTelemetryAt: new Date().toISOString(),
-      lastError: undefined
-    })
+    callbacks.onStatusChange(
+      buildTelemetryRuntimeStatus(
+        telemetry,
+        performance.now() - startedAt,
+        useRobotStore.getState().robotRuntimeById[config.robotId]
+      )
+    )
   } catch (error) {
     if (session.runId !== currentRunId) return
 
@@ -197,6 +273,12 @@ async function executeAndReportCommand(
 
   try {
     await executeBackendCommand(command, {
+      loadFactoryRunProgramArtifact: async (factoryRunId, targetId, _artifact, signal) => {
+        return await withDeviceToken(config, (token) =>
+          getFactoryRunProgramArtifact(config, factoryRunId, targetId, token, signal)
+        )
+      },
+
       armFactoryRunCommand: async (payload, estimatedStepDurationsMs, signal) => {
         return await withDeviceToken(config, (token) =>
           postFactoryRunArmed(
@@ -416,6 +498,7 @@ export function createBackendDeviceSimulatorSession(): BackendDeviceSimulatorSes
 
       session.running = true
       session.runId += 1
+      session.telemetrySequenceNumber = 0
       const currentRunId = session.runId
 
       callbacks.onStatusChange({
