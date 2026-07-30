@@ -61,6 +61,18 @@ export function sampleJointTrajectory(
     validateJointAngles(keyframes[index], `Joint trajectory keyframe ${index + 1}`)
   }
 
+  return sampleValidatedJointTrajectory(keyframes, rawProgress)
+}
+
+/**
+ * Samples a trajectory whose keyframes were already validated and cloned when the motion was
+ * scheduled. Keeping validation out of the animation-frame hot path makes playback cost constant
+ * regardless of trace length without changing interpolation, duration or endpoint semantics.
+ */
+function sampleValidatedJointTrajectory(
+  keyframes: readonly JointAngles[],
+  rawProgress: number
+): JointAngles {
   if (keyframes.length === 1) {
     return cloneJointAngles(keyframes[0])
   }
@@ -287,7 +299,7 @@ export function runScheduledJointTrajectory(
       robotId,
       durationMs,
       signal,
-      (progress) => sampleJointTrajectory(safeKeyframes, progress),
+      (progress) => sampleValidatedJointTrajectory(safeKeyframes, progress),
       safeKeyframes[safeKeyframes.length - 1],
       sharedStartedAtMonotonicMs
     )

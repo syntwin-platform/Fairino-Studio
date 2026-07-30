@@ -20,6 +20,8 @@ export type FactoryRunDiagnosticEventName =
   | 'robot.prepare.started'
   | 'robot.prepare.completed'
   | 'robot.prepare.failed'
+  | 'robot.arm.register'
+  | 'robot.arm.retry'
   | 'robot.arm.poll'
   | 'robot.cohort.joined'
   | 'robot.cohort.released'
@@ -293,6 +295,13 @@ export function endFactoryRunDiagnosticSession(): void {
     active: false
   }
 
+  publish()
+}
+
+export function clearFactoryRunDiagnostics(): void {
+  cancelScheduledPublish()
+  activeSession = null
+  events = []
   publish()
 }
 

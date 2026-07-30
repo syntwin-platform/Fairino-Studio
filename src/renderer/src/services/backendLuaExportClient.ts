@@ -1,3 +1,5 @@
+import { backendFetch } from './backendFetch'
+
 export interface BackendLuaExportResponse {
   robotId: string
   programId: string
@@ -32,7 +34,7 @@ export async function exportLuaProgramFromBackend(
   programId: string,
   token: string
 ): Promise<BackendLuaExportResponse> {
-  const response = await fetch(
+  const response = await backendFetch(
     apiUrl(backendUrl, `/api/robots/${robotId}/programs/${programId}/export/lua`),
     {
       method: 'GET',

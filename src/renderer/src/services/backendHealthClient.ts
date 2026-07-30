@@ -1,3 +1,5 @@
+import { backendFetch } from './backendFetch'
+
 export class BackendHealthError extends Error {
   constructor(
     readonly status: number,
@@ -28,7 +30,7 @@ export async function checkBackendHealth(
   signal?.addEventListener('abort', handleExternalAbort, { once: true })
 
   try {
-    const response = await fetch(backendHealthUrl(backendUrl), {
+    const response = await backendFetch(backendHealthUrl(backendUrl), {
       method: 'GET',
       signal: controller.signal,
       cache: 'no-store'

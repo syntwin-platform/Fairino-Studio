@@ -11,11 +11,12 @@ import type {
 import {
   cancelFactoryRun,
   createFactoryRun,
-  getFactoryRun,
+  getFactoryRunStatus,
   prepareFactoryRun,
   startFactoryRun,
   type BackendFactoryRunContext,
   type FactoryRunResponse,
+  type FactoryRunStatusResponse,
   type FactoryRunTargetResponse
 } from './backendFactoryRunClient'
 import {
@@ -137,7 +138,9 @@ function getTargetMessage(target: FactoryRunTargetResponse): string {
   return target.failureReason || target.readinessError || target.status
 }
 
-function applyFactoryRunResponse(response: FactoryRunResponse): void {
+type FactoryRunRuntimeResponse = FactoryRunResponse | FactoryRunStatusResponse
+
+function applyFactoryRunResponse(response: FactoryRunRuntimeResponse): void {
   const store = useFactoryProgramStore.getState()
   const reportedStartShiftsMs = response.targets
     .map((target) => target.startLateByMs)
@@ -173,11 +176,11 @@ async function waitForFactoryRunStatus(
   stopStatuses: Set<string>,
   signal?: AbortSignal,
   redrive?: () => Promise<FactoryRunResponse>
-): Promise<FactoryRunResponse> {
-  let latest: FactoryRunResponse | null = null
+): Promise<FactoryRunRuntimeResponse> {
+  let latest: FactoryRunRuntimeResponse | null = null
 
   for (let attempt = 0; attempt < 900; attempt++) {
-    latest = await getFactoryRun(context, factoryRunId, signal)
+    latest = await getFactoryRunStatus(context, factoryRunId, signal)
     applyFactoryRunResponse(latest)
 
     if (stopStatuses.has(latest.status)) {
@@ -195,7 +198,7 @@ async function waitForFactoryRunStatus(
       }
     }
 
-    await wait(stopStatuses === READY_FACTORY_RUN_STATUSES ? 250 : 1000, signal)
+    await wait(stopStatuses === READY_FACTORY_RUN_STATUSES ? 500 : 1000, signal)
   }
 
   throw new Error(`Factory run ${factoryRunId} monitoring timed out.`)

@@ -1,11 +1,44 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { listRobots } from './backendRobotClient'
+import { deleteRobot, listCompanies, listRobots } from './backendRobotClient'
 
 afterEach(() => {
   vi.unstubAllGlobals()
 })
 
 describe('backendRobotClient', () => {
+  it('loads companies available to the signed-in user', async () => {
+    const companies = [
+      {
+        id: 'company-1',
+        name: 'SynTwin Factory',
+        slug: 'syntwin-factory',
+        status: 'Active',
+        currentUserRole: 'Owner',
+        subscriptionPlan: 'Premium',
+        maxRobots: 30,
+        canView3D: true,
+        canSendCommand: true
+      }
+    ]
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(companies), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(listCompanies('https://backend.example/', 'token-1')).resolves.toEqual(companies)
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://backend.example/api/companies',
+      expect.objectContaining({
+        method: 'GET',
+        headers: expect.objectContaining({ Authorization: 'Bearer token-1' })
+      })
+    )
+  })
+
   it('loads the robots for the requested company with the bearer token', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify([]), {
@@ -21,6 +54,23 @@ describe('backendRobotClient', () => {
       'http://localhost:5200/api/robots?companyId=company-1',
       expect.objectContaining({
         method: 'GET',
+        headers: expect.objectContaining({ Authorization: 'Bearer token-1' })
+      })
+    )
+  })
+
+  it('deletes the requested robot with the bearer token', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(
+      deleteRobot('https://backend.example/', 'token-1', 'robot-1')
+    ).resolves.toBeUndefined()
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://backend.example/api/robots/robot-1',
+      expect.objectContaining({
+        method: 'DELETE',
         headers: expect.objectContaining({ Authorization: 'Bearer token-1' })
       })
     )

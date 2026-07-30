@@ -4,6 +4,7 @@ import type {
   SafetyPolicyResponse,
   SafetyValidationErrorResponse
 } from '../types/backendDevice'
+import { backendFetch } from './backendFetch'
 
 export class SafetyValidationError extends Error {
   readonly diagnostics: SafetyDiagnostic[]
@@ -84,7 +85,7 @@ export async function getRobotSafetyPolicy(
   robotId: string,
   token: string
 ): Promise<SafetyPolicyResponse> {
-  const response = await fetch(apiUrl(backendUrl, `/api/robots/${robotId}/safety-policy`), {
+  const response = await backendFetch(apiUrl(backendUrl, `/api/robots/${robotId}/safety-policy`), {
     method: 'GET',
     headers: authHeaders(token)
   })
@@ -98,7 +99,7 @@ export async function putRobotSafetyPolicy(
   policy: RobotSafetyPolicyDefinition,
   token: string
 ): Promise<SafetyPolicyResponse> {
-  const response = await fetch(apiUrl(backendUrl, `/api/robots/${robotId}/safety-policy`), {
+  const response = await backendFetch(apiUrl(backendUrl, `/api/robots/${robotId}/safety-policy`), {
     method: 'PUT',
     headers: authHeaders(token),
     body: JSON.stringify({ policy })
@@ -112,7 +113,7 @@ export async function deleteRobotSafetyPolicy(
   robotId: string,
   token: string
 ): Promise<void> {
-  const response = await fetch(apiUrl(backendUrl, `/api/robots/${robotId}/safety-policy`), {
+  const response = await backendFetch(apiUrl(backendUrl, `/api/robots/${robotId}/safety-policy`), {
     method: 'DELETE',
     headers: authHeaders(token)
   })
@@ -127,10 +128,13 @@ export async function getCompanySafetyPolicy(
   companyId: string,
   token: string
 ): Promise<SafetyPolicyResponse> {
-  const response = await fetch(apiUrl(backendUrl, `/api/companies/${companyId}/safety-policy`), {
-    method: 'GET',
-    headers: authHeaders(token)
-  })
+  const response = await backendFetch(
+    apiUrl(backendUrl, `/api/companies/${companyId}/safety-policy`),
+    {
+      method: 'GET',
+      headers: authHeaders(token)
+    }
+  )
 
   return readJson<SafetyPolicyResponse>(response)
 }
@@ -141,11 +145,14 @@ export async function putCompanySafetyPolicy(
   policy: RobotSafetyPolicyDefinition,
   token: string
 ): Promise<SafetyPolicyResponse> {
-  const response = await fetch(apiUrl(backendUrl, `/api/companies/${companyId}/safety-policy`), {
-    method: 'PUT',
-    headers: authHeaders(token),
-    body: JSON.stringify({ policy })
-  })
+  const response = await backendFetch(
+    apiUrl(backendUrl, `/api/companies/${companyId}/safety-policy`),
+    {
+      method: 'PUT',
+      headers: authHeaders(token),
+      body: JSON.stringify({ policy })
+    }
+  )
 
   return readJson<SafetyPolicyResponse>(response)
 }

@@ -15,6 +15,8 @@ import {
   throwIfCommandCancelled
 } from './commandExecutionRuntime'
 import { recordFactoryRunDiagnostic } from './factoryRunDiagnostics'
+import { BackendDeviceRequestError } from './backendDeviceClient'
+import type { DeviceFactoryRunProgramArtifactResponse } from './backendDeviceClient'
 import {
   latchRobotFault,
   reportSafetyFaultEvent,
@@ -24,12 +26,31 @@ const FACTORY_RUN_DEBUG =
   typeof window !== 'undefined' &&
   window.localStorage.getItem('syntwin.factoryRun.debug') === 'true'
 
-const FACTORY_RUN_ARM_MAX_ATTEMPTS = 150
+const FACTORY_RUN_ARM_MAX_ATTEMPTS = 600
+const FACTORY_RUN_ARM_MAX_WAIT_MS = 120_000
 const FACTORY_RUN_ARM_POLL_INTERVAL_MS = 200
+const FACTORY_RUN_ARM_RETRY_INITIAL_MS = 100
+const FACTORY_RUN_ARM_RETRY_MAX_MS = 1_000
 const FACTORY_RUN_MAX_STANDALONE_START_LATENESS_MS = 250
 const FACTORY_RUN_MAX_ABSOLUTE_COHORT_LATENESS_MS = 2000
 const FACTORY_RUN_HARD_MAX_ABSOLUTE_COHORT_LATENESS_MS = 30000
 const FACTORY_RUN_LOCAL_COHORT_JOIN_TIMEOUT_MS = 2000
+
+interface SharedFactoryRunBarrierWait {
+  controller: AbortController
+  consumerCount: number
+  settled: boolean
+  promise: Promise<FactoryRunArmResponse>
+}
+
+const sharedFactoryRunBarrierWaits = new Map<string, SharedFactoryRunBarrierWait>()
+
+interface SharedFactoryRunProgramArtifactLoad {
+  controller: AbortController
+  consumerCount: number
+  settled: boolean
+  promise: Promise<RunProgramStep[]>
+}
 
 const factoryRunLocalStartBarrier = new FactoryRunLocalStartBarrierCoordinator({
   registerParticipant: (factoryRunId, participantId) =>
@@ -89,6 +110,18 @@ interface RunProgramStep {
   payload?: unknown
 }
 
+export interface FactoryRunProgramArtifactReference {
+  contractVersion: number
+  factoryRunProgramId: string
+  compiledProgramHash: string
+}
+
+interface FactoryRunProgramArtifactPointer {
+  factoryRunId: string
+  targetId: string
+  artifact: FactoryRunProgramArtifactReference
+}
+
 interface PreparedRunProgramExecution {
   estimatedStepDurationsMs: number[]
   moveLTrajectoriesByStepIndex: Map<number, PreparedMoveLTrajectory>
@@ -109,6 +142,13 @@ export interface FactoryRunArmResponse {
 }
 
 export interface BackendCommandExecutionContext {
+  loadFactoryRunProgramArtifact?: (
+    factoryRunId: string,
+    targetId: string,
+    artifact: FactoryRunProgramArtifactReference,
+    signal: AbortSignal
+  ) => Promise<DeviceFactoryRunProgramArtifactResponse>
+
   armFactoryRunCommand?: (
     payload: FactoryRunArmPayload,
     estimatedStepDurationsMs: number[],
@@ -120,6 +160,32 @@ export interface BackendCommandExecutionContext {
     actualStartedAtUtc: string,
     signal: AbortSignal
   ) => Promise<void>
+}
+
+const MAX_FACTORY_RUN_PROGRAM_ARTIFACT_CACHE_ENTRIES = 32
+const factoryRunProgramArtifactCache = new Map<string, SharedFactoryRunProgramArtifactLoad>()
+
+export function clearFactoryRunProgramArtifactCache(): void {
+  for (const sharedLoad of factoryRunProgramArtifactCache.values()) {
+    if (!sharedLoad.settled) {
+      sharedLoad.controller.abort()
+    }
+  }
+
+  factoryRunProgramArtifactCache.clear()
+}
+
+export function clearFactoryCommandRuntime(): void {
+  for (const sharedWait of sharedFactoryRunBarrierWaits.values()) {
+    if (!sharedWait.settled) {
+      sharedWait.controller.abort()
+    }
+  }
+
+  sharedFactoryRunBarrierWaits.clear()
+  factoryRunLocalStartBarrier.clear('SynTwin account signed out')
+  factoryRunStepCoordinator.clear()
+  clearFactoryRunProgramArtifactCache()
 }
 
 export interface CommandExecutionFailureMetadata {
@@ -464,36 +530,32 @@ function parseSetDOPayload(payload: unknown): SetDOPayload {
   }
 }
 
-function parseRunProgramSteps(payload: unknown): RunProgramStep[] {
-  if (!isRecord(payload)) {
-    throw new Error('RunProgram payload must be an object')
-  }
-
-  if (!Array.isArray(payload.steps) || payload.steps.length === 0) {
-    throw new Error('RunProgram steps must be a non-empty array')
+function parseRunProgramStepArray(rawSteps: unknown, source: string): RunProgramStep[] {
+  if (!Array.isArray(rawSteps) || rawSteps.length === 0) {
+    throw new Error(`${source} steps must be a non-empty array`)
   }
 
   const orderIndexes = new Set<number>()
 
-  const steps = payload.steps.map((value, index): RunProgramStep => {
+  const steps = rawSteps.map((value, index): RunProgramStep => {
     if (!isRecord(value)) {
-      throw new Error(`RunProgram step ${index + 1} must be an object`)
+      throw new Error(`${source} step ${index + 1} must be an object`)
     }
 
     if (!Number.isInteger(value.orderIndex) || (value.orderIndex as number) < 1) {
-      throw new Error(`RunProgram step ${index + 1} has invalid orderIndex`)
+      throw new Error(`${source} step ${index + 1} has invalid orderIndex`)
     }
 
     const orderIndex = value.orderIndex as number
 
     if (orderIndexes.has(orderIndex)) {
-      throw new Error(`Duplicate RunProgram orderIndex: ${orderIndex}`)
+      throw new Error(`Duplicate ${source} orderIndex: ${orderIndex}`)
     }
 
     orderIndexes.add(orderIndex)
 
     if (typeof value.stepType !== 'string' || !value.stepType.trim()) {
-      throw new Error(`RunProgram step ${orderIndex} requires stepType`)
+      throw new Error(`${source} step ${orderIndex} requires stepType`)
     }
 
     return {
@@ -505,6 +567,227 @@ function parseRunProgramSteps(payload: unknown): RunProgramStep[] {
   })
 
   return steps.sort((first, second) => first.orderIndex - second.orderIndex)
+}
+
+function parseRunProgramSteps(payload: unknown): RunProgramStep[] {
+  if (!isRecord(payload)) {
+    throw new Error('RunProgram payload must be an object')
+  }
+
+  return parseRunProgramStepArray(payload.steps, 'RunProgram')
+}
+
+function parseFactoryRunProgramArtifactPointer(
+  payload: unknown
+): FactoryRunProgramArtifactPointer | null {
+  if (!isRecord(payload) || payload.artifact === undefined || payload.artifact === null) {
+    return null
+  }
+
+  if (!isRecord(payload.artifact)) {
+    throw new Error('Factory Run program artifact reference must be an object')
+  }
+
+  const factoryRunId = typeof payload.factoryRunId === 'string' ? payload.factoryRunId.trim() : ''
+  const targetId = typeof payload.targetId === 'string' ? payload.targetId.trim() : ''
+  const factoryRunProgramId =
+    typeof payload.artifact.factoryRunProgramId === 'string'
+      ? payload.artifact.factoryRunProgramId.trim()
+      : ''
+  const compiledProgramHash =
+    typeof payload.artifact.compiledProgramHash === 'string'
+      ? payload.artifact.compiledProgramHash.trim()
+      : ''
+
+  if (!factoryRunId || !targetId) {
+    throw new Error('Factory Run program artifact requires factoryRunId and targetId')
+  }
+
+  if (payload.artifact.contractVersion !== 1) {
+    throw new Error('Unsupported Factory Run program artifact contractVersion')
+  }
+
+  if (!factoryRunProgramId || !compiledProgramHash) {
+    throw new Error(
+      'Factory Run program artifact requires factoryRunProgramId and compiledProgramHash'
+    )
+  }
+
+  return {
+    factoryRunId,
+    targetId,
+    artifact: {
+      contractVersion: 1,
+      factoryRunProgramId,
+      compiledProgramHash
+    }
+  }
+}
+
+function buildFactoryRunProgramArtifactCacheKey(pointer: FactoryRunProgramArtifactPointer): string {
+  return (
+    `${pointer.artifact.factoryRunProgramId}:` + pointer.artifact.compiledProgramHash.toLowerCase()
+  )
+}
+
+function validateLoadedFactoryRunProgramArtifact(
+  pointer: FactoryRunProgramArtifactPointer,
+  artifact: DeviceFactoryRunProgramArtifactResponse
+): RunProgramStep[] {
+  if (
+    artifact.factoryRunId !== pointer.factoryRunId ||
+    artifact.targetId !== pointer.targetId ||
+    artifact.factoryRunProgramId !== pointer.artifact.factoryRunProgramId ||
+    artifact.contractVersion !== pointer.artifact.contractVersion ||
+    artifact.compiledProgramHash.toLowerCase() !==
+      pointer.artifact.compiledProgramHash.toLowerCase()
+  ) {
+    throw new Error('Loaded Factory Run program artifact does not match its command reference')
+  }
+
+  return parseRunProgramStepArray(artifact.steps, 'Factory Run program artifact')
+}
+
+function pruneFactoryRunProgramArtifactCache(): void {
+  while (factoryRunProgramArtifactCache.size > MAX_FACTORY_RUN_PROGRAM_ARTIFACT_CACHE_ENTRIES) {
+    const removableEntry = Array.from(factoryRunProgramArtifactCache.entries()).find(
+      ([, sharedLoad]) => sharedLoad.settled && sharedLoad.consumerCount === 0
+    )
+
+    if (!removableEntry) return
+    factoryRunProgramArtifactCache.delete(removableEntry[0])
+  }
+}
+
+function getOrCreateFactoryRunProgramArtifactLoad(
+  pointer: FactoryRunProgramArtifactPointer,
+  context: BackendCommandExecutionContext
+): SharedFactoryRunProgramArtifactLoad {
+  const cacheKey = buildFactoryRunProgramArtifactCacheKey(pointer)
+  const cached = factoryRunProgramArtifactCache.get(cacheKey)
+
+  if (cached) {
+    factoryRunProgramArtifactCache.delete(cacheKey)
+    factoryRunProgramArtifactCache.set(cacheKey, cached)
+    return cached
+  }
+
+  const controller = new AbortController()
+  const sharedLoad: SharedFactoryRunProgramArtifactLoad = {
+    controller,
+    consumerCount: 0,
+    settled: false,
+    promise: Promise.resolve([])
+  }
+
+  sharedLoad.promise = context.loadFactoryRunProgramArtifact!(
+    pointer.factoryRunId,
+    pointer.targetId,
+    pointer.artifact,
+    controller.signal
+  )
+    .then((artifact) => validateLoadedFactoryRunProgramArtifact(pointer, artifact))
+    .catch((error: unknown) => {
+      if (factoryRunProgramArtifactCache.get(cacheKey) === sharedLoad) {
+        factoryRunProgramArtifactCache.delete(cacheKey)
+      }
+
+      throw error
+    })
+    .finally(() => {
+      sharedLoad.settled = true
+      pruneFactoryRunProgramArtifactCache()
+    })
+
+  // All command consumers can be cancelled before the shared request observes its abort.
+  // Keep a rejection handler attached so cleanup never creates an unhandled rejection.
+  void sharedLoad.promise.catch(() => undefined)
+  factoryRunProgramArtifactCache.set(cacheKey, sharedLoad)
+  pruneFactoryRunProgramArtifactCache()
+  return sharedLoad
+}
+
+function waitForFactoryRunProgramArtifactLoad(
+  sharedPromise: Promise<RunProgramStep[]>,
+  signal: AbortSignal
+): Promise<RunProgramStep[]> {
+  throwIfCommandCancelled(signal)
+
+  return new Promise((resolve, reject) => {
+    const handleAbort = (): void => {
+      signal.removeEventListener('abort', handleAbort)
+
+      try {
+        throwIfCommandCancelled(signal)
+      } catch (error) {
+        reject(error)
+      }
+    }
+
+    signal.addEventListener('abort', handleAbort, { once: true })
+
+    void sharedPromise.then(
+      (steps) => {
+        signal.removeEventListener('abort', handleAbort)
+
+        try {
+          throwIfCommandCancelled(signal)
+          resolve(steps)
+        } catch (error) {
+          reject(error)
+        }
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', handleAbort)
+        reject(error)
+      }
+    )
+  })
+}
+
+async function loadFactoryRunProgramArtifactSteps(
+  pointer: FactoryRunProgramArtifactPointer,
+  context: BackendCommandExecutionContext | undefined,
+  signal: AbortSignal
+): Promise<RunProgramStep[]> {
+  if (!context?.loadFactoryRunProgramArtifact) {
+    throw new Error('Factory Run program artifact loader is unavailable')
+  }
+
+  const cacheKey = buildFactoryRunProgramArtifactCacheKey(pointer)
+  const sharedLoad = getOrCreateFactoryRunProgramArtifactLoad(pointer, context)
+  sharedLoad.consumerCount += 1
+
+  try {
+    return await waitForFactoryRunProgramArtifactLoad(sharedLoad.promise, signal)
+  } finally {
+    sharedLoad.consumerCount = Math.max(0, sharedLoad.consumerCount - 1)
+
+    if (sharedLoad.consumerCount === 0 && !sharedLoad.settled) {
+      sharedLoad.controller.abort()
+
+      if (factoryRunProgramArtifactCache.get(cacheKey) === sharedLoad) {
+        factoryRunProgramArtifactCache.delete(cacheKey)
+      }
+    }
+  }
+}
+
+async function resolveRunProgramSteps(
+  payload: unknown,
+  context: BackendCommandExecutionContext | undefined,
+  signal: AbortSignal
+): Promise<RunProgramStep[]> {
+  if (isRecord(payload) && Array.isArray(payload.steps) && payload.steps.length > 0) {
+    return parseRunProgramSteps(payload)
+  }
+
+  const artifactPointer = parseFactoryRunProgramArtifactPointer(payload)
+  if (!artifactPointer) {
+    throw new Error('RunProgram requires embedded steps or a program artifact reference')
+  }
+
+  return await loadFactoryRunProgramArtifactSteps(artifactPointer, context, signal)
 }
 
 function parseFactoryRunArmPayload(payload: unknown): FactoryRunArmPayload | null {
@@ -609,41 +892,251 @@ async function waitForFactoryRunBarrierStart(
     throw new Error('FactoryRun barrier arm API is not available in command executor context.')
   }
 
-  for (let attempt = 0; attempt < FACTORY_RUN_ARM_MAX_ATTEMPTS; attempt++) {
-    assertMotionCanContinue(signal, robotId)
+  assertMotionCanContinue(signal, robotId)
 
-    const armPollStartedAtMonotonicMs = performance.now()
+  const registrationResponse = await requestFactoryRunArmWithRetry(
+    armPayload,
+    estimatedStepDurationsMs,
+    context.armFactoryRunCommand,
+    signal,
+    'robot.arm.register'
+  )
+
+  if (registrationResponse.isReady && registrationResponse.scheduledStartAtUtc) {
+    return registrationResponse
+  }
+
+  const sharedWait = getOrCreateSharedFactoryRunBarrierWait(
+    armPayload,
+    estimatedStepDurationsMs,
+    context.armFactoryRunCommand
+  )
+
+  sharedWait.consumerCount += 1
+
+  try {
+    return await waitForSharedFactoryRunBarrierResult(sharedWait.promise, signal, robotId)
+  } finally {
+    sharedWait.consumerCount = Math.max(0, sharedWait.consumerCount - 1)
+
+    if (sharedWait.consumerCount === 0 && !sharedWait.settled) {
+      sharedWait.controller.abort()
+
+      if (sharedFactoryRunBarrierWaits.get(armPayload.factoryRunId) === sharedWait) {
+        sharedFactoryRunBarrierWaits.delete(armPayload.factoryRunId)
+      }
+    }
+  }
+}
+
+async function requestFactoryRunArmWithRetry(
+  armPayload: FactoryRunArmPayload,
+  estimatedStepDurationsMs: number[],
+  armFactoryRunCommand: NonNullable<BackendCommandExecutionContext['armFactoryRunCommand']>,
+  signal: AbortSignal,
+  diagnosticStage: 'robot.arm.register' | 'robot.arm.poll',
+  deadlineAtMonotonicMs = performance.now() + FACTORY_RUN_ARM_MAX_WAIT_MS
+): Promise<FactoryRunArmResponse> {
+  let retryableFailureCount = 0
+
+  for (let attempt = 0; attempt < FACTORY_RUN_ARM_MAX_ATTEMPTS; attempt++) {
+    throwIfCommandCancelled(signal)
+
+    const remainingBeforeRequestMs = deadlineAtMonotonicMs - performance.now()
+    if (remainingBeforeRequestMs <= 0) {
+      break
+    }
+
+    const requestStartedAtMonotonicMs = performance.now()
 
     let response: FactoryRunArmResponse
 
     try {
-      response = await context.armFactoryRunCommand(armPayload, estimatedStepDurationsMs, signal)
+      response = await armFactoryRunCommand(armPayload, estimatedStepDurationsMs, signal)
     } catch (error) {
       if (signal.aborted) {
         throwIfCommandCancelled(signal)
       }
 
+      if (isRetryableFactoryRunArmError(error)) {
+        const exponentialDelayMs = Math.min(
+          FACTORY_RUN_ARM_RETRY_MAX_MS,
+          FACTORY_RUN_ARM_RETRY_INITIAL_MS * 2 ** Math.min(retryableFailureCount, 4)
+        )
+        const jitterMs = Math.floor(Math.random() * Math.max(1, exponentialDelayMs * 0.25))
+        const retryDelayMs = Math.max(error.retryAfterMs ?? 0, exponentialDelayMs + jitterMs)
+        const remainingMs = deadlineAtMonotonicMs - performance.now()
+
+        recordFactoryRunDiagnostic('robot.arm.retry', {
+          factoryRunId: armPayload.factoryRunId,
+          targetId: armPayload.targetId,
+          durationMs: performance.now() - requestStartedAtMonotonicMs,
+          details: {
+            attempt: attempt + 1,
+            stage: diagnosticStage,
+            errorCode: error.errorCode ?? 'legacy_factory_run_arm_busy',
+            retryDelayMs
+          }
+        })
+
+        if (remainingMs <= 0) {
+          break
+        }
+
+        retryableFailureCount += 1
+        await delay(Math.min(retryDelayMs, remainingMs), signal)
+        continue
+      }
+
       throw error
     }
 
-    recordFactoryRunDiagnostic('robot.arm.poll', {
+    recordFactoryRunDiagnostic(diagnosticStage, {
       factoryRunId: armPayload.factoryRunId,
       targetId: armPayload.targetId,
-      durationMs: performance.now() - armPollStartedAtMonotonicMs,
+      durationMs: performance.now() - requestStartedAtMonotonicMs,
       details: {
         attempt: attempt + 1,
         ready: response.isReady
       }
     })
 
+    return response
+  }
+
+  throw new Error('FactoryRun arm request timed out while registering the robot.')
+}
+
+function getOrCreateSharedFactoryRunBarrierWait(
+  armPayload: FactoryRunArmPayload,
+  estimatedStepDurationsMs: number[],
+  armFactoryRunCommand: NonNullable<BackendCommandExecutionContext['armFactoryRunCommand']>
+): SharedFactoryRunBarrierWait {
+  const existing = sharedFactoryRunBarrierWaits.get(armPayload.factoryRunId)
+  if (existing) {
+    return existing
+  }
+
+  const controller = new AbortController()
+  const sharedWait: SharedFactoryRunBarrierWait = {
+    controller,
+    consumerCount: 0,
+    settled: false,
+    promise: Promise.resolve<FactoryRunArmResponse>({
+      isReady: false,
+      expectedParticipantCount: 0
+    })
+  }
+
+  sharedWait.promise = pollFactoryRunBarrierUntilReady(
+    armPayload,
+    estimatedStepDurationsMs,
+    armFactoryRunCommand,
+    controller.signal
+  ).finally(() => {
+    sharedWait.settled = true
+
+    if (sharedFactoryRunBarrierWaits.get(armPayload.factoryRunId) === sharedWait) {
+      sharedFactoryRunBarrierWaits.delete(armPayload.factoryRunId)
+    }
+  })
+
+  // The last consumer may be cancelled before the shared poller observes its abort.
+  // Keep a rejection handler attached so that cleanup never creates an unhandled rejection.
+  void sharedWait.promise.catch(() => undefined)
+  sharedFactoryRunBarrierWaits.set(armPayload.factoryRunId, sharedWait)
+  return sharedWait
+}
+
+async function pollFactoryRunBarrierUntilReady(
+  armPayload: FactoryRunArmPayload,
+  estimatedStepDurationsMs: number[],
+  armFactoryRunCommand: NonNullable<BackendCommandExecutionContext['armFactoryRunCommand']>,
+  signal: AbortSignal
+): Promise<FactoryRunArmResponse> {
+  const deadlineAtMonotonicMs = performance.now() + FACTORY_RUN_ARM_MAX_WAIT_MS
+
+  for (let pollIndex = 0; pollIndex < FACTORY_RUN_ARM_MAX_ATTEMPTS; pollIndex++) {
+    throwIfCommandCancelled(signal)
+
+    if (performance.now() >= deadlineAtMonotonicMs) {
+      break
+    }
+
+    const response = await requestFactoryRunArmWithRetry(
+      armPayload,
+      estimatedStepDurationsMs,
+      armFactoryRunCommand,
+      signal,
+      'robot.arm.poll',
+      deadlineAtMonotonicMs
+    )
+
     if (response.isReady && response.scheduledStartAtUtc) {
       return response
     }
 
-    await delay(FACTORY_RUN_ARM_POLL_INTERVAL_MS, signal)
+    const remainingMs = deadlineAtMonotonicMs - performance.now()
+    if (remainingMs <= 0) {
+      break
+    }
+
+    await delay(Math.min(FACTORY_RUN_ARM_POLL_INTERVAL_MS, remainingMs), signal)
   }
 
   throw new Error('FactoryRun barrier start timed out while waiting for all robots to arm.')
+}
+
+function waitForSharedFactoryRunBarrierResult(
+  sharedPromise: Promise<FactoryRunArmResponse>,
+  signal: AbortSignal,
+  robotId?: string
+): Promise<FactoryRunArmResponse> {
+  assertMotionCanContinue(signal, robotId)
+
+  return new Promise((resolve, reject) => {
+    const handleAbort = (): void => {
+      signal.removeEventListener('abort', handleAbort)
+
+      try {
+        assertMotionCanContinue(signal, robotId)
+      } catch (error) {
+        reject(error)
+      }
+    }
+
+    signal.addEventListener('abort', handleAbort, { once: true })
+
+    void sharedPromise.then(
+      (response) => {
+        signal.removeEventListener('abort', handleAbort)
+
+        try {
+          assertMotionCanContinue(signal, robotId)
+          resolve(response)
+        } catch (error) {
+          reject(error)
+        }
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', handleAbort)
+        reject(error)
+      }
+    )
+  })
+}
+
+export function isRetryableFactoryRunArmError(error: unknown): error is BackendDeviceRequestError {
+  if (!(error instanceof BackendDeviceRequestError)) {
+    return false
+  }
+
+  if (error.errorCode === 'factory_run_arm_busy' && error.retryable) {
+    return true
+  }
+
+  // Compatibility with an older Backend that returned this transient condition as HTTP 400.
+  return error.status === 400 && /factory run barrier is busy/i.test(error.message)
 }
 
 async function executeWaitMs(
@@ -900,7 +1393,7 @@ async function executeRunProgram(
   robotId: string | undefined,
   context?: BackendCommandExecutionContext
 ): Promise<void> {
-  const steps = parseRunProgramSteps(payload)
+  const steps = await resolveRunProgramSteps(payload, context, signal)
   const armPayload = parseFactoryRunArmPayload(payload)
   const usesSynchronizedBarrier = armPayload?.coordinationMode === 'Synchronized'
 
@@ -1552,7 +2045,15 @@ export async function executeBackendCommand(
 
     switch (command.commandType) {
       case 'PrepareProgram':
-        await delay(200, signal)
+        {
+          const artifactPointer = parseFactoryRunProgramArtifactPointer(command.payload)
+          if (artifactPointer) {
+            await loadFactoryRunProgramArtifactSteps(artifactPointer, context, signal)
+          } else {
+            // Preserve the legacy preparation behavior for existing command rows.
+            await delay(200, signal)
+          }
+        }
         break
 
       case 'SetDO':

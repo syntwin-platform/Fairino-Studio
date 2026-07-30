@@ -20,6 +20,7 @@ interface SceneState {
   setRobotContact: (robotId: string, contact: RobotSafetyContactState | null) => void
   resolveRobotCollision: (robotId: string) => void
   clearRobotSafetyState: (robotId: string) => void
+  clearAllRobotSafetyState: () => void
   setDebugHitbox: (debug: boolean) => void
   clearScene: () => void
 }
@@ -183,6 +184,12 @@ export const useSceneStore = create<SceneState>((set) => ({
         robotFaultsById,
         robotContactsById
       }
+    }),
+
+  clearAllRobotSafetyState: () =>
+    set({
+      robotFaultsById: {},
+      robotContactsById: {}
     }),
 
   setDebugHitbox: (debug) => set({ isDebugHitbox: debug }),

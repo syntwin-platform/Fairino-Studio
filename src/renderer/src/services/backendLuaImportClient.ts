@@ -1,4 +1,5 @@
 import type { BackendSimulatorConfig } from '../types/backendDevice'
+import { backendFetch } from './backendFetch'
 
 const CONFIG_KEY = 'syntwin.backendSimulator.config'
 const TOKEN_KEY = 'syntwin.backendProgram.accessToken'
@@ -77,7 +78,7 @@ async function fetchLua(
   }, LUA_REQUEST_TIMEOUT_MS)
 
   try {
-    return await fetch(input, { ...init, signal: controller.signal })
+    return await backendFetch(input, { ...init, signal: controller.signal })
   } catch (error) {
     if (timedOut) {
       throw new Error(

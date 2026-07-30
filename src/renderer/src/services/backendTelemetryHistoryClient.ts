@@ -1,9 +1,12 @@
 import type { TcpPose } from '../types/backendDevice'
+import { backendFetch } from './backendFetch'
 
 export interface RobotTelemetryHistoryPoint {
   timestamp: string
   jointAngles: number[]
   tcpPose?: TcpPose | null
+  sequenceNumber?: number | null
+  latencyMilliseconds?: number | null
   temperature?: number | null
   collisionWarning?: boolean | null
   status?: string | null
@@ -69,7 +72,7 @@ export async function getRobotTelemetryHistory(
 
   const suffix = params.toString() ? `?${params.toString()}` : ''
 
-  const response = await fetch(
+  const response = await backendFetch(
     apiUrl(backendUrl, `/api/robots/${robotId}/telemetry/history${suffix}`),
     {
       method: 'GET',

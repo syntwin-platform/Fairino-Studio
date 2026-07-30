@@ -144,6 +144,11 @@ export function getRobotRuntimeConfig(robotId?: string): RobotRuntimeConfig {
   })
 }
 
+export function clearRobotRuntimeConfigs(): void {
+  robotRuntimeConfigsByRobotId.clear()
+  robotRuntimeConfig = cloneRobotRuntimeConfig(defaultRobotRuntimeConfig)
+}
+
 export function registerMoveLRunner(runner: MoveLRunner): () => void {
   moveLRunner = runner
 

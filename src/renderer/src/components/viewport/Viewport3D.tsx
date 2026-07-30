@@ -25,7 +25,10 @@ import type { MoveLRunOptions, PreparedMoveLTrajectory } from '../../services/ro
 import { throwIfCommandCancelled } from '../../services/commandExecutionRuntime'
 import { runScheduledJointTrajectory } from '../../services/factoryMotionScheduler'
 import { loadUrdfRobotWhenAssetsReady } from '../../services/urdfRobotLoader'
-import { CartesianTraceRecorder } from '../../services/cartesianTraceRecorder'
+import {
+  CartesianTraceRecorder,
+  isAuthoritativeRecordedTraceStep
+} from '../../services/cartesianTraceRecorder'
 import {
   hasCartesianTraceWristInput,
   isCartesianTraceControlKey,
@@ -73,6 +76,7 @@ const ROBOT_WORLD_UP = new THREE.Vector3(0, 1, 0)
 const PREVIEW_COLLISION_ROBOT_ID = '__viewport_preview_robot__'
 const COLLISION_SCHEDULER_INTERVAL_MS = 1000 / 15
 const MEASUREMENT_SCHEDULER_INTERVAL_MS = 100
+const FACTORY_TCP_PUBLISH_INTERVAL_MS = 100
 const TRACE_WRIST_JOINT_LIMITS_DEGREES = [
   { min: -265, max: 85 },
   { min: -175, max: 175 },
@@ -238,6 +242,8 @@ export default function Viewport3D(): React.JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null)
   const robotRef = useRef<FairinoRobotObject | null>(null)
   const robotRefs = useRef<Map<string, FairinoRobotObject>>(new Map())
+  const robotIdByObjectRef = useRef<WeakMap<FairinoRobotObject, string>>(new WeakMap())
+  const lastFactoryTcpPublishAtByRobotIdRef = useRef<Map<string, number>>(new Map())
   const collisionEngineRef = useRef<CollisionEngine | null>(null)
   const collisionSchedulerRef = useRef<CollisionScheduler | null>(null)
   const requestCollisionPrewarmRef = useRef<() => void>(() => undefined)
@@ -1399,7 +1405,12 @@ export default function Viewport3D(): React.JSX.Element {
           }
         }
       } else if (step.type === 'MoveL') {
-        if (step.tcpPose) {
+        if (isAuthoritativeRecordedTraceStep(step)) {
+          // Freehand training records the exact joint branch followed by the operator.
+          // Never replace it with another valid IK solution for the same TCP pose.
+          nextJoints = [...step.jointAngles]
+          nextTCP = step.tcpPose ? { ...step.tcpPose } : computeFK(nextJoints, robot)
+        } else if (step.tcpPose) {
           nextTCP = { ...step.tcpPose }
           const solved = computeIK(nextTCP, tempJoints, robot)
           if (solved) {
@@ -3248,6 +3259,7 @@ export default function Viewport3D(): React.JSX.Element {
     const safetyHelpers = safetyHelpersRef.current
     const pressedKeys = keysPressedRef.current
     const pressedTraceKeys = traceKeysPressedRef.current
+    const factoryTcpPublishTimes = lastFactoryTcpPublishAtByRobotIdRef.current
     // Clean up
     return () => {
       const ownsCurrentScene =
@@ -3294,6 +3306,7 @@ export default function Viewport3D(): React.JSX.Element {
           disposeRobotObject(robot)
         }
         loadedRobots.clear()
+        factoryTcpPublishTimes.clear()
 
         const previewRobot = previewRobotRef.current
         if (previewRobot) {
@@ -4037,6 +4050,7 @@ export default function Viewport3D(): React.JSX.Element {
           unregisterLoadedRobotMoveLRunner(id)
         }
         robotRefs.current.delete(id)
+        lastFactoryTcpPublishAtByRobotIdRef.current.delete(id)
         collisionEngineRef.current?.removeRobot(id)
         removeRobotSafetyState(id)
         if (selectedRobotId === id) {
@@ -4139,6 +4153,7 @@ export default function Viewport3D(): React.JSX.Element {
 
             scene.add(loadedRobot)
             robotRefs.current.set(robot.id, loadedRobot)
+            robotIdByObjectRef.current.set(loadedRobot, robot.id)
             applyRobotSafetyVisual(robot.id, true)
             loadingRobotIdsRef.current.delete(robot.id)
             // Initial joints position sync
@@ -4226,21 +4241,32 @@ export default function Viewport3D(): React.JSX.Element {
 
     applyRobotJointValues(angles, robot)
 
-    let robotId: string | null = null
-
-    for (const [id, loadedRobot] of robotRefs.current.entries()) {
-      if (loadedRobot === robot) {
-        robotId = id
-        break
-      }
-    }
+    const robotId = robotIdByObjectRef.current.get(robot) ?? null
 
     const wristLink = robot.links['wrist3_link']
     const nextTcpPose = getRobotTcpPose(robot)
     if (!wristLink || !nextTcpPose) return
 
     if (robotId) {
-      setTCPPoseForRobot(robotId, nextTcpPose)
+      const robotState = useRobotStore.getState()
+      const now = performance.now()
+      const lastPublishedAt = lastFactoryTcpPublishAtByRobotIdRef.current.get(robotId)
+      const shouldPublishTcpPose =
+        robotState.workspaceMode !== 'factory' ||
+        lastPublishedAt === undefined ||
+        now - lastPublishedAt >= FACTORY_TCP_PUBLISH_INTERVAL_MS
+
+      if (shouldPublishTcpPose) {
+        const previousPose = robotState.tcpPoseByRobotId[robotId]
+
+        if (isTcpPoseDifferent(previousPose, nextTcpPose, 0.01)) {
+          setTCPPoseForRobot(robotId, nextTcpPose)
+        }
+
+        if (robotState.workspaceMode === 'factory') {
+          lastFactoryTcpPublishAtByRobotIdRef.current.set(robotId, now)
+        }
+      }
     } else if (robot === previewRobotRef.current) {
       setTCPPose(nextTcpPose)
     }

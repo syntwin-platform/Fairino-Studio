@@ -170,9 +170,10 @@ export default function TelemetryHistoryPanel({
               <tr>
                 <th className="px-3 py-2">Time</th>
                 <th className="px-3 py-2">Status</th>
+                <th className="px-3 py-2">Seq</th>
                 <th className="px-3 py-2">Joints</th>
                 <th className="px-3 py-2">TCP</th>
-                <th className="px-3 py-2">Temp</th>
+                <th className="px-3 py-2">Delay</th>
                 <th className="px-3 py-2">Collision</th>
               </tr>
             </thead>
@@ -186,6 +187,9 @@ export default function TelemetryHistoryPanel({
                     {formatTime(point.timestamp)}
                   </td>
                   <td className="px-3 py-2">{point.status || '-'}</td>
+                  <td className="px-3 py-2 font-mono">
+                    {typeof point.sequenceNumber === 'number' ? point.sequenceNumber : '-'}
+                  </td>
                   <td className="max-w-[220px] truncate px-3 py-2 font-mono text-[10px]">
                     {formatJointAngles(point)}
                   </td>
@@ -193,7 +197,9 @@ export default function TelemetryHistoryPanel({
                     {formatTcp(point)}
                   </td>
                   <td className="px-3 py-2">
-                    {typeof point.temperature === 'number' ? point.temperature.toFixed(1) : '-'}
+                    {typeof point.latencyMilliseconds === 'number'
+                      ? `${point.latencyMilliseconds.toFixed(0)} ms`
+                      : '-'}
                   </td>
                   <td className="px-3 py-2">
                     {point.collisionWarning ? (

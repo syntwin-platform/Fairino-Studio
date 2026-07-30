@@ -1,13 +1,17 @@
-import { useCallback, useEffect, useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
+  ChevronDown,
   Factory,
   FilePlus,
   FolderOpen,
   Globe,
+  LogOut,
   Play,
   Save,
+  ShieldCheck,
   Upload,
+  UserRound,
   Wrench
 } from 'lucide-react'
 
@@ -17,6 +21,7 @@ import { electronService } from '../../services/electronService'
 import { buildCollisionAlertPresentation } from '../../services/collision/collisionPresentation'
 import { previewLuaProgram } from '../../services/backendLuaImportClient'
 import { toWorkflowStep } from '../../services/backendLuaWorkflowMapper'
+import { useBackendAuthStore } from '../../store/backendAuthStore'
 import { useRobotStore } from '../../store/robotStore'
 import { useSceneStore } from '../../store/sceneStore'
 import { DEFAULT_JOINT_ANGLES } from '../../types/robot.types'
@@ -24,6 +29,10 @@ import type { JointAngles, RobotProgramSource, WorkflowStep } from '../../types/
 import type { Transform3D } from '../../types/scene.types'
 
 type AppLanguage = keyof typeof translations
+
+interface HeaderProps {
+  onLogout: () => void
+}
 
 interface SavedSceneObject {
   name: string
@@ -52,7 +61,7 @@ function parseSavedProject(jsonStr: string): SavedProjectData {
   return JSON.parse(jsonStr) as SavedProjectData
 }
 
-export default function Header(): React.JSX.Element {
+export default function Header({ onLogout }: HeaderProps): React.JSX.Element {
   const steps = useRobotStore((state) => state.steps)
   const projectName = useRobotStore((state) => state.projectName)
   const currentFilePath = useRobotStore((state) => state.currentFilePath)
@@ -71,12 +80,40 @@ export default function Header(): React.JSX.Element {
 
   const language = useRobotStore((state) => state.language)
   const setLanguage = useRobotStore((state) => state.setLanguage)
+  const authUser = useBackendAuthStore((state) => state.user)
+  const [isAccountMenuOpen, setIsAccountMenuOpen] = useState(false)
+  const accountMenuRef = useRef<HTMLDivElement>(null)
 
   const t = useCallback(
     (key: keyof typeof translations.vi): string => translations[language][key],
     [language]
   )
   const selectedRobot = robots.find((robot) => robot.id === selectedRobotId) ?? null
+  const accountDisplayName = authUser?.fullName?.trim() || authUser?.email || 'SynTwin User'
+  const accountInitials = accountDisplayName
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part.charAt(0).toUpperCase())
+    .join('')
+
+  useEffect(() => {
+    if (!isAccountMenuOpen) {
+      return
+    }
+
+    const handlePointerDown = (event: PointerEvent): void => {
+      if (!accountMenuRef.current?.contains(event.target as Node)) {
+        setIsAccountMenuOpen(false)
+      }
+    }
+
+    window.addEventListener('pointerdown', handlePointerDown)
+
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown)
+    }
+  }, [isAccountMenuOpen])
   const collisionAlert = useMemo(
     () =>
       buildCollisionAlertPresentation(
@@ -526,6 +563,117 @@ export default function Header(): React.JSX.Element {
             <Play size={12} className="fill-white" />
             {t('exportLua')} ({steps.length})
           </button>
+        </div>
+
+        <div ref={accountMenuRef} className="relative">
+          <button
+            type="button"
+            onClick={() => setIsAccountMenuOpen((current) => !current)}
+            aria-haspopup="menu"
+            aria-expanded={isAccountMenuOpen}
+            className="flex max-w-[220px] items-center gap-2 rounded-lg border border-[#343849] bg-[#1e1e24] px-2 py-1.5 text-left transition hover:border-blue-500/50 hover:bg-[#282830]"
+          >
+            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-gradient-to-br from-blue-500 to-indigo-600 text-[10px] font-black text-white shadow">
+              {accountInitials || <UserRound size={14} />}
+            </span>
+
+            <span className="min-w-0">
+              <span className="block truncate text-[11px] font-semibold text-white">
+                {accountDisplayName}
+              </span>
+              <span className="block truncate text-[9px] text-slate-400">
+                {authUser?.subscriptionPlan || 'SynTwin'}
+              </span>
+            </span>
+
+            <ChevronDown
+              size={13}
+              className={`shrink-0 text-slate-400 transition ${
+                isAccountMenuOpen ? 'rotate-180' : ''
+              }`}
+            />
+          </button>
+
+          {isAccountMenuOpen && authUser && (
+            <div
+              role="menu"
+              className="absolute right-0 top-full z-[100] mt-2 w-80 overflow-hidden rounded-xl border border-[#343849] bg-[#17171d] shadow-2xl shadow-black/50"
+            >
+              <div className="border-b border-[#2d2d34] bg-gradient-to-br from-blue-600/15 to-indigo-600/5 p-4">
+                <div className="flex items-start gap-3">
+                  <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600 text-sm font-black text-white">
+                    {accountInitials || <UserRound size={18} />}
+                  </span>
+
+                  <span className="min-w-0">
+                    <span className="block truncate text-sm font-bold text-white">
+                      {accountDisplayName}
+                    </span>
+                    <span className="mt-0.5 block truncate text-[11px] text-slate-400">
+                      {authUser.email}
+                    </span>
+                    <span className="mt-2 inline-flex items-center gap-1 rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2 py-0.5 text-[9px] font-semibold text-emerald-300">
+                      <ShieldCheck size={10} />
+                      {language === 'vi' ? 'Đã xác thực' : 'Verified'}
+                    </span>
+                  </span>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-px bg-[#2d2d34]">
+                <div className="bg-[#1b1b21] px-3 py-2.5">
+                  <div className="text-[9px] uppercase tracking-wider text-slate-500">
+                    {language === 'vi' ? 'Vai trò' : 'Role'}
+                  </div>
+                  <div className="mt-1 truncate text-[11px] font-semibold text-slate-200">
+                    {authUser.role}
+                  </div>
+                </div>
+
+                <div className="bg-[#1b1b21] px-3 py-2.5">
+                  <div className="text-[9px] uppercase tracking-wider text-slate-500">
+                    {language === 'vi' ? 'Gói dịch vụ' : 'Plan'}
+                  </div>
+                  <div className="mt-1 truncate text-[11px] font-semibold text-blue-300">
+                    {authUser.subscriptionPlan}
+                  </div>
+                </div>
+
+                <div className="bg-[#1b1b21] px-3 py-2.5">
+                  <div className="text-[9px] uppercase tracking-wider text-slate-500">
+                    {language === 'vi' ? 'Giới hạn robot' : 'Robot limit'}
+                  </div>
+                  <div className="mt-1 text-[11px] font-semibold text-slate-200">
+                    {authUser.maxRobots}
+                  </div>
+                </div>
+
+                <div className="bg-[#1b1b21] px-3 py-2.5">
+                  <div className="text-[9px] uppercase tracking-wider text-slate-500">
+                    {language === 'vi' ? 'Trạng thái' : 'Status'}
+                  </div>
+                  <div className="mt-1 truncate text-[11px] font-semibold text-emerald-300">
+                    {authUser.status}
+                  </div>
+                </div>
+              </div>
+
+              <div className="p-2">
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setIsAccountMenuOpen(false)
+                    onLogout()
+                  }}
+                  className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-semibold text-rose-300 transition hover:bg-rose-500/10 hover:text-rose-200"
+                >
+                  <LogOut size={14} />
+                  {language === 'vi' ? 'Đăng xuất khỏi SynTwin' : 'Sign out of SynTwin'}
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </header>

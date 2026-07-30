@@ -37,10 +37,24 @@ export interface FileReadResult {
   error?: string
 }
 
+export interface BackendRequestOptions {
+  method?: string
+  headers?: Record<string, string>
+  body?: string
+}
+
+export interface BackendResponsePayload {
+  status: number
+  statusText: string
+  headers: Record<string, string>
+  body: string
+}
+
 export interface AppApi {
   showSaveDialog: (options: SaveDialogOptions) => Promise<SaveDialogResult>
   showOpenDialog: (options: OpenDialogOptions) => Promise<OpenDialogResult>
   writeFile: (filePath: string, content: string) => Promise<FileWriteResult>
   readFile: (filePath: string) => Promise<FileReadResult>
+  backendRequest: (url: string, options?: BackendRequestOptions) => Promise<BackendResponsePayload>
   onMenuAction: (callback: (action: string) => void) => () => void
 }

@@ -13,7 +13,9 @@ export interface CartesianTraceConfig {
   sampleIntervalMs: number
   minPositionDeltaMm: number
   minRotationDeltaDeg: number
+  minJointDeltaDeg: number
   simplifyToleranceMm: number
+  simplifyJointToleranceDeg: number
   maxDurationMs: number
   maxRawSamples: number
   maxOutputPoints: number

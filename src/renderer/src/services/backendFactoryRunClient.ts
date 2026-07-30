@@ -5,6 +5,7 @@ import type {
   FactoryRunTargetTerminationReason
 } from '../types/factoryProgram.types'
 import { SafetyValidationError } from './backendSafetyClient'
+import { backendFetch } from './backendFetch'
 
 export interface BackendFactoryRunContext {
   backendUrl: string
@@ -99,6 +100,23 @@ export interface FactoryRunResponse {
   targets: FactoryRunTargetResponse[]
 }
 
+export interface FactoryRunStatusResponse {
+  id: string
+  status: string
+  coordinationMode: FactoryCoordinationMode
+  failurePolicy: FactoryFailurePolicy
+  targetCount: number
+  scheduledStartAtUtc?: string | null
+  preparedAtUtc?: string | null
+  startedAtUtc?: string | null
+  actualStartSkewMs?: number | null
+  completedAtUtc?: string | null
+  cancelledAtUtc?: string | null
+  failureReason?: string | null
+  updatedAtUtc?: string | null
+  targets: FactoryRunTargetResponse[]
+}
+
 function normalizeBackendUrl(backendUrl: string): string {
   const normalized = backendUrl.trim().replace(/\/+$/, '')
 
@@ -163,7 +181,7 @@ async function request<T>(
 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const response = await fetch(apiUrl(context, path), {
+      const response = await backendFetch(apiUrl(context, path), {
         ...init,
         headers: {
           'Content-Type': 'application/json',
@@ -302,6 +320,21 @@ export async function getFactoryRun(
   return request<FactoryRunResponse>(
     context,
     `/api/factory-runs/${encodeURIComponent(factoryRunId)}`,
+    {
+      method: 'GET',
+      signal
+    }
+  )
+}
+
+export async function getFactoryRunStatus(
+  context: BackendFactoryRunContext,
+  factoryRunId: string,
+  signal?: AbortSignal
+): Promise<FactoryRunStatusResponse> {
+  return request<FactoryRunStatusResponse>(
+    context,
+    `/api/factory-runs/${encodeURIComponent(factoryRunId)}/status`,
     {
       method: 'GET',
       signal

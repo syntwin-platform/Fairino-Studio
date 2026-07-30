@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   attachFactoryRunDiagnosticId,
   beginFactoryRunDiagnosticSession,
+  clearFactoryRunDiagnostics,
   endFactoryRunDiagnosticSession,
   getFactoryRunDiagnosticSnapshot,
   recordFactoryRunDiagnostic,
@@ -15,7 +16,7 @@ describe('factoryRunDiagnostics', () => {
   })
 
   afterEach(() => {
-    endFactoryRunDiagnosticSession()
+    clearFactoryRunDiagnostics()
     vi.clearAllTimers()
     vi.useRealTimers()
   })
@@ -96,5 +97,24 @@ describe('factoryRunDiagnostics', () => {
     })
 
     expect(getFactoryRunDiagnosticSnapshot().events).toHaveLength(eventCount)
+  })
+
+  it('clears the active factory session and its account-specific events', () => {
+    beginFactoryRunDiagnosticSession('account-workflow.lua')
+    attachFactoryRunDiagnosticId('account-run-1')
+    recordFactoryRunDiagnostic('robot.step.started', {
+      robotId: 'account-robot-1',
+      stepIndex: 3
+    })
+
+    clearFactoryRunDiagnostics()
+
+    const result = getFactoryRunDiagnosticSnapshot()
+    expect(result.sessionId).toBeNull()
+    expect(result.factoryRunId).toBeNull()
+    expect(result.active).toBe(false)
+    expect(result.events).toEqual([])
+    expect(result.summary.eventCount).toBe(0)
+    expect(result.summary.currentStage).toBeNull()
   })
 })
