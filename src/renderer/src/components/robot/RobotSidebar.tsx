@@ -65,7 +65,8 @@ import { useBackendAuthStore } from '../../store/backendAuthStore'
 import {
   BackendSimulatorConfig,
   BackendSimulatorConfigByRobotId,
-  BackendSimulatorStatus
+  BackendSimulatorStatus,
+  LOCAL_BACKEND_URL
 } from '../../types/backendDevice'
 
 const FACTORY_SIDEBAR_TCP_POSE = Object.freeze({
@@ -528,9 +529,15 @@ export default function RobotSidebar({
       savedConfig?.deviceSecret ??
       (isCurrentConfig ? simulatorConfig.deviceSecret : '')
 
+    const backendUrl =
+      savedConfig?.backendUrl && savedConfig.backendUrl !== LOCAL_BACKEND_URL
+        ? savedConfig.backendUrl
+        : simulatorConfig.backendUrl
+
     return {
       ...simulatorConfig,
       ...savedConfig,
+      backendUrl,
       robotId: robot.id,
       deviceSecret,
       enabled: savedConfig?.enabled ?? (isCurrentConfig ? simulatorConfig.enabled : false)
