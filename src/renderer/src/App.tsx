@@ -13,6 +13,7 @@ import {
   BackendSimulatorStatus,
   BackendSimulatorStatusByRobotId,
   CLOUD_STAGING_BACKEND_URL,
+  LOCAL_BACKEND_URL,
   createDisconnectedBackendSimulatorStatus,
   defaultBackendSimulatorConfig,
   defaultRobotRuntimeConfig
@@ -82,6 +83,15 @@ function loadConfigByRobotId(): BackendSimulatorConfigByRobotId {
     const raw = window.localStorage.getItem(BACKEND_SIMULATOR_BY_ROBOT_STORAGE_KEY)
     const baseConfigs: BackendSimulatorConfigByRobotId = raw ? JSON.parse(raw) : {}
 
+    for (const [robotId, cfg] of Object.entries(baseConfigs)) {
+      if (cfg?.backendUrl === LOCAL_BACKEND_URL) {
+        baseConfigs[robotId] = {
+          ...cfg,
+          backendUrl: CLOUD_STAGING_BACKEND_URL
+        }
+      }
+    }
+
     const rawUser = window.sessionStorage.getItem(BACKEND_USER_STORAGE_KEY)
     let accountKey = ''
     if (rawUser) {
@@ -93,9 +103,16 @@ function loadConfigByRobotId(): BackendSimulatorConfigByRobotId {
       const savedSecrets = getSavedDeviceSecretsForAccount(accountKey)
       for (const [robotId, secret] of Object.entries(savedSecrets)) {
         if (secret) {
+          const existing = baseConfigs[robotId]
+          const backendUrl =
+            existing?.backendUrl && existing.backendUrl !== LOCAL_BACKEND_URL
+              ? existing.backendUrl
+              : CLOUD_STAGING_BACKEND_URL
+
           baseConfigs[robotId] = {
             ...defaultBackendSimulatorConfig,
-            ...(baseConfigs[robotId] ?? {}),
+            ...(existing ?? {}),
+            backendUrl,
             robotId,
             deviceSecret: secret
           }
