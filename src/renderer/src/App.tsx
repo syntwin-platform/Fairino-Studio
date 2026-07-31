@@ -206,8 +206,10 @@ function App(): React.JSX.Element {
       JSON.stringify(configByRobotId)
     )
 
-    const accountKey = authenticatedUser?.id || authenticatedUser?.email
-    if (!accountKey) return
+    const userKeys = [authenticatedUser?.id, authenticatedUser?.email].filter(
+      (k): k is string => Boolean(k?.trim())
+    )
+    if (userKeys.length === 0) return
 
     const secretsToSave: Record<string, string> = {}
     for (const [robotId, cfg] of Object.entries(configByRobotId)) {
@@ -217,15 +219,23 @@ function App(): React.JSX.Element {
     }
 
     if (Object.keys(secretsToSave).length > 0) {
-      saveDeviceSecretsForAccount(accountKey, secretsToSave)
+      for (const key of userKeys) {
+        saveDeviceSecretsForAccount(key, secretsToSave)
+      }
     }
   }, [configByRobotId, authenticatedUser])
 
   useEffect(() => {
-    const accountKey = authenticatedUser?.id || authenticatedUser?.email
-    if (!accountKey) return
+    const userKeys = [authenticatedUser?.id, authenticatedUser?.email].filter(
+      (k): k is string => Boolean(k?.trim())
+    )
+    if (userKeys.length === 0) return
 
-    const savedSecrets = getSavedDeviceSecretsForAccount(accountKey)
+    let savedSecrets: Record<string, string> = {}
+    for (const key of userKeys) {
+      savedSecrets = { ...savedSecrets, ...getSavedDeviceSecretsForAccount(key) }
+    }
+
     if (Object.keys(savedSecrets).length === 0) return
 
     setConfigByRobotId((current) => {
