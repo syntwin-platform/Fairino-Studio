@@ -197,7 +197,7 @@ export const BACKEND_ENVIRONMENT_OPTIONS = [
 
 export const defaultBackendSimulatorConfig: BackendSimulatorConfig = {
   enabled: false,
-  backendUrl: LOCAL_BACKEND_URL,
+  backendUrl: CLOUD_STAGING_BACKEND_URL,
   robotId: '',
   deviceSecret: '',
   heartbeatIntervalMs: 3000,
