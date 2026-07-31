@@ -22,7 +22,11 @@ import { deleteRobot as deleteBackendRobot } from './services/backendRobotClient
 import { getRobotRuntimeConfig as fetchRobotRuntimeConfig } from './services/backendRuntimeConfigClient'
 import { setRobotRuntimeConfig } from './services/robotMotionRuntime'
 import BackendProgramControls from './components/BackendProgramControls'
-import { BACKEND_ACCESS_TOKEN_STORAGE_KEY, useBackendAuthStore } from './store/backendAuthStore'
+import {
+  BACKEND_ACCESS_TOKEN_STORAGE_KEY,
+  BACKEND_USER_STORAGE_KEY,
+  useBackendAuthStore
+} from './store/backendAuthStore'
 import { useRobotStore } from './store/robotStore'
 import { translations } from './i18n/translations'
 import {
@@ -31,6 +35,10 @@ import {
   clearSynTwinAccountSession,
   sanitizeBackendSimulatorConfigForLogout
 } from './services/accountSession'
+import {
+  getSavedDeviceSecretsForAccount,
+  saveDeviceSecretsForAccount
+} from './services/deviceSecretStorage'
 import LoginScreen from './components/auth/LoginScreen'
 
 const FACTORY_VIEW_STORAGE_KEY = 'fairobot.factory.view'
@@ -72,9 +80,30 @@ function loadConfigByRobotId(): BackendSimulatorConfigByRobotId {
 
   try {
     const raw = window.localStorage.getItem(BACKEND_SIMULATOR_BY_ROBOT_STORAGE_KEY)
-    if (!raw) return {}
+    const baseConfigs: BackendSimulatorConfigByRobotId = raw ? JSON.parse(raw) : {}
 
-    return JSON.parse(raw) as BackendSimulatorConfigByRobotId
+    const rawUser = window.sessionStorage.getItem(BACKEND_USER_STORAGE_KEY)
+    let accountKey = ''
+    if (rawUser) {
+      const user = JSON.parse(rawUser) as { id?: string; email?: string }
+      accountKey = user.id || user.email || ''
+    }
+
+    if (accountKey) {
+      const savedSecrets = getSavedDeviceSecretsForAccount(accountKey)
+      for (const [robotId, secret] of Object.entries(savedSecrets)) {
+        if (secret) {
+          baseConfigs[robotId] = {
+            ...defaultBackendSimulatorConfig,
+            ...(baseConfigs[robotId] ?? {}),
+            robotId,
+            deviceSecret: secret
+          }
+        }
+      }
+    }
+
+    return baseConfigs
   } catch {
     return {}
   }
@@ -176,7 +205,48 @@ function App(): React.JSX.Element {
       BACKEND_SIMULATOR_BY_ROBOT_STORAGE_KEY,
       JSON.stringify(configByRobotId)
     )
-  }, [configByRobotId])
+
+    const accountKey = authenticatedUser?.id || authenticatedUser?.email
+    if (!accountKey) return
+
+    const secretsToSave: Record<string, string> = {}
+    for (const [robotId, cfg] of Object.entries(configByRobotId)) {
+      if (cfg?.deviceSecret?.trim()) {
+        secretsToSave[robotId] = cfg.deviceSecret.trim()
+      }
+    }
+
+    if (Object.keys(secretsToSave).length > 0) {
+      saveDeviceSecretsForAccount(accountKey, secretsToSave)
+    }
+  }, [configByRobotId, authenticatedUser])
+
+  useEffect(() => {
+    const accountKey = authenticatedUser?.id || authenticatedUser?.email
+    if (!accountKey) return
+
+    const savedSecrets = getSavedDeviceSecretsForAccount(accountKey)
+    if (Object.keys(savedSecrets).length === 0) return
+
+    setConfigByRobotId((current) => {
+      let updated = false
+      const next = { ...current }
+
+      for (const [robotId, secret] of Object.entries(savedSecrets)) {
+        if (secret && next[robotId]?.deviceSecret !== secret) {
+          next[robotId] = {
+            ...defaultBackendSimulatorConfig,
+            ...(next[robotId] ?? {}),
+            robotId,
+            deviceSecret: secret
+          }
+          updated = true
+        }
+      }
+
+      return updated ? next : current
+    })
+  }, [authenticatedUser])
 
   useEffect(() => {
     const previousAccessToken = previousAccessTokenRef.current
@@ -495,7 +565,7 @@ function App(): React.JSX.Element {
           />
         </div>
 
-        {workspaceMode === 'factory' && factoryView === 'overview' ? (
+        {workspaceMode === 'factory' && factoryView === 'overview' && (
           <FactoryDashboard
             simulatorConfig={config}
             simulatorConfigByRobotId={configByRobotId}
@@ -507,25 +577,29 @@ function App(): React.JSX.Element {
               setFactoryView('scene')
             }}
           />
-        ) : (
-          <>
-            <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-              <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
-                <Viewport3D />
-              </div>
-              <BottomConsole />
-            </main>
+        )}
 
-            {workspaceMode === 'train' && (
-              <aside className="flex h-full w-[380px] shrink-0 flex-col overflow-hidden border-l border-[#343849] bg-[#141720]">
-                <BackendProgramControls />
+        <main
+          className={
+            workspaceMode === 'factory' && factoryView === 'overview'
+              ? 'hidden'
+              : 'relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden'
+          }
+        >
+          <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
+            <Viewport3D />
+          </div>
+          <BottomConsole />
+        </main>
 
-                <div className="min-h-0 flex-1">
-                  <WorkflowPanel />
-                </div>
-              </aside>
-            )}
-          </>
+        {workspaceMode === 'train' && (
+          <aside className="flex h-full w-[380px] shrink-0 flex-col overflow-hidden border-l border-[#343849] bg-[#141720]">
+            <BackendProgramControls />
+
+            <div className="min-h-0 flex-1">
+              <WorkflowPanel />
+            </div>
+          </aside>
         )}
       </div>
     </div>
