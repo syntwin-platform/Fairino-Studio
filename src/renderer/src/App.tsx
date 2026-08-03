@@ -6,6 +6,7 @@ import Viewport3D from './components/viewport/Viewport3D'
 import WorkflowPanel from './components/workflow/WorkflowPanel'
 import BottomConsole from './components/ui/BottomConsole'
 import FactoryDashboard from './components/dashboard/FactoryDashboard'
+import { AutoUpdateNotifier } from './components/AutoUpdateNotifier'
 import {
   BACKEND_ENVIRONMENT_OPTIONS,
   BackendSimulatorConfig,
@@ -629,6 +630,7 @@ function App(): React.JSX.Element {
           </aside>
         )}
       </div>
+      <AutoUpdateNotifier />
     </div>
   )
 }

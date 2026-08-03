@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   Cpu,
+  Download,
   FileCode2,
   HelpCircle,
   Home,
@@ -17,6 +18,11 @@ import {
   ChevronsRight
 } from 'lucide-react'
 import { backendFetch } from '../../services/backendFetch'
+import {
+  parseDeviceCredentialBackup,
+  serializeDeviceCredentialBackup
+} from '../../services/deviceCredentialBackup'
+import { electronService } from '../../services/electronService'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ChangeEvent, ReactElement } from 'react'
 import {
@@ -275,6 +281,7 @@ export default function RobotSidebar({
     status: 'success' | 'error'
     message: string
   } | null>(null)
+  const [credentialExportBusy, setCredentialExportBusy] = useState(false)
   const [deletingRobotId, setDeletingRobotId] = useState('')
   const [factoryActionBusy, setFactoryActionBusy] = useState(false)
   const [robotListReloadRevision, setRobotListReloadRevision] = useState(0)
@@ -914,6 +921,7 @@ export default function RobotSidebar({
     setBackendRobots([])
     setRobotListError('')
     setCredentialImportFeedback(null)
+    setCredentialExportBusy(false)
     setDeletingRobotId('')
     setFactoryActionBusy(false)
     setSceneBindingSaveFeedback({})
@@ -946,9 +954,9 @@ export default function RobotSidebar({
 
     try {
       setCredentialImportFeedback(null)
-      const parsed = JSON.parse(await file.text()) as unknown
+      const parsed = parseDeviceCredentialBackup(JSON.parse(await file.text()) as unknown)
 
-      if (!Array.isArray(parsed)) {
+      if (parsed.credentials.length === 0 && parsed.rejectedCount === 0) {
         throw new Error(
           language === 'vi'
             ? 'Tệp thông tin kết nối không đúng định dạng.'
@@ -958,30 +966,22 @@ export default function RobotSidebar({
 
       const knownRobotIds = new Set(backendRobots.map((robot) => robot.id))
       const importedConfigs: BackendSimulatorConfigByRobotId = {}
-      let ignoredCount = 0
+      let ignoredCount = parsed.rejectedCount
 
-      for (const item of parsed) {
-        if (!item || typeof item !== 'object') {
+      for (const credential of parsed.credentials) {
+        if (!knownRobotIds.has(credential.robotId)) {
           ignoredCount += 1
           continue
         }
 
-        const credential = item as Record<string, unknown>
-        const robotId = typeof credential.robotId === 'string' ? credential.robotId.trim() : ''
-        const deviceSecret =
-          typeof credential.deviceSecret === 'string' ? credential.deviceSecret.trim() : ''
-
-        if (!robotId || !deviceSecret || !knownRobotIds.has(robotId)) {
-          ignoredCount += 1
-          continue
-        }
+        const robotId = credential.robotId
 
         importedConfigs[robotId] = {
           ...simulatorConfig,
           ...simulatorConfigByRobotId[robotId],
           backendUrl: simulatorConfig.backendUrl.trim(),
           robotId,
-          deviceSecret,
+          deviceSecret: credential.deviceSecret,
           enabled: false
         }
       }
@@ -1020,6 +1020,83 @@ export default function RobotSidebar({
       })
     } finally {
       event.target.value = ''
+    }
+  }
+
+  const handleCredentialBackupExport = async (): Promise<void> => {
+    setCredentialImportFeedback(null)
+
+    const credentials = backendRobots.flatMap((robot) => {
+      const mappedConfig = simulatorConfigByRobotId[robot.id]
+      const selectedConfig = simulatorConfig.robotId === robot.id ? simulatorConfig : undefined
+      const deviceSecret = (mappedConfig?.deviceSecret ?? selectedConfig?.deviceSecret ?? '').trim()
+
+      return deviceSecret ? [{ robotId: robot.id, deviceSecret }] : []
+    })
+
+    if (credentials.length === 0) {
+      setCredentialImportFeedback({
+        status: 'error',
+        message:
+          language === 'vi'
+            ? 'Không có khóa kết nối robot nào để sao lưu.'
+            : 'There are no robot connection keys to back up.'
+      })
+      return
+    }
+
+    const confirmed = window.confirm(
+      language === 'vi'
+        ? `Bản sao chứa ${credentials.length} khóa kết nối robot ở dạng có thể đọc được. Chỉ lưu tại nơi an toàn và không chia sẻ tệp này. Bạn có muốn tiếp tục?`
+        : `This backup contains ${credentials.length} readable robot connection keys. Store it securely and do not share it. Continue?`
+    )
+
+    if (!confirmed) return
+
+    setCredentialExportBusy(true)
+
+    try {
+      const date = new Date().toISOString().slice(0, 10)
+      const saveResult = await electronService.showSaveDialog({
+        title:
+          language === 'vi' ? 'Lưu bản sao khóa kết nối robot' : 'Save robot connection key backup',
+        defaultPath: `syntwin-connection-keys-${date}.json`,
+        filters: [{ name: 'JSON', extensions: ['json'] }]
+      })
+
+      if (saveResult.canceled || !saveResult.filePath) return
+
+      const writeResult = await electronService.writeFile(
+        saveResult.filePath,
+        serializeDeviceCredentialBackup(credentials)
+      )
+
+      if (!writeResult.success) {
+        throw new Error(
+          writeResult.error ||
+            (language === 'vi' ? 'Không thể lưu tệp sao lưu.' : 'Unable to save the backup file.')
+        )
+      }
+
+      setCredentialImportFeedback({
+        status: 'success',
+        message:
+          language === 'vi'
+            ? `Đã sao lưu ${credentials.length} khóa kết nối robot.`
+            : `${credentials.length} robot connection keys were backed up.`
+      })
+    } catch (error) {
+      setCredentialImportFeedback({
+        status: 'error',
+        message:
+          error instanceof Error
+            ? error.message
+            : language === 'vi'
+              ? 'Không thể xuất bản sao khóa kết nối robot.'
+              : 'Unable to export the robot connection key backup.'
+      })
+    } finally {
+      setCredentialExportBusy(false)
     }
   }
 
@@ -2057,7 +2134,7 @@ export default function RobotSidebar({
                   )}
               </div>
 
-              <div className="mb-2 flex justify-end gap-2">
+              <div className="mb-2 flex flex-wrap justify-end gap-2">
                 <input
                   ref={credentialFileInputRef}
                   type="file"
@@ -2067,8 +2144,28 @@ export default function RobotSidebar({
                 />
                 <button
                   type="button"
+                  onClick={() => void handleCredentialBackupExport()}
+                  disabled={
+                    !backendToken ||
+                    backendRobots.length === 0 ||
+                    factoryActionBusy ||
+                    credentialExportBusy
+                  }
+                  className="flex items-center gap-1 rounded border border-sky-500/40 px-2 py-1.5 text-[10px] font-semibold text-sky-300 transition hover:bg-sky-950/30 hover:text-sky-200 disabled:cursor-not-allowed disabled:opacity-40"
+                  title={t('exportConnectionKeysHint')}
+                >
+                  <Download size={11} className={credentialExportBusy ? 'animate-pulse' : ''} />
+                  {t('exportConnectionKeys')}
+                </button>
+                <button
+                  type="button"
                   onClick={() => credentialFileInputRef.current?.click()}
-                  disabled={!backendToken || backendRobots.length === 0 || factoryActionBusy}
+                  disabled={
+                    !backendToken ||
+                    backendRobots.length === 0 ||
+                    factoryActionBusy ||
+                    credentialExportBusy
+                  }
                   className="flex items-center gap-1 rounded border border-amber-500/40 px-2 py-1.5 text-[10px] font-semibold text-amber-300 transition hover:bg-amber-950/30 hover:text-amber-200 disabled:cursor-not-allowed disabled:opacity-40"
                   title={t('importConnectionKeysHint')}
                 >

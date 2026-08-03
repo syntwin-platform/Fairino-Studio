@@ -50,6 +50,27 @@ export interface BackendResponsePayload {
   body: string
 }
 
+export type UpdateStatusState =
+  | 'idle'
+  | 'checking'
+  | 'available'
+  | 'not-available'
+  | 'downloading'
+  | 'downloaded'
+  | 'error'
+
+export interface UpdateStatusPayload {
+  state: UpdateStatusState
+  version?: string
+  progress?: {
+    percent: number
+    transferred: number
+    total: number
+    bytesPerSecond: number
+  }
+  error?: string
+}
+
 export interface AppApi {
   showSaveDialog: (options: SaveDialogOptions) => Promise<SaveDialogResult>
   showOpenDialog: (options: OpenDialogOptions) => Promise<OpenDialogResult>
@@ -57,4 +78,7 @@ export interface AppApi {
   readFile: (filePath: string) => Promise<FileReadResult>
   backendRequest: (url: string, options?: BackendRequestOptions) => Promise<BackendResponsePayload>
   onMenuAction: (callback: (action: string) => void) => () => void
+  checkForUpdates: () => Promise<{ success: boolean; error?: string }>
+  restartAndInstall: () => void
+  onUpdateStatus: (callback: (payload: UpdateStatusPayload) => void) => () => void
 }

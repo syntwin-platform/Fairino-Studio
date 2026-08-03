@@ -4,6 +4,7 @@ import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import fs from 'fs/promises'
 import { setupMenu } from './menu'
+import { setupAutoUpdater } from './autoUpdater'
 import type { BackendRequestOptions, BackendResponsePayload } from '../preload/api.types'
 
 const ALLOWED_CLOUD_BACKEND_HOSTS = new Set([
@@ -73,6 +74,9 @@ function createWindow(): void {
 
   // Initialize the native application menu bar
   setupMenu(mainWindow)
+
+  // Initialize auto-updater
+  setupAutoUpdater(mainWindow)
 
   // HMR for renderer base on electron-vite cli.
   // Load the remote URL for development or the local html file for production.

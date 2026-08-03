@@ -41,6 +41,24 @@ const api: AppApi = {
     return (): void => {
       ipcRenderer.removeListener('menu-action', listener)
     }
+  },
+
+  checkForUpdates: () =>
+    ipcRenderer.invoke('check-for-updates') as ReturnType<AppApi['checkForUpdates']>,
+
+  restartAndInstall: () => {
+    ipcRenderer.invoke('restart-and-install')
+  },
+
+  onUpdateStatus: (callback) => {
+    const listener = (_event: IpcRendererEvent, payload: unknown): void => {
+      callback(payload as Parameters<Parameters<AppApi['onUpdateStatus']>[0]>[0])
+    }
+    ipcRenderer.on('auto-update-status', listener)
+
+    return (): void => {
+      ipcRenderer.removeListener('auto-update-status', listener)
+    }
   }
 }
 
