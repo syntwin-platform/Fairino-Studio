@@ -85,6 +85,13 @@ export function setupMenu(mainWindow: BrowserWindow): void {
       label: 'Help',
       submenu: [
         {
+          label: 'Kiểm tra cập nhật...',
+          click: () => {
+            mainWindow.webContents.send('menu-action', 'check-for-updates')
+          }
+        },
+        { type: 'separator' },
+        {
           label: 'Tìm hiểu thêm',
           click: async (): Promise<void> => {
             await shell.openExternal('https://electronjs.org')

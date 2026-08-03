@@ -6,6 +6,7 @@ import Viewport3D from './components/viewport/Viewport3D'
 import WorkflowPanel from './components/workflow/WorkflowPanel'
 import BottomConsole from './components/ui/BottomConsole'
 import FactoryDashboard from './components/dashboard/FactoryDashboard'
+import { AutoUpdateNotifier } from './components/AutoUpdateNotifier'
 import {
   BACKEND_ENVIRONMENT_OPTIONS,
   BackendSimulatorConfig,
@@ -223,8 +224,8 @@ function App(): React.JSX.Element {
       JSON.stringify(configByRobotId)
     )
 
-    const userKeys = [authenticatedUser?.id, authenticatedUser?.email].filter(
-      (k): k is string => Boolean(k?.trim())
+    const userKeys = [authenticatedUser?.id, authenticatedUser?.email].filter((k): k is string =>
+      Boolean(k?.trim())
     )
     if (userKeys.length === 0) return
 
@@ -243,8 +244,8 @@ function App(): React.JSX.Element {
   }, [configByRobotId, authenticatedUser])
 
   useEffect(() => {
-    const userKeys = [authenticatedUser?.id, authenticatedUser?.email].filter(
-      (k): k is string => Boolean(k?.trim())
+    const userKeys = [authenticatedUser?.id, authenticatedUser?.email].filter((k): k is string =>
+      Boolean(k?.trim())
     )
     if (userKeys.length === 0) return
 
@@ -629,6 +630,7 @@ function App(): React.JSX.Element {
           </aside>
         )}
       </div>
+      <AutoUpdateNotifier />
     </div>
   )
 }

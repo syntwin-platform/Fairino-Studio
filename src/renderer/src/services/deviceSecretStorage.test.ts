@@ -1,8 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest'
-import {
-  getSavedDeviceSecretsForAccount,
-  saveDeviceSecretsForAccount
-} from './deviceSecretStorage'
+import { getSavedDeviceSecretsForAccount, saveDeviceSecretsForAccount } from './deviceSecretStorage'
 
 class MemoryStorage implements Storage {
   private store = new Map<string, string>()

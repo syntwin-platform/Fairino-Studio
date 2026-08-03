@@ -1,5 +1,8 @@
 appId: com.syntwin.fairobotstudio
 productName: FaiRobot Studio
+publish:
+  provider: generic
+  url: https://storage.googleapis.com/syntwin-staging-reso-2026-fairobot-downloads/
 directories:
   buildResources: build
 files:
