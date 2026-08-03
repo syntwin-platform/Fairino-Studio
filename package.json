@@ -1,6 +1,6 @@
 {
   "name": "fairobot-studio",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Industrial robot operation, simulation and monitoring application powered by SynTwin",
   "main": "./out/main/index.js",
   "author": "SynTwin Platform",

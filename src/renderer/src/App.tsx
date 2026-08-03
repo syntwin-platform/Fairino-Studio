@@ -224,8 +224,8 @@ function App(): React.JSX.Element {
       JSON.stringify(configByRobotId)
     )
 
-    const userKeys = [authenticatedUser?.id, authenticatedUser?.email].filter(
-      (k): k is string => Boolean(k?.trim())
+    const userKeys = [authenticatedUser?.id, authenticatedUser?.email].filter((k): k is string =>
+      Boolean(k?.trim())
     )
     if (userKeys.length === 0) return
 
@@ -244,8 +244,8 @@ function App(): React.JSX.Element {
   }, [configByRobotId, authenticatedUser])
 
   useEffect(() => {
-    const userKeys = [authenticatedUser?.id, authenticatedUser?.email].filter(
-      (k): k is string => Boolean(k?.trim())
+    const userKeys = [authenticatedUser?.id, authenticatedUser?.email].filter((k): k is string =>
+      Boolean(k?.trim())
     )
     if (userKeys.length === 0) return
 

@@ -4,7 +4,9 @@ export function getSavedDeviceSecretsForAccount(accountIdentifier: string): Reco
   if (typeof window === 'undefined' || !accountIdentifier?.trim()) return {}
 
   try {
-    const raw = window.localStorage.getItem(`${DEVICE_SECRETS_STORAGE_PREFIX}${accountIdentifier.trim()}`)
+    const raw = window.localStorage.getItem(
+      `${DEVICE_SECRETS_STORAGE_PREFIX}${accountIdentifier.trim()}`
+    )
     if (!raw) return {}
     return JSON.parse(raw) as Record<string, string>
   } catch {

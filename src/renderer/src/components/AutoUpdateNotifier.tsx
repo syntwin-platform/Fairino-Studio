@@ -61,9 +61,7 @@ export const AutoUpdateNotifier: React.FC = () => {
             <Download className="h-5 w-5 animate-bounce text-blue-400" />
           )}
           {status.state === 'downloaded' && <CheckCircle2 className="h-5 w-5 text-emerald-400" />}
-          {status.state === 'not-available' && (
-            <CheckCircle2 className="h-5 w-5 text-slate-400" />
-          )}
+          {status.state === 'not-available' && <CheckCircle2 className="h-5 w-5 text-slate-400" />}
           {status.state === 'error' && <AlertCircle className="h-5 w-5 text-rose-400" />}
 
           <div>
@@ -80,10 +78,11 @@ export const AutoUpdateNotifier: React.FC = () => {
               {status.state === 'available' && 'Tệp cập nhật sẽ tự động được tải xuống.'}
               {status.state === 'downloading' &&
                 `Tiến độ: ${status.progress?.percent || 0}% (${(
-                  (status.progress?.transferred || 0) / 1024 / 1024
+                  (status.progress?.transferred || 0) /
+                  1024 /
+                  1024
                 ).toFixed(1)} / ${((status.progress?.total || 0) / 1024 / 1024).toFixed(1)} MB)`}
-              {status.state === 'downloaded' &&
-                'Khởi động lại ứng dụng để hoàn tất việc nâng cấp.'}
+              {status.state === 'downloaded' && 'Khởi động lại ứng dụng để hoàn tất việc nâng cấp.'}
               {status.state === 'not-available' && 'Hệ thống đã ở phiên bản mới nhất.'}
               {status.state === 'error' && (status.error || 'Vui lòng kiểm tra lại kết nối mạng.')}
             </p>
